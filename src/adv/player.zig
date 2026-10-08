@@ -18,6 +18,10 @@ const vti_mod = @import("vti.zig");
 const tmap = @import("tmap.zig");
 const aca = @import("aca.zig");
 const timeline = @import("timeline.zig");
+const present = @import("present.zig");
+const vdec = @import("vdec.zig");
+const adec = @import("adec.zig");
+const pipdec = @import("pipdec.zig");
 
 const gpa = std.heap.c_allocator;
 const sector_size = 2048;
@@ -39,6 +43,10 @@ extern fn hddvd_block_release(b: *vlc.block_t) void;
 extern fn hddvd_fmt_set_extra(fmt: *vlc.es_format_t, data: [*]const u8, len: usize) void;
 extern fn hddvd_fmt_set_description(fmt: *vlc.es_format_t, desc: ?[*:0]const u8) void;
 extern fn hddvd_fmt_set_language_str(fmt: *vlc.es_format_t, lang: [*:0]const u8) void;
+extern fn hddvd_es_send(demux: *vlc.demux_t, es: *vlc.es_out_id_t, block: *vlc.block_t) void;
+extern fn hddvd_es_selected(demux: *vlc.demux_t, es: *vlc.es_out_id_t) bool;
+extern fn hddvd_inherit_string(obj: *vlc.vlc_object_t, name: [*:0]const u8) ?[*:0]u8;
+extern fn hddvd_free(p: ?*anyopaque) void;
 
 fn log(obj: *vlc.vlc_object_t, prio: c_int, src: std.builtin.SourceLocation, comptime fmt: [*:0]const u8, args: anytype) void {
     @call(.auto, vlc.vlc_Log, .{ obj, prio, "hddvd", src.file, @as(c_uint, src.line), src.fn_name, fmt } ++ args);
@@ -74,6 +82,9 @@ const SpuTrack = struct {
 };
 
 const EsTrack = struct { es: *vlc.es_out_id_t, id: c_int };
+
+/// A stream forwarded into a main ES (sub video into the main video, sub audio into the main audio).
+const SubStream = struct { es: ?*vlc.es_out_id_t = null, id: c_int = -1, codec: u32 = 0 };
 
 /// What happens once the current clip has been presented.
 const Next = union(enum) {
@@ -120,6 +131,11 @@ pub const Player = struct {
     tracks: std.ArrayList(EsTrack) = .empty,
     spus: std.ArrayList(SpuTrack) = .empty,
     spu_shared: ?*spudec.Shared = null,
+    pres: ?*present.Presentation = null,
+    /// The main video ES (our compositor) and the forwarded sub streams.
+    main_video: ?*vlc.es_out_id_t = null,
+    sub_video: SubStream = .{},
+    sub_audio: SubStream = .{},
     cur_title: c_int = -1,
     cur_seekpoint: c_int = -1,
 
@@ -197,6 +213,13 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
         return vlc.VLC_EGENERIC;
     };
     p.spu_shared = spudec.Shared.create();
+    if (p.spu_shared) |sh| p.pres = present.Presentation.create(sh);
+    if (p.pres) |pr| {
+        pr.aperture_w = p.pl.aperture_w;
+        pr.aperture_h = p.pl.aperture_h;
+        pr.outer = .{ @intCast(p.pl.default_color >> 16), @intCast((p.pl.default_color >> 8) & 0xff), @intCast(p.pl.default_color & 0xff) };
+        debugOptions(o, pr);
+    }
     demux.p_sys = @ptrCast(p);
     demux.pf_demux = demuxOne;
     demux.pf_control = HddvdDemuxControl;
@@ -219,6 +242,26 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
     }
     _ = hddvd_es_out_control(demux.out, vlc.ES_OUT_SET_ES_CAT_POLICY, @as(c_int, vlc.SPU_ES), @as(c_int, vlc.ES_OUT_ES_POLICY_SIMULTANEOUS));
     return vlc.VLC_SUCCESS;
+}
+
+/// --hddvd-pip=x,y,w,h[,alpha] and --hddvd-sub-mix=level: show the sub video and mix the sub audio without the
+/// disc's application.
+fn debugOptions(o: *vlc.vlc_object_t, pr: *present.Presentation) void {
+    if (hddvd_inherit_string(o, "hddvd-pip")) |str| {
+        defer hddvd_free(str);
+        var v: [5]i32 = .{ 0, 0, 0, 0, 255 };
+        var it = std.mem.tokenizeAny(u8, std.mem.span(str), ", ");
+        var n: usize = 0;
+        while (it.next()) |t| : (n += 1) {
+            if (n == v.len) break;
+            v[n] = std.fmt.parseInt(i32, t, 10) catch break;
+        }
+        if (n >= 4) pr.setSubLayout(.{ .x = v[0], .y = v[1], .w = v[2], .h = v[3] }, @intCast(std.math.clamp(v[4], 0, 255)));
+    }
+    if (hddvd_inherit_string(o, "hddvd-sub-mix")) |str| {
+        defer hddvd_free(str);
+        pr.sub_gain = std.math.clamp(std.fmt.parseFloat(f32, std.mem.span(str)) catch 0, 0, 1);
+    }
 }
 
 fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
@@ -260,6 +303,7 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
 pub fn close(demux: *vlc.demux_t) void {
     const p = playerOf(demux);
     if (p.ps) |ps| vlc.demux_Delete(ps);
+    if (p.pres) |pr| pr.unref();
     if (p.spu_shared) |sh| sh.unref();
     if (p.stream) |s| hddvd_stream_delete(s);
     hddvd_esout_delete(p.esout);
@@ -296,6 +340,9 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
     // opens, so the reader is positioned first.
     if (p.ps) |ps| vlc.demux_Delete(ps);
     p.ps = null;
+    p.main_video = null;
+    p.sub_video = .{};
+    p.sub_audio = .{};
     p.tracks.clearRetainingCapacity();
     for (p.spus.items) |*s| s.buf.deinit(gpa);
     p.spus.clearRetainingCapacity();
@@ -342,9 +389,15 @@ fn positionSpan(demux: *vlc.demux_t, span: timeline.Span, t: u64) bool {
         p.file_evob = evob;
     }
     const r = timeline.sectorRange(mi, span, t, span.end);
+    if (p.pres) |pr| if (p.vti.attrOf(evob)) |a| {
+        pr.lockIt();
+        pr.luma_key = if (a.luma != 0) .{ @intCast(a.luma >> 8), @intCast(a.luma & 0xff) } else null;
+        pr.unlock();
+    };
     p.span = span;
     p.evob = evob;
     p.tmapi = mi;
+    updateSubVideo(demux);
     p.pos = @as(u64, evob.adr_ofs) * sector_size + r.first * sector_size;
     p.end = @as(u64, evob.adr_ofs) * sector_size + r.end * sector_size;
     p.sector_off = sector_size;
@@ -714,10 +767,13 @@ pub fn esFixup(demux: *vlc.demux_t, fmt: *vlc.es_format_t) void {
     } else if (fmt.i_cat == vlc.AUDIO_ES and (id & 0xff00) == 0xbd00) {
         const sub: u8 = @intCast(id & 0xff);
         if (isSubAudio(sub)) {
-            fmt.i_priority = vlc.ES_PRIORITY_NOT_SELECTABLE; // mixed in by the application (Phase 6)
+            // Forwarded into the main audio ES and mixed by our decoder (adec.zig).
+            fmt.i_priority = vlc.ES_PRIORITY_NOT_SELECTABLE;
+            p.sub_audio = .{ .id = id, .codec = fmt.i_codec };
             setDesc(fmt, &name_buf, "Sub audio", 0);
             return;
         }
+        toOurDecoder(p, fmt, adec.fourcc);
         for (clip.audio) |a| {
             if (a.stream -| 1 != (sub & 7)) continue;
             if (title.audioNav(a.track)) |nav| {
@@ -730,10 +786,31 @@ pub fn esFixup(demux: *vlc.demux_t, fmt: *vlc.es_format_t) void {
         }
         fmt.i_priority = vlc.ES_PRIORITY_NOT_SELECTABLE;
     } else if (fmt.i_cat == vlc.VIDEO_ES) {
-        // The sub video stream (E1, E3, FD-56…) is not a main video track.
         const main = id == 0xe0 or id == 0xe2 or id == 0xfd55;
-        if (!main) fmt.i_priority = vlc.ES_PRIORITY_NOT_SELECTABLE;
+        if (main) {
+            toOurDecoder(p, fmt, vdec.fourcc);
+        } else {
+            // The sub video (E1, E3, FD-56…) becomes a sub-picture ES drawn as an overlay (pipdec.zig), selected
+            // where the playlist assigns it.
+            p.sub_video = .{ .id = id, .codec = fmt.i_codec };
+            toOurDecoder(p, fmt, pipdec.fourcc);
+            fmt.i_cat = vlc.SPU_ES;
+            fmt.i_priority = vlc.ES_PRIORITY_NOT_DEFAULTABLE;
+            fmt.unnamed_0.subs = std.mem.zeroes(vlc.subs_format_t);
+            fmt.unnamed_0.subs.spu.i_original_frame_width = p.pl.aperture_w;
+            fmt.unnamed_0.subs.spu.i_original_frame_height = p.pl.aperture_h;
+            setDesc(fmt, &name_buf, "Picture-in-picture", 0);
+        }
     }
+}
+
+/// Routes an ES to our decoder: private fourcc, the real codec in p_extra, and no VLC packetizer (ours packetize).
+fn toOurDecoder(p: *Player, fmt: *vlc.es_format_t, fourcc: u32) void {
+    const pr = p.pres orelse return;
+    const e = pr.extra(fmt.i_codec);
+    hddvd_fmt_set_extra(fmt, &e, e.len);
+    fmt.i_codec = fourcc;
+    fmt.b_packetized = true;
 }
 
 fn setLang(fmt: *vlc.es_format_t, code: []const u8) void {
@@ -755,6 +832,12 @@ pub fn esAdded(demux: *vlc.demux_t, id: c_int, es: *vlc.es_out_id_t) void {
     log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "ES added: id 0x%x", .{@as(c_uint, @bitCast(id))});
     p.tracks.append(gpa, .{ .es = es, .id = id }) catch {};
     if ((id & 0xffe0) == 0xbd20) p.spus.append(gpa, .{ .es = es, .id = id }) catch {};
+    if (id == p.sub_video.id) {
+        p.sub_video.es = es;
+        updateSubVideo(demux);
+    }
+    if (id == p.sub_audio.id) p.sub_audio.es = es;
+    if (id == 0xe0 or id == 0xe2 or id == 0xfd55) p.main_video = es;
 }
 
 pub fn esDeleted(demux: *vlc.demux_t, es: *vlc.es_out_id_t) void {
@@ -763,6 +846,9 @@ pub fn esDeleted(demux: *vlc.demux_t, es: *vlc.es_out_id_t) void {
         _ = p.tracks.swapRemove(i);
         break;
     };
+    if (p.main_video == es) p.main_video = null;
+    if (p.sub_video.es == es) p.sub_video = .{};
+    if (p.sub_audio.es == es) p.sub_audio = .{};
     for (p.spus.items, 0..) |*t, i| if (t.es == es) {
         t.buf.deinit(gpa);
         _ = p.spus.swapRemove(i);
@@ -773,6 +859,23 @@ pub fn esDeleted(demux: *vlc.demux_t, es: *vlc.es_out_id_t) void {
 /// Sub-picture units are reassembled and sent whole, with the EVOB's HD palette, to spudec.zig.
 pub fn esFilter(demux: *vlc.demux_t, es: *vlc.es_out_id_t, block: *vlc.block_t) ?*vlc.block_t {
     const p = playerOf(demux);
+    // The sub audio is decoded only where the playlist assigns it (§6.2.3: SubAudio of the clip).
+    const clip = if (p.span) |sp| sp.clip else null;
+    if (p.sub_audio.es == es and (clip == null or clip.?.sub_audio.len == 0)) {
+        hddvd_block_release(block);
+        return null;
+    }
+    if (p.sub_audio.es == es) {
+        // Into the selected main audio track (the one our mixer is decoding).
+        for (p.tracks.items) |t| {
+            if ((t.id & 0xff00) != 0xbd00 or !isMainAudio(@intCast(t.id & 0xff))) continue;
+            if (!hddvd_es_selected(demux, t.es)) continue;
+            forward(demux, t.es, block, present.sub_audio_magic, p.sub_audio.codec);
+            return null;
+        }
+        hddvd_block_release(block);
+        return null;
+    }
     const t = for (p.spus.items) |*t| {
         if (t.es == es) break t;
     } else return block;
@@ -802,6 +905,23 @@ pub fn esFilter(demux: *vlc.demux_t, es: *vlc.es_out_id_t, block: *vlc.block_t) 
     out.*.i_pts = t.pts;
     out.*.i_dts = t.pts;
     return out;
+}
+
+/// Selects the sub video ES where the current clip assigns a sub video, deselects it elsewhere.
+fn updateSubVideo(demux: *vlc.demux_t) void {
+    const p = playerOf(demux);
+    const es = p.sub_video.es orelse return;
+    const want = if (p.span) |sp| sp.clip.sub_video != null else false;
+    if (want != hddvd_es_selected(demux, es)) hddvd_es_select(demux, es, want);
+}
+
+/// Sends `block` to `to`, prefixed with `magic` and the codec, for our decoder to pick out.
+fn forward(demux: *vlc.demux_t, to: *vlc.es_out_id_t, block: *vlc.block_t, comptime magic: []const u8, codec: u32) void {
+    const len = block.i_buffer;
+    const b = vlc.block_Realloc(block, present.sub_prefix_len, len) orelse return;
+    @memcpy(b.*.p_buffer[0..8], magic);
+    std.mem.writeInt(u32, b.*.p_buffer[8..12], codec, .native);
+    hddvd_es_send(demux, to, b);
 }
 
 // ---- tests --------------------------------------------------------------------------------------------------

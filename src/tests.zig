@@ -14,4 +14,7 @@ test {
     _ = @import("adv/aca.zig");
     _ = @import("adv/timeline.zig");
     _ = @import("adv/player.zig");
+    _ = @import("adv/compose.zig");
+    _ = @import("adv/mix.zig");
+    _ = @import("adv/retime.zig");
 }

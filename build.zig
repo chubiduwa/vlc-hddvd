@@ -13,7 +13,8 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
+    // ReleaseSafe by default: a Debug plugin is too slow to composite and mix Advanced Content in real time.
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode: debug, safe, fast or small (default: safe)") orelse .safe;
 
     const vlc_sdk = b.option([]const u8, "vlc-sdk", "VLC SDK dir (with include/vlc/plugins)") orelse
         "../vlc-sdk/vlc-3.0.24/sdk";
@@ -54,7 +55,7 @@ pub fn build(b: *std.Build) void {
 
     mod.addIncludePath(b.path("src"));
     mod.addIncludePath(vlc_include);
-    mod.addCSourceFiles(.{ .files = &.{ "src/module.c", "src/nav_glue.c", "src/spu_glue.c" }, .flags = &common_flags });
+    mod.addCSourceFiles(.{ .files = &.{ "src/module.c", "src/nav_glue.c", "src/spu_glue.c", "src/codec_glue.c" }, .flags = &common_flags });
 
     switch (target.result.os.tag) {
         .windows => {

@@ -25,6 +25,12 @@ int HddvdOpen(vlc_object_t *);
 void HddvdClose(vlc_object_t *);
 int HddvdSpuOpen(vlc_object_t *);
 void HddvdSpuClose(vlc_object_t *);
+int HddvdVdecOpen(vlc_object_t *);
+void HddvdVdecClose(vlc_object_t *);
+int HddvdAdecOpen(vlc_object_t *);
+void HddvdAdecClose(vlc_object_t *);
+int HddvdPipOpen(vlc_object_t *);
+void HddvdPipClose(vlc_object_t *);
 int hddvd_get_position(demux_t *, double *);
 int hddvd_set_position(demux_t *, double);
 int hddvd_get_length(demux_t *, int64_t *);
@@ -38,7 +44,7 @@ uint64_t hddvd_stream_size(stream_t *);
 
 vlc_module_begin()
     set_shortname("HD DVD")
-    set_description("HD DVD Standard Content input (HVDVD_TS)")
+    set_description("HD DVD input (Standard and Advanced Content)")
     set_category(CAT_INPUT)
     set_subcategory(SUBCAT_INPUT_ACCESS)
     /* Like dvdread: an access_demux reached through its own scheme, e.g. hddvd:///Volumes/DISC */
@@ -49,12 +55,34 @@ vlc_module_begin()
                "General parameters to set before playback starts, and again whenever a Title_Play resets them, "
                "as n=value pairs separated by commas (e.g. 1=5,2=1). Useful with hddvd:///disc.iso#title to start "
                "a title directly when it expects registers that the disc's menus normally set.", true)
+    add_string("hddvd-pip", NULL, "Picture-in-picture layout (debugging)",
+               "Advanced Content: show the sub video at x,y,width,height[,alpha] (aperture pixels, alpha 0-255) "
+               "without waiting for the disc's application to place it.", true)
+    add_string("hddvd-sub-mix", NULL, "Sub audio level (debugging)",
+               "Advanced Content: mix the sub audio (e.g. a commentary) at this level (0-1) without waiting for "
+               "the disc's application.", true)
 
     /* Sub-pictures with button highlights (spudec.zig); only takes the ESes the demux marks with its fourcc. */
     add_submodule()
     set_description("HD DVD sub-pictures")
     set_capability("spu decoder", 50)
     set_callbacks(HddvdSpuOpen, HddvdSpuClose)
+
+    /* Advanced Content: the main video with corrected frame times (adv/vdec.zig), the sub video as an overlay
+     * (adv/pipdec.zig), main + sub + effect audio mixed (adv/adec.zig). Only take the ESes the demux marks with
+     * their fourccs. */
+    add_submodule()
+    set_description("HD DVD sub video")
+    set_capability("spu decoder", 50)
+    set_callbacks(HddvdPipOpen, HddvdPipClose)
+    add_submodule()
+    set_description("HD DVD main video")
+    set_capability("video decoder", 50)
+    set_callbacks(HddvdVdecOpen, HddvdVdecClose)
+    add_submodule()
+    set_description("HD DVD audio mixer")
+    set_capability("audio decoder", 50)
+    set_callbacks(HddvdAdecOpen, HddvdAdecClose)
 vlc_module_end()
 
 /* pf_control of the demux_t; installed by HddvdOpen (Zig). */

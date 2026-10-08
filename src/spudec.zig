@@ -85,7 +85,8 @@ pub const Shared = struct {
         return error.NoDecoder;
     }
 
-    fn register(s: *Shared, dec: *vlc.decoder_t, on: bool) void {
+    /// Adds or removes a decoder whose clock the demux may read (sub-picture, video and audio decoders).
+    pub fn register(s: *Shared, dec: *vlc.decoder_t, on: bool) void {
         vlc.vlc_mutex_lock(&s.lock);
         defer vlc.vlc_mutex_unlock(&s.lock);
         for (&s.decoders) |*d| {

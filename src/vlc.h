@@ -16,3 +16,5 @@
 #include <vlc_input.h>
 #include <vlc_codec.h>
 #include <vlc_subpicture.h>
+#include <vlc_picture.h>
+#include <vlc_aout.h>
