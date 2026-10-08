@@ -124,6 +124,10 @@ folder as `VLC_PLUGIN_PATH`.
 The [CI workflow](.github/workflows/ci.yml) runs the tests and builds every platform on each push; the plugins
 are attached to each run as artifacts.
 
+## Reference
+
+Based on HD-DVD spec from: https://github.com/amp64/hddvd-docs
+
 ## License
 
 LGPL 2.1 or later.
