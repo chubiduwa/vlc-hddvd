@@ -72,4 +72,13 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
     b.installArtifact(lib);
+
+    // `zig build test`: unit tests of the modules that do not depend on VLC, built for and run on the host
+    // whatever -Dtarget is. Test code is only compiled here, never into the plugin.
+    const tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tests.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    b.step("test", "Run the unit tests").dependOn(&b.addRunArtifact(tests).step);
 }

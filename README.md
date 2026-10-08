@@ -13,7 +13,7 @@ An HD DVD plugin for VLC 3.0.
 Not supported yet: Advanced Content (most later discs), encrypted (AACS) discs, physical drives, and angles on
 interleaved cells. Tested on macOS; Windows builds but is untested.
 
-## Install
+## Build
 
 Build it (needs [Zig](https://ziglang.org) 0.17 and the VLC 3.0 plugin SDK):
 
@@ -26,7 +26,7 @@ zig build --prefix zig-out/win64 -Dvlc-sdk=/path/to/vlc-3.0.x/sdk -Dtarget=x86_6
 Then point VLC at the plugin folder, or copy the plugin into VLC's `plugins/access/` folder (Windows):
 
 ```sh
-export VLC_PLUGIN_PATH=$PWD/zig-out/macos/lib
+export VLC_PLUGIN_PATH=<repo-folder>/zig-out/macos/lib
 ```
 
 ## Play

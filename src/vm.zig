@@ -824,3 +824,313 @@ pub const Vm = struct {
         vm.start_offset = offset;
     }
 };
+
+// ---- tests ------------------------------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn cmd(comptime hex: *const [16]u8) nav.Cmd {
+    var c: nav.Cmd = undefined;
+    _ = std.fmt.hexToBytes(&c, hex) catch unreachable;
+    return c;
+}
+
+fn testCell(first: u32, still: u8, cmd_count: u8, cmd_first: u16) nav.Cell {
+    return .{
+        .first_sector = first,
+        .last_sector = first + 9,
+        .duration_us = 1_000_000,
+        .block_mode = 0,
+        .block_type = 0,
+        .seamless = false,
+        .stc_discontinuity = false,
+        .still = still,
+        .cmd_count = cmd_count,
+        .cmd_first = cmd_first,
+    };
+}
+
+fn testPgc(cells: []nav.Cell, programs: []u16) nav.Pgc {
+    return .{
+        .program_cells = programs,
+        .cells = cells,
+        .pre = &.{},
+        .post = &.{},
+        .cell_cmds = &.{},
+        .resume_cmds = &.{},
+        .next_pgcn = 0,
+        .prev_pgcn = 0,
+        .goup_pgcn = 0,
+        .playback_mode = 0,
+        .still = 0,
+        .uop_mask = 0,
+        .audio_ctl = @splat(0),
+        .spst_ctl = @splat(0),
+        .sd_palette = @splat(0),
+        .hd_palette = @splat(0),
+        .duration_us = 0,
+        .entry = false,
+        .resume_prohibited = false,
+        .hli_off = false,
+        .vts_ttn = 0,
+        .menu_id = 0,
+    };
+}
+
+/// A small disc, modelled on an interactive game:
+/// - First Play: JumpTT 1.
+/// - VMGM (en): PGC 1, the title menu (entry): pre GPRM9 = 7, one cell with an infinite still. PGC 2, no cells:
+///   GPRM1 -= 1 (a life), then RSM.
+/// - VTS 1, title 1: PGC 1 (chapter 1): pre GPRM0 = 0; cells 1 and 2 (programs 1 and 2); cell 2 checks the move
+///   with `if (GPRM0 != 1) LinkPTTN 2`; post JumpTT 2. PGC 2 (chapter 2): one cell whose command is
+///   CallSS VMGM PGC 2, resume cell 1.
+/// - VTS 1, title 2: PGC 3, one cell with a 5 s still; Title_Play/PTT_Play prohibited (TT_PB_TY UOP0/1).
+const TestDisc = struct {
+    fp_pre: [1]nav.Cmd = .{cmd("3002000000010000")}, // JumpTT 1
+    menu_cells: [1]nav.Cell = .{testCell(0, 255, 0, 0)},
+    menu_programs: [1]u16 = .{1},
+    menu_pre: [1]nav.Cmd = .{cmd("7100000900070000")}, // GPRM9 = 7
+    lives_pre: [2]nav.Cmd = .{ cmd("7400000100010000"), cmd("2001000000000010") }, // GPRM1 -= 1; LinkRSM
+    t1_cells: [2]nav.Cell = .{ testCell(0, 0, 0, 0), testCell(10, 0, 1, 1) },
+    t1_programs: [2]u16 = .{ 1, 2 },
+    t1_pre: [1]nav.Cmd = .{cmd("7100000000000000")}, // GPRM0 = 0
+    t1_cell_cmds: [1]nav.Cmd = .{cmd("20b5000000010002")}, // if (GPRM0 != 1) LinkPTTN 2
+    t1_post: [1]nav.Cmd = .{cmd("3002000000020000")}, // JumpTT 2
+    death_cells: [1]nav.Cell = .{testCell(20, 0, 1, 1)},
+    death_programs: [1]u16 = .{1},
+    death_cell_cmds: [1]nav.Cmd = .{cmd("3008000200b00000")}, // CallSS VMGM PGC 2 (resume cell 1)
+    t2_cells: [1]nav.Cell = .{testCell(30, 5, 0, 0)},
+    t2_programs: [1]u16 = .{1},
+    ptt1: [2]nav.Ptt = .{ .{ .pgcn = 1, .pgn = 1 }, .{ .pgcn = 2, .pgn = 1 } },
+    ptt2: [1]nav.Ptt = .{.{ .pgcn = 3, .pgn = 1 }},
+    titles: [2]nav.Title = .{
+        .{ .vtsn = 1, .vts_ttn = 1, .n_ptt = 2, .pb_ty = 0x40, .chapter_us = &.{}, .duration_us = 0 },
+        .{ .vtsn = 1, .vts_ttn = 2, .n_ptt = 1, .pb_ty = 0x03, .chapter_us = &.{}, .duration_us = 0 },
+    },
+    vmgm_pgcs: [2]nav.Pgc = undefined,
+    vmgm_lus: [1]nav.MenuLu = undefined,
+    title_pgcs: [3]nav.Pgc = undefined,
+    ptts: [2][]nav.Ptt = undefined,
+    vts: [1]nav.Vts = undefined,
+    disc: nav.Disc = undefined,
+
+    /// Builds the disc in place (it points into itself, so `d` must not move afterwards).
+    fn init(d: *TestDisc) void {
+        d.* = .{};
+        var menu = testPgc(&d.menu_cells, &d.menu_programs);
+        menu.pre = &d.menu_pre;
+        menu.entry = true;
+        menu.menu_id = 2;
+        var lives = testPgc(&.{}, &.{});
+        lives.pre = &d.lives_pre;
+        d.vmgm_pgcs = .{ menu, lives };
+        d.vmgm_lus = .{.{ .lang = ('e' << 8) | 'n', .pgcs = &d.vmgm_pgcs }};
+
+        var t1 = testPgc(&d.t1_cells, &d.t1_programs);
+        t1.pre = &d.t1_pre;
+        t1.cell_cmds = &d.t1_cell_cmds;
+        t1.post = &d.t1_post;
+        t1.entry = true;
+        t1.vts_ttn = 1;
+        var death = testPgc(&d.death_cells, &d.death_programs);
+        death.cell_cmds = &d.death_cell_cmds;
+        death.vts_ttn = 1;
+        var t2 = testPgc(&d.t2_cells, &d.t2_programs);
+        t2.entry = true;
+        t2.vts_ttn = 2;
+        d.title_pgcs = .{ t1, death, t2 };
+        d.ptts = .{ &d.ptt1, &d.ptt2 };
+        d.vts = .{.{ .title_pgcs = &d.title_pgcs, .ptts = &d.ptts, .menus = &.{}, .title_evos = &.{}, .menu_evos = &.{} }};
+
+        var fp = testPgc(&.{}, &.{});
+        fp.pre = &d.fp_pre;
+        d.disc = .{ .arena = .init(testing.allocator), .fp_pgc = fp, .vmgm = &d.vmgm_lus, .vmgm_evos = &.{}, .titles = &d.titles, .vts = &d.vts };
+    }
+};
+
+test "First Play jumps to title 1 and runs its pre-commands" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    vm.gprm[0] = 9;
+    vm.start();
+    try testing.expectEqual(Domain.tt, vm.domain);
+    try testing.expectEqual(Phase.play_cell, vm.phase);
+    try testing.expectEqual(.{ 1, 1 }, vm.titleChapter());
+    try testing.expectEqual(.{ 1, 1 }, .{ vm.pgcn, vm.celln });
+    try testing.expectEqual(0, vm.gprm[0]);
+    try testing.expectEqual(0, vm.cell().?.first_sector);
+}
+
+test "cells play in order, and a failed check links to the death chapter" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    vm.start();
+    const gen = vm.generation;
+    vm.cellPresented();
+    try testing.expectEqual(.{ 1, 2, 2 }, .{ vm.pgcn, vm.pgn, vm.celln });
+    try testing.expect(vm.generation != gen);
+    vm.cellPresented(); // GPRM0 is still 0
+    try testing.expectEqual(.{ 2, 1 }, .{ vm.pgcn, vm.celln });
+    try testing.expectEqual(.{ 1, 2 }, vm.titleChapter());
+}
+
+test "a passed check falls through to the post-commands" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    vm.start();
+    vm.cellPresented();
+    vm.activateButton(&.{cmd("7100000000010000")}); // the move: GPRM0 = 1
+    vm.cellPresented();
+    try testing.expectEqual(.{ 2, 1 }, vm.titleChapter()); // JumpTT 2
+    try testing.expectEqual(.{ 3, 1 }, .{ vm.pgcn, vm.celln });
+    try testing.expectEqual(Phase.play_cell, vm.phase);
+}
+
+test "a cell still holds, then the title ends" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    vm.titlePlay(2);
+    vm.cellPresented();
+    try testing.expectEqual(Phase.cell_still, vm.phase);
+    try testing.expectEqual(5, vm.still);
+    vm.stillDone();
+    try testing.expectEqual(Phase.stopped, vm.phase);
+    try testing.expectEqual(null, vm.cell());
+}
+
+test "CallSS to a menu PGC, then RSM back to the saved cell" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    vm.start();
+    vm.gprm[1] = 3;
+    vm.cellPresented();
+    vm.cellPresented(); // death chapter
+    vm.cellPresented(); // CallSS VMGM PGC 2: GPRM1 -= 1, LinkRSM
+    try testing.expectEqual(2, vm.gprm[1]);
+    try testing.expectEqual(Domain.tt, vm.domain);
+    try testing.expectEqual(.{ 2, 1 }, .{ vm.pgcn, vm.celln });
+    try testing.expectEqual(.{ 1, 2 }, vm.titleChapter());
+}
+
+test "Menu_Call saves the resume point and Resume returns to it" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    vm.start();
+    try testing.expect(vm.menuCall(.title));
+    try testing.expect(vm.inMenu());
+    try testing.expectEqual(.{ Domain.vmgm, 1 }, .{ vm.domain, vm.pgcn });
+    try testing.expectEqual(7, vm.gprm[9]);
+    vm.cellPresented();
+    try testing.expectEqual(.{ Phase.cell_still, 255 }, .{ vm.phase, vm.still });
+    try testing.expect(vm.userResume());
+    try testing.expectEqual(.{ Domain.tt, 1, 1 }, .{ vm.domain, vm.pgcn, vm.celln });
+    try testing.expectEqual(Phase.play_cell, vm.phase);
+    try testing.expect(!vm.menuCall(.root)); // no VTS menus on this disc
+    try testing.expect(!vm.userResume()); // already in the title
+}
+
+test "Set instructions" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    vm.activateButton(&.{
+        cmd("71000002ffff0000"), cmd("7300000200050000"), // GPRM2 = 65535; GPRM2 += 5 (saturates)
+        cmd("7100000300030000"), cmd("7400000300050000"), // GPRM3 = 3; GPRM3 -= 5 (stops at 0)
+        cmd("7100000400070000"), cmd("7600000400000000"), // GPRM4 = 7; GPRM4 /= 0
+        cmd("7100000500110000"), cmd("7700000500050000"), // GPRM5 = 17; GPRM5 %= 5
+        cmd("7100000600010000"), cmd("7100000700020000"), cmd("6200000600070000"), // GPRM6 <-> GPRM7
+        cmd("71000009000e0000"), cmd("79000009000c0000"), // GPRM9 = 14; GPRM9 &= 12
+        cmd("7a00000a00030000"), cmd("7b00000b00050000"), // GPRM10 |= 3; GPRM11 ^= 5
+    });
+    try testing.expectEqual(0xffff, vm.gprm[2]);
+    try testing.expectEqual(0, vm.gprm[3]);
+    try testing.expectEqual(0xffff, vm.gprm[4]);
+    try testing.expectEqual(2, vm.gprm[5]);
+    try testing.expectEqual(.{ 2, 1 }, .{ vm.gprm[6], vm.gprm[7] });
+    try testing.expectEqual(12, vm.gprm[9]);
+    try testing.expectEqual(3, vm.gprm[10]);
+    try testing.expectEqual(5, vm.gprm[11]);
+}
+
+test "rnd(n) gives 1..n" {
+    var d: TestDisc = undefined;
+    d.init();
+    var seen: [7]bool = @splat(false);
+    for (0..300) |seed| {
+        var vm = Vm.init(&d.disc, seed);
+        vm.activateButton(&.{cmd("7800000800060000")}); // GPRM8 = rnd(6)
+        try testing.expect(vm.gprm[8] >= 1 and vm.gprm[8] <= 6);
+        seen[vm.gprm[8]] = true;
+    }
+    try testing.expectEqualSlices(bool, &.{ false, true, true, true, true, true, true }, &seen);
+}
+
+test "GoTo is relative to the command area, Break ends it" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    vm.activateButton(&.{
+        cmd("7100000000030000"), // 1: GPRM0 = 3
+        cmd("00a1000000030004"), // 2: if (GPRM0 == 3) GoTo 4
+        cmd("7100000100090000"), // 3: GPRM1 = 9 (skipped)
+        cmd("7100000200010000"), // 4: GPRM2 = 1
+        cmd("0002000000000000"), // 5: Break
+        cmd("7100000300010000"), // 6: GPRM3 = 1 (not reached)
+    });
+    try testing.expectEqual(.{ 3, 0, 1, 0 }, .{ vm.gprm[0], vm.gprm[1], vm.gprm[2], vm.gprm[3] });
+}
+
+test "an endless command loop stops the VM" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    vm.start();
+    vm.activateButton(&.{cmd("0001000000000001")}); // GoTo 1
+    try testing.expectEqual(Phase.stopped, vm.phase);
+}
+
+test "SetHL_BTNN selects a button" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    try testing.expectEqual(1, vm.button());
+    vm.activateButton(&.{cmd("560000000c000000")});
+    try testing.expectEqual(3, vm.button());
+}
+
+test "user operations: title, PGC and EVOBU masks" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    vm.start();
+    try testing.expect(vm.uopAllowed(0, 0) and vm.uopAllowed(1, 0));
+    try testing.expect(!vm.uopAllowed(2, 1 << 2)); // the EVOBU mask
+    vm.titlePlay(2);
+    try testing.expect(!vm.uopAllowed(0, 0) and !vm.uopAllowed(1, 0)); // TT_PB_TY
+    try testing.expect(vm.uopAllowed(2, 0));
+    d.title_pgcs[2].uop_mask = 1 << 5;
+    try testing.expect(!vm.uopAllowed(5, 0)); // the PGC mask
+}
+
+test "Title_Play resets the GPRMs except presets; PTT_Play within a title skips the pre-commands" {
+    var d: TestDisc = undefined;
+    d.init();
+    var vm = Vm.init(&d.disc, 1);
+    vm.presetGprm(1, 5);
+    vm.gprm[5] = 9;
+    vm.titlePlay(1);
+    try testing.expectEqual(.{ 0, 5 }, .{ vm.gprm[5], vm.gprm[1] });
+
+    vm.gprm[0] = 1;
+    vm.pttPlay(1, 1); // PTT_Search in the current title: PGC 1's pre (GPRM0 = 0) does not run
+    try testing.expectEqual(1, vm.gprm[0]);
+    vm.pttPlay(2, 1); // another title: registers reset
+    try testing.expectEqual(.{ 0, 5 }, .{ vm.gprm[0], vm.gprm[1] });
+    try testing.expectEqual(.{ 2, 1 }, vm.titleChapter());
+}

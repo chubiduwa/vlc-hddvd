@@ -165,3 +165,140 @@ pub fn hit(h: *const Hli, x: i32, y: i32) u8 {
     }
     return 0;
 }
+
+// ---- tests ------------------------------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn testPutButton(b: *[hli_size]u8, i: usize, color: u2, sx: u11, ex: u11, sy: u11, ey: u11, auto: bool, adj: [4]u8, cmd0: nav.Cmd) void {
+    const e = 6228 + i * 74;
+    const pos: u48 = @as(u48, color) << 46 | @as(u48, sx) << 35 | @as(u48, ex) << 24 |
+        @as(u48, @intFromBool(auto)) << 22 | @as(u48, sy) << 11 | ey;
+    std.mem.writeInt(u48, b[e..][0..6], pos, .big);
+    @memcpy(b[e + 6 ..][0..4], &adj);
+    @memcpy(b[e + 10 ..][0..8], &cmd0);
+}
+
+/// A 2-button HLI: button 1 (100,200)-(300,250), button 2 (400,200)-(600,250) with auto action.
+fn testHli() [hli_size]u8 {
+    var b: [hli_size]u8 = @splat(0);
+    b[0] = 'H';
+    b[1] = 'L';
+    std.mem.writeInt(u16, b[2..4], 1, .big);
+    std.mem.writeInt(u32, b[4..8], 90_000, .big);
+    std.mem.writeInt(u32, b[8..12], 270_000, .big);
+    std.mem.writeInt(u32, b[12..16], 180_000, .big);
+    b[22] = 0; // BTN_OFN
+    b[23] = 2; // BTN_Ns
+    b[24] = 2; // NSL_BTN_Ns
+    b[26] = 2; // FOSL_BTNN
+    b[27] = 63; // FOAC_BTNN: the selected button
+    b[28] = 0x80; // SP_USE #0: decoding stream 0x20 carries buttons
+    std.mem.writeInt(u32, b[60..64], 0x8c260fff, .big); // colour 1, selection
+    std.mem.writeInt(u32, b[64..68], 0xcc210fff, .big); // colour 1, action
+    const c8 = b[84..][0..2048]; // 8-bit colour 1: value 1 = Y 0x50, Cr 0x60, Cb 0x70, contrast 0x00 (opaque)
+    c8[3..6].* = .{ 0x50, 0x60, 0x70 };
+    c8[768] = 0xff;
+    c8[769] = 0x00;
+    testPutButton(&b, 0, 1, 100, 300, 200, 250, false, .{ 1, 1, 1, 2 }, .{ 0x71, 0, 0, 0, 0, 1, 0, 0 });
+    testPutButton(&b, 1, 1, 400, 600, 200, 250, true, .{ 2, 2, 1, 2 }, .{ 0x71, 0, 0, 0, 0, 2, 0, 0 });
+    return b;
+}
+
+/// Palette entry i = Y 16i, Cr 0x80 + i, Cb 0x40 + i (0x00YYCrCb).
+fn testPalette() [16]u32 {
+    var p: [16]u32 = undefined;
+    for (&p, 0..) |*e, i| e.* = @intCast((i * 16) << 16 | (0x80 + i) << 8 | (0x40 + i));
+    return p;
+}
+
+test "parse an HLI" {
+    const raw = testHli();
+    const h = parse(&raw).?;
+    try testing.expectEqual(1, h.status);
+    try testing.expectEqual(90_000, h.start_ptm);
+    try testing.expectEqual(270_000, h.end_ptm);
+    try testing.expectEqual(180_000, h.select_end_ptm);
+    try testing.expectEqual(2, h.n_buttons);
+    try testing.expectEqual(2, h.force_select);
+    try testing.expectEqual(63, h.force_activate);
+    try testing.expectEqual(0x80, h.sp_use[0]);
+    try testing.expectEqual(0x8c260fff, h.colors[0][0]);
+    try testing.expectEqual(0xcc210fff, h.colors[0][1]);
+
+    const b1 = h.buttons[0];
+    try testing.expectEqual(1, b1.color);
+    try testing.expectEqual(.{ 100, 300, 200, 250 }, .{ b1.sx, b1.ex, b1.sy, b1.ey });
+    try testing.expect(!b1.auto_action);
+    try testing.expectEqualSlices(u8, &.{ 1, 1, 1, 2 }, &b1.adjacent);
+    try testing.expectEqualSlices(u8, &.{ 0x71, 0, 0, 0, 0, 1, 0, 0 }, &b1.cmds[0]);
+    try testing.expect(h.buttons[1].auto_action);
+}
+
+test "parse rejects a buffer without the HL tag" {
+    var raw = testHli();
+    raw[0] = 'X';
+    try testing.expectEqual(null, parse(&raw));
+}
+
+test "the assembler joins 5 HLI packs" {
+    const raw = testHli();
+    var a: Assembler = .{};
+    var off: usize = 0;
+    for (0..4) |_| {
+        try testing.expectEqual(null, a.feed(raw[off..][0..2027]));
+        off += 2027;
+    }
+    const h = a.feed(raw[off..]).?; // the 5th pack holds the remaining 1672 bytes
+    try testing.expectEqual(2, h.n_buttons);
+
+    // A full-size pack after 4 others starts a new HLI instead of overflowing.
+    for (0..4) |_| _ = a.feed(raw[0..2027]);
+    try testing.expectEqual(null, a.feed(raw[0..2027]));
+    try testing.expectEqual(1, a.packs);
+}
+
+test "contrast to alpha" {
+    try testing.expectEqual(0, alpha2(0));
+    try testing.expectEqual(32, alpha2(1));
+    try testing.expectEqual(240, alpha2(14));
+    try testing.expectEqual(255, alpha2(15));
+    try testing.expectEqual(255, alpha8(0x00));
+    try testing.expectEqual(0, alpha8(0xff));
+    try testing.expectEqual(0xef, alpha8(0x10));
+}
+
+test "highlight colours: background first, palette as Y Cb Cr" {
+    const raw = testHli();
+    const h = parse(&raw).?;
+    const pal = testPalette();
+
+    // 8c260fff: background 8 (contrast 0), pattern 12, emphasis-1 2, emphasis-2 6 (all contrast 15).
+    const sel = highlight(&h, 1, false, &pal).?;
+    try testing.expectEqual(.{ 100, 300, 200, 250 }, .{ sel.sx, sel.ex, sel.sy, sel.ey });
+    try testing.expectEqual([4]u8{ 8 * 16, 0x48, 0x88, 0 }, sel.lut2[0]);
+    try testing.expectEqual([4]u8{ 12 * 16, 0x4c, 0x8c, 255 }, sel.lut2[1]);
+    try testing.expectEqual([4]u8{ 2 * 16, 0x42, 0x82, 255 }, sel.lut2[2]);
+    try testing.expectEqual([4]u8{ 6 * 16, 0x46, 0x86, 255 }, sel.lut2[3]);
+    // 8-bit table: (Y, Cr, Cb) on the disc becomes (Y, Cb, Cr); contrast 0x00 is opaque.
+    try testing.expectEqual([4]u8{ 0x50, 0x70, 0x60, 255 }, sel.lut8[1]);
+    try testing.expectEqual(0, sel.lut8[0][3]);
+
+    // cc210fff: the action colours.
+    const act = highlight(&h, 1, true, &pal).?;
+    try testing.expectEqual([4]u8{ 12 * 16, 0x4c, 0x8c, 0 }, act.lut2[0]);
+    try testing.expectEqual([4]u8{ 1 * 16, 0x41, 0x81, 255 }, act.lut2[3]);
+
+    try testing.expectEqual(null, highlight(&h, 0, false, &pal));
+    try testing.expectEqual(null, highlight(&h, 3, false, &pal));
+}
+
+test "hit-testing is inclusive of the rectangle edges" {
+    const raw = testHli();
+    const h = parse(&raw).?;
+    try testing.expectEqual(1, hit(&h, 100, 200));
+    try testing.expectEqual(1, hit(&h, 300, 250));
+    try testing.expectEqual(2, hit(&h, 500, 225));
+    try testing.expectEqual(0, hit(&h, 350, 225));
+    try testing.expectEqual(0, hit(&h, 500, 251));
+}

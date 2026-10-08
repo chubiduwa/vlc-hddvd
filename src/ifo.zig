@@ -289,3 +289,149 @@ pub fn loadDisc(gpa: std.mem.Allocator, fs: *vfs.Fs) Error!nav.Disc {
     }
     return d;
 }
+
+// ---- tests ------------------------------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "BCD playback time at each frame rate" {
+    try testing.expectEqual(10_010_000, bcdTimeUs(0x00_00_90_80)); // 00:00:10:00 at 29.97
+    try testing.expectEqual(90_480_000, bcdTimeUs(0x00_01_30_92)); // 00:01:30:12 at 25
+    try testing.expectEqual(3_603_600_000, bcdTimeUs(0x01_80_80_80)); // 01:00:00:00 at 59.94
+    try testing.expectEqual(2_000_000, bcdTimeUs(0x00_80_02_80)); // 00:00:02:00 at 50
+}
+
+fn put16(b: []u8, off: usize, v: u16) void {
+    std.mem.writeInt(u16, b[off..][0..2], v, .big);
+}
+
+fn put32(b: []u8, off: usize, v: u32) void {
+    std.mem.writeInt(u32, b[off..][0..4], v, .big);
+}
+
+/// A PGCI with 2 programs, 2 cells and one pre, post and cell command each.
+fn testPgci() [400]u8 {
+    var b: [400]u8 = @splat(0);
+    put16(&b, 0, 2); // programs
+    put16(&b, 2, 2); // cells
+    put32(&b, 4, 0x00_00_90_80); // 10 s at 29.97
+    put32(&b, 8, 0x0000_0024); // UOP mask
+    put16(&b, 12, 0x8000); // audio stream control #0
+    put32(&b, 28, 0x8000_0000); // sub-picture stream control #0
+    put16(&b, 156, 4); // next PGCN
+    put16(&b, 158, 2); // previous PGCN
+    put16(&b, 160, 0xffff); // go-up: resume
+    b[164] = 255; // PGC still: infinite
+    put16(&b, 168, 304); // command table
+    put16(&b, 170, 338); // program map
+    put16(&b, 172, 344); // cell playback information
+    put32(&b, 240, 0x00_eb_80_80); // HD palette #0
+    // Command table: 1 pre, 1 post, 1 cell command, no resume command.
+    put16(&b, 304, 1);
+    put16(&b, 306, 1);
+    put16(&b, 308, 1);
+    @memcpy(b[314..322], &[_]u8{ 0x71, 0, 0, 0, 0, 1, 0, 0 });
+    @memcpy(b[322..330], &[_]u8{ 0x30, 2, 0, 0, 0, 2, 0, 0 });
+    @memcpy(b[330..338], &[_]u8{ 0x20, 0xb5, 0, 0, 0, 1, 0, 2 });
+    put16(&b, 338, 1); // program 1 starts at cell 1
+    put16(&b, 340, 2); // program 2 at cell 2
+    // Cell 2: first cell of an angle block, seamless, STC discontinuity, infinite still, 1 command from #1.
+    put32(&b, 344 + 4, 0x00_00_82_80); // cell 1: 2 s
+    put32(&b, 344 + 8, 100);
+    put32(&b, 344 + 20, 199);
+    put32(&b, 372, 0x5a00_ff00);
+    put32(&b, 372 + 4, 0x00_00_88_80); // cell 2: 8 s
+    put32(&b, 372 + 8, 200);
+    put32(&b, 372 + 20, 299);
+    put16(&b, 372 + 24, 0x1001);
+    return b;
+}
+
+test "parse a PGC" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const b = testPgci();
+    const cat: u64 = 1 << 63 | 1 << 57 | 3 << 48; // entry, HLI not available, VTS_TTN 3
+    const p = try parsePgc(arena.allocator(), &b, 0, cat);
+
+    try testing.expect(p.entry and p.hli_off and !p.resume_prohibited);
+    try testing.expectEqual(3, p.vts_ttn);
+    try testing.expectEqual(10_010_000, p.duration_us);
+    try testing.expectEqual(0x24, p.uop_mask);
+    try testing.expectEqual(.{ 4, 2, 0xffff, 255 }, .{ p.next_pgcn, p.prev_pgcn, p.goup_pgcn, p.still });
+    try testing.expectEqual(0x8000, p.audio_ctl[0]);
+    try testing.expectEqual(0x8000_0000, p.spst_ctl[0]);
+    try testing.expectEqual(0x00eb8080, p.hd_palette[0]);
+    try testing.expectEqualSlices(u16, &.{ 1, 2 }, p.program_cells);
+    try testing.expectEqual(.{ 1, 1, 1, 0 }, .{ p.pre.len, p.post.len, p.cell_cmds.len, p.resume_cmds.len });
+    try testing.expectEqual(0x30, p.post[0][0]);
+
+    const c1 = p.cells[0];
+    try testing.expectEqual(.{ 100, 199 }, .{ c1.first_sector, c1.last_sector });
+    try testing.expectEqual(.{ 0, 0, 0 }, .{ c1.block_mode, c1.still, c1.cmd_count });
+    const c2 = p.cells[1];
+    try testing.expectEqual(.{ 1, 1 }, .{ c2.block_mode, c2.block_type });
+    try testing.expect(c2.seamless and c2.stc_discontinuity);
+    try testing.expectEqual(.{ 255, 1, 1 }, .{ c2.still, c2.cmd_count, c2.cmd_first });
+    try testing.expectEqual(8_008_000, c2.duration_us);
+}
+
+test "a truncated PGC is rejected" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const b = testPgci();
+    try testing.expectError(error.BadIfo, parsePgc(arena.allocator(), b[0..300], 0, 0));
+    try testing.expectError(error.BadIfo, parsePgc(arena.allocator(), b[0..350], 0, 0)); // cells cut off
+}
+
+test "parse a menu table" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var b: [344]u8 = @splat(0);
+    put16(&b, 0, 1); // 1 language unit
+    put16(&b, 8, ('e' << 8) | 'n');
+    put32(&b, 12, 16); // the unit at 16
+    put16(&b, 16, 1); // 1 PGC
+    std.mem.writeInt(u64, b[24..32], 1 << 63 | 2 << 52, .big); // entry, title menu
+    put32(&b, 32, 24); // its PGCI at 16 + 24, after the 12-byte entry
+    const lus = try parseMenus(arena.allocator(), &b, 0);
+    try testing.expectEqual(1, lus.len);
+    try testing.expectEqual(('e' << 8) | 'n', lus[0].lang);
+    try testing.expectEqual(1, lus[0].pgcs.len);
+    try testing.expect(lus[0].pgcs[0].entry);
+    try testing.expectEqual(2, lus[0].pgcs[0].menu_id);
+}
+
+test "chapter times count the first angle only" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cell = struct {
+        fn make(secs: i64, mode: u2) nav.Cell {
+            return .{ .first_sector = 0, .last_sector = 0, .duration_us = secs * 1_000_000, .block_mode = mode, .block_type = if (mode != 0) 1 else 0, .seamless = false, .stc_discontinuity = false, .still = 0, .cmd_count = 0, .cmd_first = 0 };
+        }
+    };
+    var b = testPgci();
+    put16(&b, 0, 0);
+    put16(&b, 2, 0);
+    const empty = try parsePgc(a, &b, 0, 0);
+
+    // PGC 1: 10 s, then a 2-angle block of 4 s, then 6 s (20 s); chapter 2 starts at cell 4. PGC 2: 5 s.
+    var cells1 = [_]nav.Cell{ cell.make(10, 0), cell.make(4, 1), cell.make(4, 3), cell.make(6, 0) };
+    var programs1 = [_]u16{ 1, 4 };
+    var p1 = empty;
+    p1.cells = &cells1;
+    p1.program_cells = &programs1;
+    p1.duration_us = 20_000_000;
+    var programs2 = [_]u16{1};
+    var p2 = empty;
+    p2.program_cells = &programs2;
+    p2.duration_us = 5_000_000;
+    var pgcs = [_]nav.Pgc{ p1, p2 };
+    const vts: nav.Vts = .{ .title_pgcs = &pgcs, .ptts = &.{}, .menus = &.{}, .title_evos = &.{}, .menu_evos = &.{} };
+
+    const times, const total = try chapterTimes(a, vts, &.{ .{ .pgcn = 1, .pgn = 1 }, .{ .pgcn = 1, .pgn = 2 }, .{ .pgcn = 2, .pgn = 1 } });
+    try testing.expectEqualSlices(i64, &.{ 0, 14_000_000, 20_000_000 }, times);
+    try testing.expectEqual(25_000_000, total);
+    try testing.expectError(error.BadIfo, chapterTimes(a, vts, &.{.{ .pgcn = 3, .pgn = 1 }}));
+}

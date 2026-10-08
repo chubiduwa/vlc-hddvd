@@ -335,3 +335,236 @@ fn decodeName(raw: []const u8, out: *[255]u8) []const u8 {
     }
     return out[0..n];
 }
+
+// ---- tests ------------------------------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// A synthetic UDF image: HVDVD_TS/HV001I01.IFO (5000 bytes in two extents, an Extended File Entry) and
+/// HVDVD_TS/TINY (4 bytes embedded in its File Entry). With `meta`, the file entries and directories live in a
+/// Metadata Partition (as on HD DVD) and file data is addressed with long_ads into the physical partition.
+const TestImage = struct {
+    const part_start = 64; // physical partition, in sectors
+    const meta_file_lbn = 20; // the Metadata File's entry, in the physical partition
+    const meta_start = 30; // the Metadata File's data (= metadata block 0), in the physical partition
+
+    data: []u8,
+    meta: bool,
+
+    fn init(meta: bool) !TestImage {
+        var img: TestImage = .{ .data = try testing.allocator.alloc(u8, 300 * block_size), .meta = meta };
+        @memset(img.data, 0);
+        img.build();
+        return img;
+    }
+
+    fn deinit(img: *TestImage) void {
+        testing.allocator.free(img.data);
+    }
+
+    fn block(img: *TestImage, sector: usize) *[block_size]u8 {
+        return img.data[sector * block_size ..][0..block_size];
+    }
+
+    /// Sector of logical block `lbn` of the partition holding file entries and directories.
+    fn fsSector(img: *const TestImage, lbn: usize) usize {
+        return part_start + (if (img.meta) @as(usize, meta_start) else 0) + lbn;
+    }
+
+    fn put16(b: []u8, off: usize, v: u16) void {
+        std.mem.writeInt(u16, b[off..][0..2], v, .little);
+    }
+
+    fn put32(b: []u8, off: usize, v: u32) void {
+        std.mem.writeInt(u32, b[off..][0..4], v, .little);
+    }
+
+    /// File Entry (tag 261) or Extended File Entry (tag 266) with allocation descriptors `ads` of type `ad_type`.
+    fn fileEntry(b: *[block_size]u8, extended: bool, is_dir: bool, size: u64, ad_type: u16, ads: []const u8) void {
+        put16(b, 0, if (extended) 266 else 261);
+        b[16 + 11] = if (is_dir) 4 else 5;
+        put16(b, 16 + 18, ad_type);
+        std.mem.writeInt(u64, b[56..64], size, .little);
+        const l_ea: usize = if (extended) 208 else 168;
+        put32(b, l_ea, 0);
+        put32(b, l_ea + 4, @intCast(ads.len));
+        @memcpy(b[l_ea + 8 ..][0..ads.len], ads);
+    }
+
+    fn shortAd(len: u32, lbn: u32) [8]u8 {
+        var a: [8]u8 = undefined;
+        put32(&a, 0, len);
+        put32(&a, 4, lbn);
+        return a;
+    }
+
+    fn longAd(len: u32, lbn: u32, ref: u16) [16]u8 {
+        var a: [16]u8 = @splat(0);
+        put32(&a, 0, len);
+        put32(&a, 4, lbn);
+        put16(&a, 8, ref);
+        return a;
+    }
+
+    /// File Identifier Descriptor; returns its padded length. An empty name is the parent entry.
+    fn fid(out: []u8, name: []const u8, is_dir: bool, lbn: u32, ref: u16) usize {
+        put16(out, 0, 257);
+        out[18] = (if (name.len == 0) @as(u8, 8) else 0) | (if (is_dir) @as(u8, 2) else 0);
+        const l_fi: usize = if (name.len == 0) 0 else 1 + name.len;
+        out[19] = @intCast(l_fi);
+        put32(out, 20, block_size);
+        put32(out, 24, lbn);
+        put16(out, 28, ref);
+        if (l_fi > 0) {
+            out[38] = 8; // CS0, one byte per character
+            @memcpy(out[39..][0..name.len], name);
+        }
+        return (38 + l_fi + 3) & ~@as(usize, 3);
+    }
+
+    /// One byte of the IFO file's content.
+    fn pattern(i: usize) u8 {
+        return @intCast(i % 251);
+    }
+
+    fn build(img: *TestImage) void {
+        // Volume Recognition Sequence, Anchor, Volume Descriptor Sequence.
+        img.block(16)[1..6].* = "BEA01".*;
+        img.block(17)[1..6].* = "NSR03".*;
+        img.block(18)[1..6].* = "TEA01".*;
+        const avdp = img.block(256);
+        put16(avdp, 0, 2);
+        put32(avdp, 16, 3 * block_size);
+        put32(avdp, 20, 32);
+        const pd = img.block(32);
+        put16(pd, 0, 5);
+        put16(pd, 22, 0);
+        put32(pd, 188, part_start);
+        const lvd = img.block(33);
+        put16(lvd, 0, 6);
+        put32(lvd, 212, block_size);
+        const fs_ref: u16 = if (img.meta) 1 else 0; // partition reference of entries and directories
+        put32(lvd, 252, 0); // File Set Descriptor at block 0
+        put16(lvd, 256, fs_ref);
+        put32(lvd, 268, if (img.meta) 2 else 1);
+        lvd[440] = 1; // type 1 map: physical partition 0
+        lvd[441] = 6;
+        put16(lvd, 444, 0);
+        if (img.meta) { // type 2 map: Metadata Partition on partition 0
+            lvd[446] = 2;
+            lvd[447] = 64;
+            @memcpy(lvd[446 + 5 ..][0..23], "*UDF Metadata Partition");
+            put16(lvd, 446 + 38, 0);
+            put32(lvd, 446 + 40, meta_file_lbn);
+            const mf = img.block(part_start + meta_file_lbn);
+            fileEntry(mf, false, false, 16 * block_size, 0, &shortAd(16 * block_size, meta_start));
+        }
+        put16(img.block(34), 0, 8); // Terminating Descriptor
+
+        // File Set Descriptor -> root directory (block 1).
+        const fsd = img.block(img.fsSector(0));
+        put16(fsd, 0, 256);
+        put32(fsd, 404, 1);
+        put16(fsd, 408, fs_ref);
+
+        // Root directory: data in block 2, one entry HVDVD_TS (entry in block 3).
+        var dir = img.block(img.fsSector(2));
+        var n = fid(dir, "", true, 1, fs_ref);
+        n += fid(dir[n..], "HVDVD_TS", true, 3, fs_ref);
+        fileEntry(img.block(img.fsSector(1)), false, true, n, 0, &shortAd(@intCast(n), 2));
+
+        // HVDVD_TS: data in block 4; HV001I01.IFO (entry in block 5) and TINY (entry in block 6).
+        dir = img.block(img.fsSector(4));
+        n = fid(dir, "", true, 1, fs_ref);
+        n += fid(dir[n..], "HV001I01.IFO", false, 5, fs_ref);
+        n += fid(dir[n..], "TINY", false, 6, fs_ref);
+        fileEntry(img.block(img.fsSector(3)), false, true, n, 0, &shortAd(@intCast(n), 4));
+
+        // HV001I01.IFO: 4096 bytes at physical blocks 100-101, then 904 bytes at block 110.
+        var ads: [32]u8 = undefined;
+        const ad_len: usize = if (img.meta) 16 else 8;
+        if (img.meta) {
+            ads[0..16].* = longAd(4096, 100, 0);
+            ads[16..32].* = longAd(904, 110, 0);
+        } else {
+            ads[0..8].* = shortAd(4096, 100);
+            ads[8..16].* = shortAd(904, 110);
+        }
+        fileEntry(img.block(img.fsSector(5)), true, false, 5000, if (img.meta) 1 else 0, ads[0 .. 2 * ad_len]);
+        for (0..5000) |i| {
+            const at = if (i < 4096) (part_start + 100) * block_size + i else (part_start + 110) * block_size + i - 4096;
+            img.data[at] = pattern(i);
+        }
+
+        // TINY: embedded data.
+        fileEntry(img.block(img.fsSector(6)), false, false, 4, 3, "abcd");
+    }
+
+    fn read(ctx: *anyopaque, offset: u64, buf: []u8) Error!usize {
+        const img: *TestImage = @ptrCast(@alignCast(ctx));
+        if (offset >= img.data.len) return 0;
+        const n = @min(buf.len, img.data.len - offset);
+        @memcpy(buf[0..n], img.data[@intCast(offset)..][0..n]);
+        return n;
+    }
+};
+
+fn testReadFiles(meta: bool) !void {
+    var img = try TestImage.init(meta);
+    defer img.deinit();
+    try testing.expect(Volume.probe(&img, TestImage.read));
+    var v = try Volume.open(testing.allocator, &img, TestImage.read);
+    defer v.deinit();
+
+    const ifo = try v.lookup("HVDVD_TS/HV001I01.IFO");
+    defer v.freeInfo(ifo);
+    try testing.expectEqual(5000, ifo.size);
+    try testing.expect(!ifo.is_dir);
+    try testing.expectEqual(2, ifo.extents.len);
+
+    const all = try testing.allocator.alloc(u8, 5000);
+    defer testing.allocator.free(all);
+    try testing.expectEqual(5000, try v.pread(ifo, 0, all));
+    for (all, 0..) |c, i| try testing.expectEqual(TestImage.pattern(i), c);
+
+    var across: [20]u8 = undefined; // spans the two extents
+    try testing.expectEqual(20, try v.pread(ifo, 4090, &across));
+    for (across, 4090..) |c, i| try testing.expectEqual(TestImage.pattern(i), c);
+    try testing.expectEqual(10, try v.pread(ifo, 4990, &across)); // clipped at the end of the file
+    try testing.expectEqual(0, try v.pread(ifo, 5000, &across));
+
+    const tiny = try v.lookup("hvdvd_ts/tiny"); // names are matched case-insensitively
+    defer v.freeInfo(tiny);
+    var four: [8]u8 = undefined;
+    try testing.expectEqual(4, try v.pread(tiny, 0, &four));
+    try testing.expectEqualStrings("abcd", four[0..4]);
+
+    const root = try v.lookup("");
+    defer v.freeInfo(root);
+    try testing.expect(root.is_dir);
+    try testing.expectError(error.NotFound, v.lookup("HVDVD_TS/HV002I01.IFO"));
+    try testing.expectError(error.NotFound, v.lookup("HVDVD_TS/TINY/X"));
+}
+
+test "read files from a UDF image with a physical partition" {
+    try testReadFiles(false);
+}
+
+test "read files through a Metadata Partition" {
+    try testReadFiles(true);
+}
+
+test "an image without a Volume Recognition Sequence is not UDF" {
+    var img = try TestImage.init(false);
+    defer img.deinit();
+    @memset(img.block(17), 0); // drop NSR03
+    try testing.expect(!Volume.probe(&img, TestImage.read));
+    try testing.expectError(error.NotUdf, Volume.open(testing.allocator, &img, TestImage.read));
+}
+
+test "CS0 names: 8-bit and 16-bit compression" {
+    var out: [255]u8 = undefined;
+    try testing.expectEqualStrings("HVDVD_TS", decodeName("\x08HVDVD_TS", &out));
+    try testing.expectEqualStrings("AB?", decodeName("\x10\x00A\x00B\x01\x00", &out));
+    try testing.expectEqualStrings("", decodeName("", &out));
+}
