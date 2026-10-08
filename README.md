@@ -1,5 +1,7 @@
 # vlc-hddvd
 
+[![CI](https://github.com/chubiduwa/vlc-hddvd/actions/workflows/ci.yml/badge.svg)](https://github.com/chubiduwa/vlc-hddvd/actions/workflows/ci.yml)
+
 An HD DVD plugin for VLC 3.0.
 
 ## What it supports
@@ -10,24 +12,45 @@ An HD DVD plugin for VLC 3.0.
 - **HD DVD sub-pictures and button highlights.**
 - **VLC controls:** arrow keys, Enter and the mouse for buttons; the disc-menu key; Playback > Title and Chapter.
 
-Not supported yet: Advanced Content (most later discs), encrypted (AACS) discs, physical drives, and angles on
-interleaved cells. Tested on macOS; Windows builds but is untested.
+Not supported yet:
+
+- Advanced Content
+- angles on interleaved cells
+
+Not going to be supported:
+
+- encrypted (AACS) discs
+- physical drives (unless already unencrypted already)
 
 ## Build
 
-Build it (needs [Zig](https://ziglang.org) 0.17 and the VLC 3.0 plugin SDK):
+Build it (needs [Zig](https://ziglang.org) 0.17 and the VLC 3.0 plugin SDK, the `sdk` folder of VLC's Windows
+`.7z` package; its headers serve every platform):
 
 ```sh
 zig build --prefix zig-out/macos -Dvlc-sdk=/path/to/vlc-3.0.x/sdk -Dtarget=aarch64-macos       # macOS (Apple silicon)
 zig build --prefix zig-out/macos -Dvlc-sdk=/path/to/vlc-3.0.x/sdk -Dtarget=x86_64-macos        # macOS (Intel)
 zig build --prefix zig-out/win64 -Dvlc-sdk=/path/to/vlc-3.0.x/sdk -Dtarget=x86_64-windows-gnu  # Windows
+zig build --prefix zig-out/linux -Dvlc-sdk=/path/to/vlc-3.0.x/sdk -Dtarget=x86_64-linux-gnu \
+  -Dvlc-lib=/usr/lib/x86_64-linux-gnu                                                         # Linux (x86_64)
+zig build --prefix zig-out/linux -Dvlc-sdk=/path/to/vlc-3.0.x/sdk -Dtarget=aarch64-linux-gnu \
+  -Dvlc-lib=/usr/lib/aarch64-linux-gnu                                                        # Linux (arm64)
+zig build test                                                                                # unit tests
 ```
 
-Then point VLC at the plugin folder, or copy the plugin into VLC's `plugins/access/` folder (Windows):
+macOS links against `/Applications/VLC.app` (`-Dvlc-app=` for another copy; an Intel build needs the universal
+or Intel VLC). Linux links against the system's `libvlccore.so` (Debian/Ubuntu: `libvlccore-dev`); `-Dvlc-lib` is
+the folder holding it.
+
+Then point VLC at the plugin folder, or copy the plugin into VLC's `plugins/access/` folder (Windows,
+`/usr/lib/<arch>-linux-gnu/vlc/plugins/access/` on Debian/Ubuntu):
 
 ```sh
-export VLC_PLUGIN_PATH=<repo-folder>/zig-out/macos/lib
+export VLC_PLUGIN_PATH=<repo-folder>/zig-out/macos/lib    # zig-out/linux/lib on Linux
 ```
+
+The [CI workflow](.github/workflows/ci.yml) runs the tests and builds every platform on each push; the plugins
+are attached to each run as artifacts.
 
 ## Play
 

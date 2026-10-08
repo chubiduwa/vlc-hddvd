@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: 0.17.0
+  VLC_VERSION: 3.0.24
+  # Checksums published by VideoLAN next to each download.
+  VLC_WIN64_SHA256: 1ed59c09152e78aff84663fa76efab26057716576db74332858810e5ef54ae1f
+  VLC_MACOS_SHA256: 2c8e89f7f42e53c2fb0e87b6dfa39b49f1364b25080aaa2e476ac74c0d7beb3c
+
+jobs:
+  # The VLC plugin SDK (headers, libvlccore.lib) only ships in the Windows .7z package. The headers are
+  # platform-neutral, so every build uses them.
+  sdk:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch the VLC SDK
+        run: |
+          curl -fsSLo vlc.7z "https://download.videolan.org/pub/videolan/vlc/$VLC_VERSION/win64/vlc-$VLC_VERSION-win64.7z"
+          echo "$VLC_WIN64_SHA256  vlc.7z" | sha256sum -c
+          7z x -y vlc.7z "vlc-$VLC_VERSION/sdk" > /dev/null
+          mv "vlc-$VLC_VERSION/sdk" vlc-sdk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vlc-sdk
+          path: vlc-sdk
+          retention-days: 1
+
+  linux:
+    needs: sdk
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: vlc-sdk
+          path: ${{ runner.temp }}/vlc-sdk
+      # Only libvlccore.so is taken from the system; the distribution's headers are older than the SDK's.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvlccore-dev
+      - run: zig build test --summary all
+      - run: >-
+          zig build --release --prefix zig-out/linux-${{ matrix.arch }}
+          -Dtarget=${{ matrix.arch }}-linux-gnu
+          -Dvlc-sdk=${{ runner.temp }}/vlc-sdk -Dvlc-lib=/usr/lib/${{ matrix.arch }}-linux-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hddvd-linux-${{ matrix.arch }}
+          path: zig-out/linux-${{ matrix.arch }}/lib/libhddvd_plugin.so
+
+  macos:
+    needs: sdk
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: vlc-sdk
+          path: ${{ runner.temp }}/vlc-sdk
+      # libvlccore.dylib comes from VLC.app; the universal build has both architectures.
+      - name: Fetch VLC.app
+        run: |
+          curl -fsSLo vlc.dmg "https://download.videolan.org/pub/videolan/vlc/$VLC_VERSION/macosx/vlc-$VLC_VERSION-universal.dmg"
+          echo "$VLC_MACOS_SHA256  vlc.dmg" | shasum -a 256 -c
+          hdiutil attach -nobrowse -readonly -mountpoint "$RUNNER_TEMP/vlc" vlc.dmg
+      - run: zig build test --summary all
+      - name: Build
+        run: |
+          for arch in aarch64 x86_64; do
+            zig build --release --prefix "zig-out/macos-$arch" -Dtarget=$arch-macos \
+              -Dvlc-sdk="$RUNNER_TEMP/vlc-sdk" -Dvlc-app="$RUNNER_TEMP/vlc/VLC.app"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hddvd-macos-aarch64
+          path: zig-out/macos-aarch64/lib/libhddvd_plugin.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hddvd-macos-x86_64
+          path: zig-out/macos-x86_64/lib/libhddvd_plugin.dylib
+
+  windows:
+    needs: sdk
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: vlc-sdk
+          path: ${{ runner.temp }}/vlc-sdk
+      - run: zig build test --summary all
+      - run: zig build --release --prefix zig-out/windows-x86_64 -Dtarget=x86_64-windows-gnu "-Dvlc-sdk=${{ runner.temp }}/vlc-sdk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hddvd-windows-x86_64
+          path: zig-out/windows-x86_64/bin/libhddvd_plugin.dll

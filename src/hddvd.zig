@@ -23,8 +23,10 @@ const sector_size = nav.sector_size;
 const gpa = std.heap.c_allocator;
 
 // C side (module.c, nav_glue.c).
-extern fn HddvdDemuxControl(demux: [*c]vlc.demux_t, query: c_int, args: vlc.va_list) callconv(.c) c_int;
-extern fn HddvdStreamControl(s: [*c]vlc.stream_t, query: c_int, args: vlc.va_list) callconv(.c) c_int;
+// The va_list controls take their types from the callback fields: on x86-64 System V, va_list is an array, and a
+// parameter declared with it here would not decay to a pointer as it does in the translated field types.
+const HddvdDemuxControl = @extern(@FieldType(vlc.demux_t, "pf_control"), .{ .name = "HddvdDemuxControl" });
+const HddvdStreamControl = @extern(@FieldType(vlc.stream_t, "pf_control"), .{ .name = "HddvdStreamControl" });
 extern fn hddvd_es_out_control(out: *vlc.es_out_t, query: c_int, ...) callconv(.c) c_int;
 extern fn hddvd_stream_delete(s: *vlc.stream_t) void;
 extern fn hddvd_inherit_string(obj: *vlc.vlc_object_t, name: [*:0]const u8) ?[*:0]u8;

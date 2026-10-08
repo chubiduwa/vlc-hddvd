@@ -1,11 +1,13 @@
-//! Builds libhddvd_plugin.{dylib,dll}, a VLC 3.0 plugin.
+//! Builds libhddvd_plugin.{dylib,dll,so}, a VLC 3.0 plugin.
 //!
 //!   zig build                                   # native (macOS arm64 here)
 //!   zig build -Dtarget=x86_64-windows-gnu       # Windows x64 DLL
 //!   zig build -Dtarget=x86_64-macos             # Intel Mac
+//!   zig build -Dvlc-sdk=/usr                    # Linux, with the distribution's libvlccore-dev
 //!
-//! Plugin headers come from the VLC Windows SDK (they are platform-neutral C).
-//! libvlccore comes from the SDK's import library on Windows and from VLC.app on macOS.
+//! Plugin headers come from the VLC Windows SDK (they are platform-neutral C), or from libvlccore-dev on Linux.
+//! libvlccore comes from the SDK's import library on Windows, from VLC.app on macOS and from the system on Linux
+//! (-Dvlc-lib overrides all three).
 
 const std = @import("std");
 
@@ -17,6 +19,7 @@ pub fn build(b: *std.Build) void {
         "../vlc-sdk/vlc-3.0.24/sdk";
     const vlc_app = b.option([]const u8, "vlc-app", "VLC.app (macOS libvlccore)") orelse
         "/Applications/VLC.app";
+    const vlc_lib = b.option([]const u8, "vlc-lib", "Folder with libvlccore (default: from vlc-sdk, vlc-app or the system)");
 
     const vlc_include: std.Build.LazyPath = .{ .cwd_relative = b.fmt("{s}/include/vlc/plugins", .{vlc_sdk}) };
     // What `pkg-config --cflags vlc-plugin` gives, plus MODULE_STRING (out-of-tree builds must set it).
@@ -55,14 +58,14 @@ pub fn build(b: *std.Build) void {
 
     switch (target.result.os.tag) {
         .windows => {
-            mod.addObjectFile(.{ .cwd_relative = b.fmt("{s}/lib/libvlccore.lib", .{vlc_sdk}) });
+            mod.addObjectFile(.{ .cwd_relative = b.fmt("{s}/libvlccore.lib", .{vlc_lib orelse b.fmt("{s}/lib", .{vlc_sdk})}) });
             mod.linkSystemLibrary("ws2_32", .{});
         },
-        .macos => {
-            mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/Contents/MacOS/lib", .{vlc_app}) });
+        else => {
+            const dir = vlc_lib orelse if (target.result.os.tag == .macos) b.fmt("{s}/Contents/MacOS/lib", .{vlc_app}) else null;
+            if (dir) |d| mod.addLibraryPath(.{ .cwd_relative = d });
             mod.linkSystemLibrary("vlccore", .{});
         },
-        else => mod.linkSystemLibrary("vlccore", .{}),
     }
 
     const lib = b.addLibrary(.{
