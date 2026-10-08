@@ -82,6 +82,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tests.zig"),
         .target = b.graph.host,
         .optimize = optimize,
+        .link_libc = true, // spu.zig allocates with std.heap.c_allocator, like the plugin
     }) });
     b.step("test", "Run the unit tests").dependOn(&b.addRunArtifact(tests).step);
 }
