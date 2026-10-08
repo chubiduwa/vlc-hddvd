@@ -21,11 +21,63 @@ pub fn unwrap(d: []const u8) []const u8 {
     return d[wrapper_header..][0..@min(size, d.len - wrapper_header)];
 }
 
+/// True if `d` is an AACS-wrapped file whose content is still encrypted: the wrapper's name field is then
+/// ciphertext too, where a decrypted file has "<name>.AACS".
+pub fn isEncrypted(d: []const u8) bool {
+    if (d.len < wrapper_header or !std.mem.eql(u8, d[0..4], "AACS")) return false;
+    return !std.mem.endsWith(u8, std.mem.sliceTo(d[11..wrapper_header], 0), ".AACS");
+}
+
+/// DATA_MIME_TY (Table 6.5.4.1.2-2).
+pub const Mime = enum(u8) {
+    playlist = 0x01,
+    manifest = 0x02,
+    markup = 0x03,
+    timing = 0x04,
+    advanced_subtitle = 0x05,
+    style = 0x06,
+    script = 0x07,
+    evob = 0x08,
+    tmap = 0x09,
+    jpeg = 0x0a,
+    png = 0x0b,
+    mng = 0x0c,
+    capture_video = 0x0d,
+    capture_drawing = 0x0e,
+    wav = 0x0f,
+    font = 0x10,
+    data = 0xff,
+    _,
+
+    pub fn name(m: Mime) []const u8 {
+        return switch (m) {
+            .playlist => "text/hddvdpl+xml",
+            .manifest => "text/hddvdmf+xml",
+            .markup => "text/hddvdmu+xml",
+            .timing => "text/hddvdts+xml",
+            .advanced_subtitle => "text/hddvdas+xml",
+            .style => "text/hddvdvss+xml",
+            .script => "application/ecmascript",
+            .evob => "video/evob",
+            .tmap => "application/tmap",
+            .jpeg => "image/jpeg",
+            .png => "image/png",
+            .mng => "image/mng",
+            .capture_video => "image/cvi",
+            .capture_drawing => "image/cdw",
+            .wav => "audio/x-wav",
+            .font => "application/font",
+            else => "application/x-data",
+        };
+    }
+};
+
 pub const Entry = struct {
     name: []const u8,
     offset: u32,
     size: u32,
-    mime: u8,
+    crc: u32,
+    mime: Mime,
 };
 
 /// A parsed archive. Entry names point into the archive bytes.
@@ -45,11 +97,27 @@ pub const Archive = struct {
     }
 
     pub fn content(a: *const Archive, e: Entry) []const u8 {
-        const end = @min(a.data.len, @as(usize, e.offset) + e.size);
-        const raw = a.data[@min(e.offset, end)..end];
-        if (raw.len > 0 and raw[0] == 'A') return unwrap(raw);
+        const r = a.raw(e);
+        if (r.len > 0 and r[0] == 'A') return unwrap(r);
         // An entry pointing past a wrapper header (rewritten offsets) is already the payload.
-        return raw;
+        return r;
+    }
+
+    /// The bytes an entry points to, as stored.
+    pub fn raw(a: *const Archive, e: Entry) []const u8 {
+        const end = @min(a.data.len, @as(usize, e.offset) + e.size);
+        return a.data[@min(e.offset, end)..end];
+    }
+
+    /// DATA_CRC (ISO 3309 CRC-32) matches.
+    pub fn crcOk(a: *const Archive, e: Entry) bool {
+        return std.hash.Crc32.hash(a.raw(e)) == e.crc;
+    }
+
+    /// True if any entry is still AACS-encrypted (unusable without decryption).
+    pub fn encrypted(a: *const Archive) bool {
+        for (a.entries) |e| if (isEncrypted(a.raw(e))) return true;
+        return false;
     }
 };
 
@@ -66,7 +134,8 @@ pub fn parse(gpa: std.mem.Allocator, d: []const u8) Error!Archive {
         e.* = .{
             .offset = std.mem.readInt(u32, d[p..][0..4], .big),
             .size = std.mem.readInt(u32, d[p + 4 ..][0..4], .big),
-            .mime = d[p + 12],
+            .crc = std.mem.readInt(u32, d[p + 8 ..][0..4], .big),
+            .mime = @enumFromInt(d[p + 12]),
             .name = d[p + 14 ..][0..nl],
         };
         p += 14 + @as(usize, nl) + 32;
@@ -81,6 +150,24 @@ pub const DiscId = struct {
     content_id: [16]u8,
     /// SEARCH_FLG: 0 = also search persistent storage for a newer playlist.
     search_flag: u8,
+
+    /// An ID as a GUID string (upper case, RFC 4122 layout), or null if the field is unused (all 1b).
+    pub fn guid(id: [16]u8) ?[36]u8 {
+        if (std.mem.allEqual(u8, &id, 0xff)) return null;
+        var out: [36]u8 = undefined;
+        const hex = "0123456789ABCDEF";
+        var o: usize = 0;
+        for (id, 0..) |b, i| {
+            if (i == 4 or i == 6 or i == 8 or i == 10) {
+                out[o] = '-';
+                o += 1;
+            }
+            out[o] = hex[b >> 4];
+            out[o + 1] = hex[b & 15];
+            o += 2;
+        }
+        return out;
+    }
 
     pub fn parse(d: []const u8) ?DiscId {
         if (d.len < 61 or !std.mem.eql(u8, d[0..12], "HDDVD-V_CONF")) return null;
@@ -153,6 +240,15 @@ test "archives with wrapped and plain entries" {
     try testing.expectEqual(2, a.entries.len);
     try testing.expectEqualStrings("var x;", a.get("s.js").?);
     try testing.expectEqualStrings("PNG!", a.get("p.png").?);
+    try testing.expectEqual(Mime.data, a.entries[0].mime);
+    try testing.expect(!a.encrypted());
+    try testing.expect(!a.crcOk(a.entries[1]));
+    std.mem.writeInt(u32, d.items[t1 + 8 ..][0..4], std.hash.Crc32.hash("PNG!"), .big);
+    a.entries[1].crc = std.hash.Crc32.hash("PNG!");
+    try testing.expect(a.crcOk(a.entries[1]));
+    // An encrypted wrapper has no readable name.
+    @memset(d.items[off0 + 11 ..][0..10], 0x5a);
+    try testing.expect(a.encrypted());
     try testing.expectEqual(null, a.get("S.JS"));
     try testing.expectError(error.BadAca, parse(gpa, d.items[0..40]));
 }
@@ -167,6 +263,9 @@ test "DISCID.DAT" {
     try testing.expectEqual(@as(u8, 0xff), id.disc_id[0]);
     try testing.expectEqualStrings("PROVIDER_ID_TEST", &id.provider_id);
     try testing.expectEqual(@as(u8, 7), id.content_id[0]);
+    try testing.expectEqual(null, DiscId.guid(id.disc_id));
+    const g = DiscId.guid(.{ 0x67, 0x45, 0x23, 0x01, 0xab, 0x89, 0xef, 0xcd, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef }).?;
+    try testing.expectEqualStrings("67452301-AB89-EFCD-0123-456789ABCDEF", &g);
     @memcpy(d[0..12], "HDDVD-V_CONX");
     try testing.expectEqual(null, DiscId.parse(&d));
 }

@@ -90,7 +90,7 @@ pub const Clip = struct {
     subtitle: []SubtitleTrack = &.{},
     sub_video: ?SubVideo = null,
     sub_audio: []SubAudio = &.{},
-    network_sources: [][]const u8 = &.{},
+    network_sources: []NetworkSource = &.{},
 
     pub fn duration(c: Clip) u64 {
         return c.title_end -| c.title_begin;
@@ -99,16 +99,35 @@ pub const Clip = struct {
 
 pub const Sync = enum { hard, soft, none };
 
+/// A source to use instead of `src` when the player's network throughput is at least `throughput` kbps
+/// (§6.2.3.6).
+pub const NetworkSource = struct { src: []const u8, throughput: u32 };
+
 pub const Resource = struct {
     src: []const u8,
     size: u64 = 0,
     priority: u32 = 0,
+    /// The valid period of a TitleResource (an ApplicationResource takes its segment's).
+    title_begin: u64 = 0,
+    title_end: ?u64 = null,
     /// ADV_PCK id it is multiplexed under, or null if loaded from its source.
     multiplexed: ?u32 = null,
     loading_begin: ?u64 = null,
     no_cache: bool = false,
     description: []const u8 = "",
+    network_sources: []NetworkSource = &.{},
 };
+
+/// The network source rule of §6.2.3.6: the source with the largest minimum throughput not above the player's,
+/// else `default`.
+pub fn selectSource(default: []const u8, sources: []const NetworkSource, throughput_kbps: u32) []const u8 {
+    var best: ?NetworkSource = null;
+    for (sources) |n| {
+        if (n.throughput > throughput_kbps) continue;
+        if (best == null or n.throughput > best.?.throughput) best = n;
+    }
+    return if (best) |b| b.src else default;
+}
 
 pub const AppSegment = struct {
     id: []const u8 = "",
@@ -474,7 +493,6 @@ const Builder = struct {
         var video: std.ArrayList(VideoTrack) = .empty;
         var audio: std.ArrayList(AudioTrack) = .empty;
         var sub_audio: std.ArrayList(SubAudio) = .empty;
-        var nets: std.ArrayList([]const u8) = .empty;
         var y = x.firstElement();
         while (y) |e| : (y = e.nextElement()) {
             if (e.is(ns, "Video")) try video.append(a, .{
@@ -494,13 +512,12 @@ const Builder = struct {
                 .stream = int(u8, e.attr("streamNumber")) orelse 1,
                 .media_attr = int(u8, e.attr("mediaAttr")) orelse 1,
             });
-            if (e.is(ns, "NetworkSource")) try nets.append(a, try b.str(e.attr("src")));
         }
         c.video = video.items;
         c.audio = audio.items;
         c.subtitle = try b.subtitles(x);
         c.sub_audio = sub_audio.items;
-        c.network_sources = nets.items;
+        c.network_sources = try b.networkSources(x);
         return c;
     }
 
@@ -531,10 +548,23 @@ const Builder = struct {
                 .priority = int(u32, e.attr("priority")) orelse 0,
                 // A boolean in the spec; discs write the ADV_PCK id instead ("1", "2"…).
                 .multiplexed = if (m) |v| (if (std.mem.eql(u8, v, "false")) null else if (std.mem.eql(u8, v, "true")) 0 else int(u32, v)) else null,
+                .title_begin = b.time(e.attr("titleTimeBegin")) orelse 0,
+                .title_end = b.time(e.attr("titleTimeEnd")),
                 .loading_begin = b.time(e.attr("loadingBegin")),
                 .no_cache = boolean(e.attr("noCache"), false),
                 .description = try b.str(e.attr("description")),
+                .network_sources = try b.networkSources(e),
             });
+        }
+        return list.items;
+    }
+
+    fn networkSources(b: *Builder, x: *const dom.Node) Error![]NetworkSource {
+        var list: std.ArrayList(NetworkSource) = .empty;
+        var y = x.firstElement();
+        while (y) |e| : (y = e.nextElement()) {
+            if (!e.is(ns, "NetworkSource")) continue;
+            try list.append(b.a, .{ .src = try b.str(e.attr("src")), .throughput = int(u32, e.attr("networkThroughput")) orelse 0 });
         }
         return list.items;
     }
@@ -575,6 +605,9 @@ const test_xpl =
     \\   <ApplicationSegment src="file:///dvddisc/ADV_OBJ/app.aca/app.xmf" zOrder="2" autorun="false" sync="hard">
     \\    <ApplicationResource src="file:///dvddisc/ADV_OBJ/app.aca" size="1000" priority="1" multiplexed="2"/>
     \\   </ApplicationSegment>
+    \\   <TitleResource src="http://h/r.aca" titleTimeBegin="00:00:01:00" titleTimeEnd="00:00:02:00" priority="3" multiplexed="false">
+    \\    <NetworkSource src="http://h/r-386.aca" networkThroughput="386"/><NetworkSource src="http://h/r-1000.aca" networkThroughput="1000"/>
+    \\   </TitleResource>
     \\   <ScheduledControlList><Event id="e1" titleTime="00:00:14:00"/><PauseAt titleTime="00:10:00:00"/></ScheduledControlList>
     \\   <ChapterList><Chapter titleTimeBegin="00:30:00:00" displayName="Two"/><Chapter titleTimeBegin="00:00:00:00" displayName="One"/></ChapterList>
     \\   <TrackNavigationList><AudioTrack track="1" langcode="en" description="English 5.1"/><SubtitleTrack track="1" langcode="fr" forced="true"/></TrackNavigationList>
@@ -616,6 +649,14 @@ test "parse a playlist" {
     try testing.expectEqual(1, t.apps.len);
     try testing.expectEqual(false, t.apps[0].autorun);
     try testing.expectEqual(@as(?u32, 2), t.apps[0].resources[0].multiplexed);
+    try testing.expectEqual(1, t.resources.len);
+    const r = t.resources[0];
+    try testing.expectEqual(@as(u64, 60), r.title_begin);
+    try testing.expectEqual(@as(?u64, 120), r.title_end);
+    try testing.expectEqual(null, r.multiplexed);
+    try testing.expectEqualStrings("http://h/r.aca", selectSource(r.src, r.network_sources, 100));
+    try testing.expectEqualStrings("http://h/r-386.aca", selectSource(r.src, r.network_sources, 999));
+    try testing.expectEqualStrings("http://h/r-1000.aca", selectSource(r.src, r.network_sources, 1000));
     try testing.expectEqual(2, t.scheduled.len);
     try testing.expectEqual(@as(u64, 14 * 60), t.scheduled[0].time);
     try testing.expectEqualStrings("One", t.chapters[0].name); // sorted

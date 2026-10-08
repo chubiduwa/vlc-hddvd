@@ -17,4 +17,11 @@ test {
     _ = @import("adv/compose.zig");
     _ = @import("adv/mix.zig");
     _ = @import("adv/retime.zig");
+    _ = @import("adv/uri.zig");
+    _ = @import("adv/memfs.zig");
+    _ = @import("adv/advpck.zig");
+    _ = @import("adv/filecache.zig");
+    _ = @import("adv/resman.zig");
+    _ = @import("adv/pstore.zig");
+    _ = @import("adv/manifest.zig");
 }

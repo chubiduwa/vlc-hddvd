@@ -675,9 +675,9 @@ fn close(o: *vlc.vlc_object_t) callconv(.c) void {
     if (adv.owns(demux)) return adv.close(demux);
     const sys = sysOf(demux);
     hddvd_mouse_delete(demux, sys.mouse);
-    if (sys.ps) |ps| vlc.demux_Delete(ps); // deletes its ESes and so their decoders
+    // demux_Delete also deletes the demuxer's stream and its ESes (and so their decoders).
+    if (sys.ps) |ps| vlc.demux_Delete(ps) else if (sys.stream) |s| hddvd_stream_delete(s);
     if (sys.spu_shared) |sh| sh.unref(); // decoders and pending subpictures hold their own references
-    if (sys.stream) |s| hddvd_stream_delete(s);
     hddvd_esout_delete(sys.esout);
     sys.closeFiles();
     for (sys.spus.items) |*t| t.deinit();

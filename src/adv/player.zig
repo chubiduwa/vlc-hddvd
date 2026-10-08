@@ -22,6 +22,7 @@ const present = @import("present.zig");
 const vdec = @import("vdec.zig");
 const adec = @import("adec.zig");
 const pipdec = @import("pipdec.zig");
+const access_mod = @import("access.zig");
 
 const gpa = std.heap.c_allocator;
 const sector_size = 2048;
@@ -102,6 +103,10 @@ pub const Player = struct {
     vti: vti_mod.Vti,
     disc_id: aca.DiscId,
     maps: std.StringHashMapUnmanaged(tmap.Tmap) = .empty,
+    /// Data access, the File Cache and the persistent storage.
+    access: *access_mod.Access,
+    /// When the File Cache was last brought up to the title time (µs).
+    res_tick: i64 = 0,
 
     // Timeline.
     /// Current title (null: the FirstPlayTitle).
@@ -167,6 +172,7 @@ pub const Player = struct {
         p.tracks.deinit(gpa);
         p.vti.deinit();
         p.pl.deinit();
+        p.access.destroy();
     }
 
     fn loadMap(p: *Player, uri: []const u8) !*const tmap.Tmap {
@@ -268,13 +274,20 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
     const id_bytes = (try fs.readFile(gpa, "ADV_OBJ/DISCID.DAT")) orelse return error.NotFound;
     defer gpa.free(id_bytes);
     const disc_id = aca.DiscId.parse(id_bytes) orelse return error.BadDiscId;
+    const acc = try access_mod.Access.create(o, fs, disc_id);
+    errdefer acc.destroy();
 
-    // The highest-numbered VPLST###.XPL (APLST### for players without a display, as a fallback).
+    // The highest-numbered VPLST###.XPL, else APLST### (§4.3.22.2 steps 3–4), on the disc or, unless
+    // SEARCH_FLG says otherwise, in this disc's area of the persistent storage.
     const names = try fs.listDir(gpa, "ADV_OBJ");
     defer vfs.freeNames(gpa, names);
-    var best: ?[]const u8 = null;
-    var best_n: i32 = -1;
+    const content = aca.DiscId.guid(disc_id.content_id);
+    var pl_bytes: ?[]u8 = null;
+    defer if (pl_bytes) |b| gpa.free(b);
+    var zb: [256]u8 = undefined;
     for ([_][]const u8{ "VPLST", "APLST" }) |kind| {
+        var best: ?[]const u8 = null;
+        var best_n: i32 = -1;
         for (names) |n| {
             if (n.len != 12 or !std.ascii.startsWithIgnoreCase(n, kind) or !std.ascii.endsWithIgnoreCase(n, ".XPL")) continue;
             const num = std.fmt.parseInt(i32, n[5..8], 10) catch continue;
@@ -283,29 +296,36 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
                 best = n;
             }
         }
-        if (best != null) break;
+        if (disc_id.search_flag & 1 == 0) if (content) |cid| if (acc.store.findPlaylist(&cid, kind)) |f| if (f.number > best_n) {
+            const u = try std.fmt.allocPrint(gpa, "file:///required/{s}/{s}{d:0>3}.XPL", .{ &cid, kind, f.number });
+            defer gpa.free(u);
+            pl_bytes = acc.read(u) catch null;
+            if (pl_bytes != null) log(o, vlc.VLC_MSG_DBG, @src(), "playlist %s", .{z(&zb, u)});
+        };
+        if (pl_bytes == null) if (best) |n| {
+            const path = try std.fmt.allocPrint(gpa, "ADV_OBJ/{s}", .{n});
+            defer gpa.free(path);
+            pl_bytes = try fs.readFile(gpa, path);
+            if (pl_bytes != null) log(o, vlc.VLC_MSG_DBG, @src(), "playlist %s", .{z(&zb, path)});
+        };
+        if (pl_bytes != null) break;
     }
-    const pl_name = best orelse return error.NoPlaylist;
-    const path = try std.fmt.allocPrint(gpa, "ADV_OBJ/{s}", .{pl_name});
-    defer gpa.free(path);
-    const pl_bytes = (try fs.readFile(gpa, path)) orelse return error.NoPlaylist;
-    defer gpa.free(pl_bytes);
-    var pl = try xpl.parse(gpa, aca.unwrap(pl_bytes));
+    var pl = try xpl.parse(gpa, aca.unwrap(pl_bytes orelse return error.NoPlaylist));
     errdefer pl.deinit();
 
     const vti_bytes = (try fs.readFile(gpa, "HVDVD_TS/HVA00001.VTI")) orelse return error.NoVti;
     defer gpa.free(vti_bytes);
     const v = try vti_mod.parse(gpa, vti_bytes);
-    p.* = .{ .obj = o, .fs = fs, .pl = pl, .vti = v, .disc_id = disc_id };
-    log(o, vlc.VLC_MSG_DBG, @src(), "playlist %s", .{path.ptr});
+    p.* = .{ .obj = o, .fs = fs, .pl = pl, .vti = v, .disc_id = disc_id, .access = acc };
+    acc.configure(&p.pl);
 }
 
 pub fn close(demux: *vlc.demux_t) void {
     const p = playerOf(demux);
-    if (p.ps) |ps| vlc.demux_Delete(ps);
+    // demux_Delete also deletes the demuxer's stream.
+    if (p.ps) |ps| vlc.demux_Delete(ps) else if (p.stream) |s| hddvd_stream_delete(s);
     if (p.pres) |pr| pr.unref();
     if (p.spu_shared) |sh| sh.unref();
-    if (p.stream) |s| hddvd_stream_delete(s);
     hddvd_esout_delete(p.esout);
     p.fs.close();
     p.deinit();
@@ -330,6 +350,10 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
         z(&zb, title.id),
         @as(c_uint, @intCast(t)),
     });
+    // The File Cache before the presentation (§4.3.22.2 step 7; a Playlist Application's resources missing
+    // at the end of the First Play hold the timeline until loaded, §4.3.19.6.2.2).
+    p.access.startTitle(&p.pl, title, index == null, t);
+    p.res_tick = hddvd_now_us();
     const span = timeline.spanFrom(title, t) orelse {
         // Nothing to present (an application-only title): move on.
         p.next = .{ .title = timeline.nextTitle(&p.pl, p.title) };
@@ -338,7 +362,10 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
     if (!positionSpan(demux, span, @max(t, span.begin))) return;
     // A new ps demuxer: the ESes are recreated with this title's track names. It peeks at the stream when it
     // opens, so the reader is positioned first.
-    if (p.ps) |ps| vlc.demux_Delete(ps);
+    if (p.ps) |ps| {
+        vlc.demux_Delete(ps); // and its stream
+        p.stream = null;
+    }
     p.ps = null;
     p.main_video = null;
     p.sub_video = .{};
@@ -422,6 +449,7 @@ fn jump(demux: *vlc.demux_t, t: u64) bool {
     const span = timeline.spanFrom(title, t) orelse return false;
     const at = @max(t, span.begin);
     if (!positionSpan(demux, span, at)) return false;
+    p.access.jumped(&p.pl, title, p.title == null, at);
     p.next = .none;
     _ = hddvd_es_out_control(demux.out, vlc.ES_OUT_RESET_PCR);
     // Frames before the target (from the start of its EVOBU) are decoded but not shown.
@@ -534,10 +562,21 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
             p.sector_off = sector_size;
         }
         updateTitleInfo(demux);
+        updateResources(demux);
         return 1;
     }
     clipRead(demux);
     return 1;
+}
+
+/// Brings the File Cache up to the title time on screen, a few times a second.
+fn updateResources(demux: *vlc.demux_t) void {
+    const p = playerOf(demux);
+    const now = hddvd_now_us();
+    if (now - p.res_tick < 200_000) return;
+    p.res_tick = now;
+    const title = p.curTitle() orelse return;
+    p.access.update(&p.pl, title, p.title == null, titleNow(p), false);
 }
 
 // ---- the stream that feeds the ps demuxer -------------------------------------------------------------------
@@ -555,6 +594,7 @@ fn streamRead(s: [*c]vlc.stream_t, buf: ?*anyopaque, len: usize) callconv(.c) is
         }
         p.pos += sector_size;
         p.sector_off = 0;
+        p.access.sector(&p.sector);
     }
     const n = @min(len, sector_size - p.sector_off);
     @memcpy(out[0..n], p.sector[p.sector_off..][0..n]);
@@ -573,6 +613,7 @@ fn streamDestroy(s: [*c]vlc.stream_t) callconv(.c) void {
 }
 
 /// A new stream and ps demuxer on it (a stream keeps the previous demuxer's peek buffer, so it is not reused).
+/// The demuxer owns the stream once it opens (demux_Delete deletes it); until then it is ours.
 fn openPs(demux: *vlc.demux_t) !void {
     const p = playerOf(demux);
     if (p.stream) |old| hddvd_stream_delete(old);
