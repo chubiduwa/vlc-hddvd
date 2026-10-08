@@ -64,37 +64,37 @@ subpicture_region_t *hddvd_region_new_yuva(unsigned width, unsigned height)
     return r;
 }
 
-/* ---- picture-in-picture overlay (adv/pipdec.zig) ------------------------------------------------------- */
+/* ---- the Advanced Content overlay (adv/overlay.zig) ------------------------------------------------- */
 
-bool hddvd_pip_validate(void *sys, bool fmt_changed, vlc_tick_t ts, vlc_tick_t start);
-void hddvd_pip_update(void *sys, subpicture_t *spu, vlc_tick_t ts, vlc_tick_t start);
-void hddvd_pip_destroy(void *sys);
+bool hddvd_ov_validate(void *sys, bool fmt_changed, vlc_tick_t ts);
+void hddvd_ov_update(void *sys, subpicture_t *spu, vlc_tick_t ts);
+void hddvd_ov_destroy(void *sys);
 
-static int PipValidate(subpicture_t *spu, bool src_changed, const video_format_t *src, bool dst_changed,
-                       const video_format_t *dst, vlc_tick_t ts)
+static int OvValidate(subpicture_t *spu, bool src_changed, const video_format_t *src, bool dst_changed,
+                      const video_format_t *dst, vlc_tick_t ts)
 {
     (void)src; (void)dst;
-    return hddvd_pip_validate(spu->updater.p_sys, src_changed || dst_changed, ts, spu->i_start) ? VLC_EGENERIC : VLC_SUCCESS;
+    return hddvd_ov_validate(spu->updater.p_sys, src_changed || dst_changed, ts) ? VLC_EGENERIC : VLC_SUCCESS;
 }
 
-static void PipUpdate(subpicture_t *spu, const video_format_t *src, const video_format_t *dst, vlc_tick_t ts)
+static void OvUpdate(subpicture_t *spu, const video_format_t *src, const video_format_t *dst, vlc_tick_t ts)
 {
     (void)src; (void)dst;
-    hddvd_pip_update(spu->updater.p_sys, spu, ts, spu->i_start);
+    hddvd_ov_update(spu->updater.p_sys, spu, ts);
 }
 
-static void PipDestroy(subpicture_t *spu)
+static void OvDestroy(subpicture_t *spu)
 {
-    hddvd_pip_destroy(spu->updater.p_sys);
+    hddvd_ov_destroy(spu->updater.p_sys);
 }
 
-/* The long-lived subpicture showing the sub video; NULL if there is no video output (sys is then not owned). */
-subpicture_t *hddvd_pip_new(decoder_t *dec, void *sys)
+/* The long-lived subpicture holding the planes; NULL if there is no video output (sys is then not owned). */
+subpicture_t *hddvd_ov_new(decoder_t *dec, void *sys)
 {
     subpicture_updater_t updater = {
-        .pf_validate = PipValidate,
-        .pf_update = PipUpdate,
-        .pf_destroy = PipDestroy,
+        .pf_validate = OvValidate,
+        .pf_update = OvUpdate,
+        .pf_destroy = OvDestroy,
         .p_sys = (subpicture_updater_sys_t *)sys,
     };
     return decoder_NewSubpicture(dec, &updater);

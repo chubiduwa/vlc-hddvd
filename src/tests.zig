@@ -24,4 +24,8 @@ test {
     _ = @import("adv/resman.zig");
     _ = @import("adv/pstore.zig");
     _ = @import("adv/manifest.zig");
+    _ = @import("adv/raster.zig");
+    _ = @import("adv/planes.zig");
+    _ = @import("adv/engine/engine.zig");
+    _ = @import("adv/engine/testpage.zig");
 }

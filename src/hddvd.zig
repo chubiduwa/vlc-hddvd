@@ -860,6 +860,11 @@ fn setSeekpoint(demux: *vlc.demux_t, i: c_int) callconv(.c) c_int {
     return vlc.VLC_SUCCESS;
 }
 
+/// DEMUX_SET_PAUSE_STATE: Advanced Content tells its applications (Standard Content has nothing to do).
+fn setPause(demux: *vlc.demux_t, paused: bool) callconv(.c) void {
+    if (adv.owns(demux)) adv.setPause(demux, paused);
+}
+
 /// DEMUX_NAV_*: 0 activate, 1 up, 2 down, 3 left, 4 right, 5 popup, 6 menu.
 fn navControl(demux: *vlc.demux_t, action: c_int) callconv(.c) c_int {
     if (adv.owns(demux)) return adv.navControl(demux, action);
@@ -1022,6 +1027,7 @@ comptime {
     @export(&setTitle, .{ .name = "hddvd_set_title", .visibility = hidden });
     @export(&setSeekpoint, .{ .name = "hddvd_set_seekpoint", .visibility = hidden });
     @export(&navControl, .{ .name = "hddvd_nav", .visibility = hidden });
+    @export(&setPause, .{ .name = "hddvd_set_pause", .visibility = hidden });
     @export(&streamSize, .{ .name = "hddvd_stream_size", .visibility = hidden });
     @export(&esFixup, .{ .name = "hddvd_es_fixup", .visibility = hidden });
     @export(&esAdded, .{ .name = "hddvd_es_added", .visibility = hidden });

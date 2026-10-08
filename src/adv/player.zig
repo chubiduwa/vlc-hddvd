@@ -22,7 +22,10 @@ const present = @import("present.zig");
 const vdec = @import("vdec.zig");
 const adec = @import("adec.zig");
 const pipdec = @import("pipdec.zig");
+const overlay = @import("overlay.zig");
 const access_mod = @import("access.zig");
+const engine = @import("engine/engine.zig");
+const host_mod = @import("engine/host.zig");
 
 const gpa = std.heap.c_allocator;
 const sector_size = 2048;
@@ -47,7 +50,12 @@ extern fn hddvd_fmt_set_language_str(fmt: *vlc.es_format_t, lang: [*:0]const u8)
 extern fn hddvd_es_send(demux: *vlc.demux_t, es: *vlc.es_out_id_t, block: *vlc.block_t) void;
 extern fn hddvd_es_selected(demux: *vlc.demux_t, es: *vlc.es_out_id_t) bool;
 extern fn hddvd_inherit_string(obj: *vlc.vlc_object_t, name: [*:0]const u8) ?[*:0]u8;
+extern fn hddvd_inherit_bool(obj: *vlc.vlc_object_t, name: [*:0]const u8) bool;
 extern fn hddvd_free(p: ?*anyopaque) void;
+extern fn hddvd_mouse_new(demux: *vlc.demux_t) ?*anyopaque;
+extern fn hddvd_mouse_delete(demux: *vlc.demux_t, m: ?*anyopaque) void;
+extern fn hddvd_es_add_spu(demux: *vlc.demux_t, codec: u32, extra: [*]const u8, len: usize, desc: [*:0]const u8) ?*vlc.es_out_id_t;
+extern fn hddvd_es_del(demux: *vlc.demux_t, es: *vlc.es_out_id_t) void;
 
 fn log(obj: *vlc.vlc_object_t, prio: c_int, src: std.builtin.SourceLocation, comptime fmt: [*:0]const u8, args: anytype) void {
     @call(.auto, vlc.vlc_Log, .{ obj, prio, "hddvd", src.file, @as(c_uint, src.line), src.fn_name, fmt } ++ args);
@@ -144,6 +152,17 @@ pub const Player = struct {
     cur_title: c_int = -1,
     cur_seekpoint: c_int = -1,
 
+    // Applications.
+    /// The HDi engine and its thread.
+    host: ?*host_mod.Host = null,
+    mouse: ?*anyopaque = null,
+    commands: std.ArrayList(engine.Command) = .empty,
+    /// The ES of the overlay holding the upper planes (overlay.zig), and when it was last sent a block.
+    overlay_es: ?*vlc.es_out_id_t = null,
+    overlay_at: i64 = 0,
+    /// The latest timestamp sent to any ES.
+    last_pts: i64 = 0,
+
     fn tb(p: *const Player) xpl.TimeBase {
         return p.pl.time_base;
     }
@@ -170,6 +189,7 @@ pub const Player = struct {
         for (p.spus.items) |*t| t.buf.deinit(gpa);
         p.spus.deinit(gpa);
         p.tracks.deinit(gpa);
+        p.commands.deinit(gpa);
         p.vti.deinit();
         p.pl.deinit();
         p.access.destroy();
@@ -221,8 +241,8 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
     p.spu_shared = spudec.Shared.create();
     if (p.spu_shared) |sh| p.pres = present.Presentation.create(sh);
     if (p.pres) |pr| {
-        pr.aperture_w = p.pl.aperture_w;
-        pr.aperture_h = p.pl.aperture_h;
+        pr.setAperture(p.pl.aperture_w, p.pl.aperture_h);
+        pr.time_base = p.pl.time_base;
         pr.outer = .{ @intCast(p.pl.default_color >> 16), @intCast((p.pl.default_color >> 8) & 0xff), @intCast(p.pl.default_color & 0xff) };
         debugOptions(o, pr);
     }
@@ -237,6 +257,21 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
         close(demux);
         return vlc.VLC_ENOMEM;
     };
+    // Sub-picture streams play together: our overlay, the sub video and subtitles.
+    _ = hddvd_es_out_control(demux.out, vlc.ES_OUT_SET_ES_CAT_POLICY, @as(c_int, vlc.SPU_ES), @as(c_int, vlc.ES_OUT_ES_POLICY_SIMULTANEOUS));
+    if (p.pres) |pr| {
+        const e = pr.extra(0);
+        p.overlay_es = hddvd_es_add_spu(demux, overlay.fourcc, &e, e.len, "HD DVD graphics");
+        p.mouse = hddvd_mouse_new(demux);
+        p.host = host_mod.Host.create(o, pr, p.mouse, .{
+            .tick_base = p.pl.tick_base,
+            .fps = @intCast(p.pl.time_base.fps()),
+            .test_page = hddvd_inherit_bool(o, "hddvd-test-page"),
+        }) catch |err| blk: {
+            log(o, vlc.VLC_MSG_ERR, @src(), "cannot start the application engine (%s)", .{@errorName(err).ptr});
+            break :blk null;
+        };
+    }
     if (p.pl.first_play != null) {
         startTitle(demux, null, 0);
     } else if (timeline.nextTitle(&p.pl, null)) |t| {
@@ -246,7 +281,6 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
         close(demux);
         return vlc.VLC_EGENERIC;
     }
-    _ = hddvd_es_out_control(demux.out, vlc.ES_OUT_SET_ES_CAT_POLICY, @as(c_int, vlc.SPU_ES), @as(c_int, vlc.ES_OUT_ES_POLICY_SIMULTANEOUS));
     return vlc.VLC_SUCCESS;
 }
 
@@ -324,6 +358,9 @@ pub fn close(demux: *vlc.demux_t) void {
     const p = playerOf(demux);
     // demux_Delete also deletes the demuxer's stream.
     if (p.ps) |ps| vlc.demux_Delete(ps) else if (p.stream) |s| hddvd_stream_delete(s);
+    if (p.host) |h| h.destroy();
+    hddvd_mouse_delete(demux, p.mouse);
+    if (p.overlay_es) |es| hddvd_es_del(demux, es);
     if (p.pres) |pr| pr.unref();
     if (p.spu_shared) |sh| sh.unref();
     hddvd_esout_delete(p.esout);
@@ -354,6 +391,11 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
     // at the end of the First Play hold the timeline until loaded, §4.3.19.6.2.2).
     p.access.startTitle(&p.pl, title, index == null, t);
     p.res_tick = hddvd_now_us();
+    if (p.host) |h| h.post(.{ .title_begin = .{
+        .title = if (index) |i| @intCast(i) else null,
+        .duration = title.duration,
+        .tick_divisor = title.tick_divisor,
+    } });
     const span = timeline.spanFrom(title, t) orelse {
         // Nothing to present (an application-only title): move on.
         p.next = .{ .title = timeline.nextTitle(&p.pl, p.title) };
@@ -380,6 +422,7 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
         return;
     };
     p.stopped = false;
+    restartOverlay(demux);
     updateTitleInfo(demux);
 }
 
@@ -430,6 +473,7 @@ fn positionSpan(demux: *vlc.demux_t, span: timeline.Span, t: u64) bool {
     p.sector_off = sector_size;
     p.ref_time = t;
     p.ref_ts = tsOf(timeline.pts(span, p.tb(), evob.start_ptm, t));
+    if (p.pres) |pr| pr.setTimeline(t, p.ref_ts, if (p.curTitle()) |ti| ti.duration else 0);
     log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "clip %s: frames %u-%u, sectors %u-%u", .{
         z(&zb, evob.name),     @as(c_uint, @intCast(t)), @as(c_uint, @intCast(span.end)),
         @as(c_uint, @intCast(r.first)), @as(c_uint, @intCast(r.end)),
@@ -455,6 +499,8 @@ fn jump(demux: *vlc.demux_t, t: u64) bool {
     // Frames before the target (from the start of its EVOBU) are decoded but not shown.
     _ = hddvd_es_out_control(demux.out, vlc.ES_OUT_SET_NEXT_DISPLAY_TIME, p.ref_ts);
     for (p.spus.items) |*s| s.buf.clearRetainingCapacity();
+    if (p.host) |h| h.post(.{ .jump = at });
+    restartOverlay(demux);
     updateTitleInfo(demux);
     return true;
 }
@@ -490,14 +536,7 @@ fn spanPresented(demux: *vlc.demux_t) bool {
 /// The title time on screen: from a decoder's clock when there is one, else from the read position.
 fn titleNow(p: *Player) u64 {
     const span = p.span orelse return 0;
-    if (p.spu_shared) |sh| {
-        const maybe = sh.displayDate(p.ref_ts) catch null;
-        if (maybe) |date| {
-            // The reference may still be ahead of the screen (negative elapsed time) after a seamless join.
-            const t_us = p.tb().us(p.ref_time) + (hddvd_now_us() - date);
-            return @min(p.tb().frames(t_us), p.curTitle().?.duration);
-        }
-    }
+    if (p.pres) |pr| if (pr.titleNow(hddvd_now_us())) |t| return t;
     const m = p.tmapi orelse return span.begin;
     const evob = p.evob orelse return span.begin;
     const sector = (p.pos / sector_size) -| evob.adr_ofs;
@@ -525,7 +564,9 @@ fn updateTitleInfo(demux: *vlc.demux_t) void {
 fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
     const demux: *vlc.demux_t = demux_c;
     const p = playerOf(demux);
+    runCommands(demux);
     if (p.stopped) return 0;
+    keepOverlay(demux);
     switch (p.next) {
         .none => {},
         else => {
@@ -544,6 +585,7 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
                     if (positionSpan(demux, s, s.begin)) {
                         _ = hddvd_es_out_control(demux.out, vlc.ES_OUT_RESET_PCR);
                         for (p.spus.items) |*t| t.buf.clearRetainingCapacity();
+                        restartOverlay(demux);
                     }
                 },
                 .title => |t| if (t) |i| startTitle(demux, i, 0) else {
@@ -567,6 +609,58 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
     }
     clipRead(demux);
     return 1;
+}
+
+// ---- applications -------------------------------------------------------------------------------------------
+
+/// Carries out what the engine asked for.
+fn runCommands(demux: *vlc.demux_t) void {
+    const p = playerOf(demux);
+    const h = p.host orelse return;
+    h.takeCommands(&p.commands);
+    defer p.commands.clearRetainingCapacity();
+    for (p.commands.items) |c| switch (c) {
+        .play_title => |i| if (i < p.pl.titles.len) startTitle(demux, i, 0),
+        .jump => |t| _ = jump(demux, t),
+    };
+}
+
+/// DEMUX_SET_PAUSE_STATE: the applications' title clock stops (their other clocks go on).
+pub fn setPause(demux: *vlc.demux_t, paused: bool) void {
+    const p = playerOf(demux);
+    if (p.host) |h| h.post(.{ .play_state = if (paused) .paused else .playing });
+}
+
+/// Sends the overlay's ES a block at `pts`: it starts its subpicture if it has none.
+fn overlayBlock(demux: *vlc.demux_t, pts: i64) void {
+    const p = playerOf(demux);
+    const es = p.overlay_es orelse return;
+    if (pts <= 0) return;
+    const b = vlc.block_Alloc(1) orelse return;
+    b.*.p_buffer[0] = 0;
+    b.*.i_pts = pts;
+    b.*.i_dts = pts;
+    hddvd_es_send(demux, es, b);
+    p.overlay_at = hddvd_now_us();
+}
+
+/// After a clock reset (which flushed the overlay and deleted its subpicture): start it again with the
+/// first frame.
+fn restartOverlay(demux: *vlc.demux_t) void {
+    const p = playerOf(demux);
+    overlayBlock(demux, p.ref_ts);
+}
+
+/// Keeps the overlay's ES selected (VLC's "Disable" subtitles deselects it, and nothing is selected while
+/// the input starts) and alive: a block now and then restarts a subpicture lost to a new video output.
+fn keepOverlay(demux: *vlc.demux_t) void {
+    const p = playerOf(demux);
+    const es = p.overlay_es orelse return;
+    if (!hddvd_es_selected(demux, es)) {
+        hddvd_es_select(demux, es, true);
+        p.overlay_at = 0;
+    }
+    if (hddvd_now_us() - p.overlay_at >= 500_000) overlayBlock(demux, if (p.last_pts > 0) p.last_pts else p.ref_ts);
 }
 
 /// Brings the File Cache up to the title time on screen, a few times a second.
@@ -783,12 +877,8 @@ pub fn esFixup(demux: *vlc.demux_t, fmt: *vlc.es_format_t) void {
     var name_buf: [256]u8 = undefined;
 
     if (fmt.i_cat == vlc.SPU_ES and (id & 0xffe0) == 0xbd20) {
-        fmt.i_codec = spudec.fourcc;
-        fmt.b_packetized = true;
-        if (p.spu_shared) |sh| {
-            const e = sh.extra();
-            hddvd_fmt_set_extra(fmt, &e, e.len);
-        }
+        // Our decoder, drawing into the overlay's sub-picture plane.
+        toOurDecoder(p, fmt, spudec.fourcc);
         fmt.unnamed_0.subs.spu.i_original_frame_width = p.pl.aperture_w;
         fmt.unnamed_0.subs.spu.i_original_frame_height = p.pl.aperture_h;
         // Which subtitle track uses this decoding stream number.
@@ -900,6 +990,7 @@ pub fn esDeleted(demux: *vlc.demux_t, es: *vlc.es_out_id_t) void {
 /// Sub-picture units are reassembled and sent whole, with the EVOB's HD palette, to spudec.zig.
 pub fn esFilter(demux: *vlc.demux_t, es: *vlc.es_out_id_t, block: *vlc.block_t) ?*vlc.block_t {
     const p = playerOf(demux);
+    if (block.i_pts > 0) p.last_pts = block.i_pts;
     // The sub audio is decoded only where the playlist assigns it (§6.2.3: SubAudio of the clip).
     const clip = if (p.span) |sp| sp.clip else null;
     if (p.sub_audio.es == es and (clip == null or clip.?.sub_audio.len == 0)) {

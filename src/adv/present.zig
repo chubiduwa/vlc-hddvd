@@ -1,12 +1,18 @@
 //! Presentation state of Advanced Content shared by the demux, the HDi engine and our decoders (vdec.zig,
-//! adec.zig): the video layout of the main and sub video planes, audio mixing levels and pending effect
-//! sounds, plus the clock registry. Reference-counted: decoders can outlive the demux briefly.
+//! adec.zig, pipdec.zig, spudec.zig, overlay.zig): the video layout of the main and sub video planes, audio
+//! mixing levels and pending effect sounds, the planes the overlay draws (sub video, sub-picture, graphics,
+//! cursor), the Title Timeline's clock, plus the clock registry. Reference-counted: decoders can outlive the
+//! demux briefly.
 
 const std = @import("std");
 const vlc = @import("vlc");
 const spudec = @import("../spudec.zig");
+const spu = @import("../spu.zig");
 const compose = @import("compose.zig");
 const mix = @import("mix.zig");
+const planes = @import("planes.zig");
+const pipdec = @import("pipdec.zig");
+const xpl = @import("xpl.zig");
 
 const gpa = std.heap.c_allocator;
 
@@ -27,6 +33,22 @@ pub const Effect = struct {
     at: i64,
 };
 
+/// One display period of a sub-picture unit on the sub-picture plane (from spudec.zig).
+pub const SpuPeriod = struct {
+    /// Unique, to tell what the overlay drew.
+    id: u32 = 0,
+    /// Decoding stream (0x20 + n).
+    stream: u5,
+    bitmap: *spu.Bitmap,
+    own: spu.Lut,
+    /// Stream timestamps; `stop` 0: until the stream's next unit.
+    start: i64,
+    stop: i64,
+};
+
+/// Most sub-picture periods kept (older ones are dropped first).
+const max_periods = 32;
+
 pub const Presentation = struct {
     refs: std.atomic.Value(u32) = .init(1),
     lock: vlc.vlc_mutex_t = undefined,
@@ -34,8 +56,11 @@ pub const Presentation = struct {
     clock: *spudec.Shared,
     /// Bumped whenever the sub video layout changes (the overlay redraws).
     layout_gen: std.atomic.Value(u32) = .init(0),
+    /// Bumped whenever the graphics frame, the cursor, the sub-picture periods or the sub video decoder change.
+    planes_gen: std.atomic.Value(u32) = .init(0),
     aperture_w: u16 = 1920,
     aperture_h: u16 = 1080,
+    time_base: xpl.TimeBase = .fps60,
 
     // Under lock:
     /// Main video area (null: the whole aperture) and the colour outside it (Y, Cb, Cr). Not applied yet: the
@@ -56,10 +81,32 @@ pub const Presentation = struct {
     /// Bumped by the mixer when an effect sound finishes (for the engine's callbacks).
     effects_done: u32 = 0,
 
+    /// The sub video decoder's frames (pipdec.zig), while it is open.
+    pip: ?*pipdec.Pip = null,
+    /// The graphics plane: the last frame the engine finished.
+    graphics: ?*planes.Frame = null,
+    cursor: planes.Cursor,
+    /// The default cursor image (the player's own).
+    default_cursor: ?*planes.Image = null,
+    /// Sub-picture periods (Advanced Content only; Standard Content draws its own subpictures).
+    periods: std.ArrayList(SpuPeriod) = .empty,
+    next_period: u32 = 1,
+
+    /// The Title Timeline: title time `ref_time` (frames) is at stream timestamp `ref_ts`.
+    ref_time: u64 = 0,
+    ref_ts: i64 = 0,
+    duration: u64 = 0,
+    /// The last title time worked out, kept while the clock cannot tell (paused, buffering).
+    last_time: ?u64 = null,
+    /// Display date minus stream timestamp, as last seen, and the timestamp it was seen at.
+    offset: ?i64 = null,
+    offset_ts: i64 = 0,
+
     pub fn create(clock: *spudec.Shared) ?*Presentation {
         const p = gpa.create(Presentation) catch return null;
         clock.ref();
-        p.* = .{ .clock = clock };
+        p.* = .{ .clock = clock, .cursor = .init(1920, 1080) };
+        p.default_cursor = planes.defaultCursor(gpa) catch null;
         vlc.vlc_mutex_init(&p.lock);
         return p;
     }
@@ -71,9 +118,20 @@ pub const Presentation = struct {
     pub fn unref(p: *Presentation) void {
         if (p.refs.fetchSub(1, .acq_rel) != 1) return;
         if (p.effect) |e| gpa.free(e.samples);
+        if (p.graphics) |f| f.unref();
+        if (p.cursor.image) |im| im.unref();
+        if (p.default_cursor) |im| im.unref();
+        for (p.periods.items) |q| q.bitmap.unref();
+        p.periods.deinit(gpa);
         p.clock.unref();
         vlc.vlc_mutex_destroy(&p.lock);
         gpa.destroy(p);
+    }
+
+    pub fn setAperture(p: *Presentation, w: u16, h: u16) void {
+        p.aperture_w = w;
+        p.aperture_h = h;
+        p.cursor = .init(w, h);
     }
 
     /// Sets the sub video layout (null rect: native size, centred; alpha 0: hidden).
@@ -91,6 +149,10 @@ pub const Presentation = struct {
 
     pub fn unlock(p: *Presentation) void {
         vlc.vlc_mutex_unlock(&p.lock);
+    }
+
+    fn changed(p: *Presentation) void {
+        _ = p.planes_gen.fetchAdd(1, .release);
     }
 
     /// p_extra for an ES whose real codec is `codec`.
@@ -119,6 +181,165 @@ pub const Presentation = struct {
         defer p.unlock();
         if (p.effect) |old| gpa.free(old.samples);
         p.effect = e;
+    }
+
+    // ---- the planes ---------------------------------------------------------------------------------------
+
+    /// The sub video decoder opens (pip) or closes (null).
+    pub fn setPip(p: *Presentation, pip: ?*pipdec.Pip) void {
+        p.lockIt();
+        const old = p.pip;
+        p.pip = pip;
+        if (pip) |x| x.ref();
+        p.unlock();
+        if (old) |x| x.unref();
+        p.changed();
+    }
+
+    /// The sub video frames, referenced, or null.
+    pub fn holdPip(p: *Presentation) ?*pipdec.Pip {
+        p.lockIt();
+        defer p.unlock();
+        const x = p.pip orelse return null;
+        x.ref();
+        return x;
+    }
+
+    /// Shows graphics frame `f` (referenced here; null: an empty graphics plane).
+    pub fn publishGraphics(p: *Presentation, f: ?*planes.Frame) void {
+        if (f) |x| x.ref();
+        p.lockIt();
+        const old = p.graphics;
+        p.graphics = f;
+        p.unlock();
+        if (old) |x| x.unref();
+        p.changed();
+    }
+
+    /// The graphics frame shown, referenced, or null.
+    pub fn holdGraphics(p: *Presentation) ?*planes.Frame {
+        p.lockIt();
+        defer p.unlock();
+        const f = p.graphics orelse return null;
+        f.ref();
+        return f;
+    }
+
+    /// Sets the cursor (its image is referenced here).
+    pub fn setCursor(p: *Presentation, c: planes.Cursor) void {
+        if (c.image) |im| im.ref();
+        p.lockIt();
+        const old = p.cursor.image;
+        p.cursor = c;
+        p.unlock();
+        if (old) |im| im.unref();
+        p.changed();
+    }
+
+    /// The cursor to draw: its position and image (referenced), or null if hidden.
+    pub fn holdCursor(p: *Presentation) ?struct { cursor: planes.Cursor, image: *planes.Image } {
+        p.lockIt();
+        defer p.unlock();
+        const c = p.cursor;
+        if (!c.visible) return null;
+        const im = c.image orelse p.default_cursor orelse return null;
+        im.ref();
+        return .{ .cursor = c, .image = im };
+    }
+
+    /// New display periods of decoding stream `stream` (their bitmaps are referenced here). The stream's open
+    /// period ends where the first new one starts.
+    pub fn addPeriods(p: *Presentation, stream: u5, new: []const SpuPeriod) void {
+        if (new.len == 0) return;
+        p.lockIt();
+        for (p.periods.items) |*q| {
+            if (q.stream == stream and q.stop == 0) q.stop = @max(q.start, new[0].start);
+        }
+        for (new) |n| {
+            if (p.periods.items.len == max_periods) {
+                p.periods.items[0].bitmap.unref();
+                _ = p.periods.orderedRemove(0);
+            }
+            var q = n;
+            q.id = p.next_period;
+            p.next_period +%= 1;
+            q.bitmap.ref();
+            p.periods.append(gpa, q) catch q.bitmap.unref();
+        }
+        p.unlock();
+        p.changed();
+    }
+
+    /// Drops the periods of `stream` (its decoder flushed or closed), or those that ended before `before`.
+    pub fn dropPeriods(p: *Presentation, stream: ?u5, before: ?i64) void {
+        p.lockIt();
+        var i: usize = 0;
+        var n: usize = 0;
+        while (i < p.periods.items.len) {
+            const q = p.periods.items[i];
+            const gone = if (stream) |s| q.stream == s else (q.stop != 0 and q.stop < before.?);
+            if (gone) {
+                q.bitmap.unref();
+                _ = p.periods.orderedRemove(i);
+                n += 1;
+            } else i += 1;
+        }
+        p.unlock();
+        if (n > 0) p.changed();
+    }
+
+    // ---- the Title Timeline's clock -----------------------------------------------------------------------
+
+    /// The demux positions the Title Timeline: title time `ref_time` will be shown at stream timestamp `ref_ts`.
+    pub fn setTimeline(p: *Presentation, ref_time: u64, ref_ts: i64, duration: u64) void {
+        p.lockIt();
+        defer p.unlock();
+        p.ref_time = ref_time;
+        p.ref_ts = ref_ts;
+        p.duration = duration;
+        p.last_time = null;
+        p.offset = null;
+    }
+
+    /// The title time on screen at `now` (mdate()), or the last one known while the clock cannot tell
+    /// (paused, buffering), or null if there was none yet.
+    pub fn titleNow(p: *Presentation, now: i64) ?u64 {
+        p.lockIt();
+        const ref_time = p.ref_time;
+        const ref_ts = p.ref_ts;
+        const duration = p.duration;
+        p.unlock();
+        const date = (p.clock.displayDate(ref_ts) catch null) orelse {
+            p.lockIt();
+            defer p.unlock();
+            return p.last_time;
+        };
+        // The reference may still be ahead of the screen (negative elapsed time) after a seamless join.
+        const tb = p.time_base;
+        const t = @min(tb.frames(tb.us(ref_time) + (now - date)), duration);
+        p.lockIt();
+        defer p.unlock();
+        if (p.ref_ts == ref_ts) p.last_time = t;
+        return t;
+    }
+
+    /// The stream timestamp shown at display date `date` (as a subpicture updater gets it), or null before
+    /// the clock could ever tell.
+    pub fn streamAt(p: *Presentation, date: i64) ?i64 {
+        p.lockIt();
+        const at = if (p.offset != null) p.offset_ts else p.ref_ts;
+        p.unlock();
+        const d = (p.clock.displayDate(at) catch null) orelse {
+            p.lockIt();
+            defer p.unlock();
+            return if (p.offset) |o| date - o else null;
+        };
+        p.lockIt();
+        defer p.unlock();
+        p.offset = d - at;
+        // Measure next time near this point, so a playback rate other than 1 drifts little.
+        p.offset_ts = date - p.offset.?;
+        return date - p.offset.?;
     }
 };
 

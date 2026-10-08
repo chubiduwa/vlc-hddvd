@@ -8,11 +8,15 @@
 //!   region is redrawn with the button rectangle in the HLI colours and the rest in the SPU's own colours. VLC 3's
 //!   built-in mechanism (the input "highlight" variables) can only crop the SPU to the button, which hides every
 //!   other button.
+//! - In Advanced Content (the ES's p_extra names an adv/present.zig Presentation), there are no highlights and
+//!   the display periods go to the sub-picture plane of the Advanced Content overlay (adv/overlay.zig), below
+//!   the graphics plane.
 
 const std = @import("std");
 const vlc = @import("vlc");
 const hli = @import("hli.zig");
 const spu = @import("spu.zig");
+const present = @import("adv/present.zig");
 
 const gpa = std.heap.c_allocator;
 
@@ -111,6 +115,8 @@ pub const Shared = struct {
 
 const DecSys = struct {
     shared: *Shared,
+    /// Advanced Content: the periods go to its sub-picture plane.
+    pres: ?*present.Presentation = null,
     stream: u5,
     width: c_int,
     height: c_int,
@@ -135,23 +141,32 @@ fn open(o: *vlc.vlc_object_t) callconv(.c) c_int {
     const dec: *vlc.decoder_t = @ptrCast(o);
     const fmt = &dec.fmt_in;
     if (fmt.i_cat != vlc.SPU_ES or fmt.i_codec != fourcc) return vlc.VLC_EGENERIC;
-    const n = extra_magic.len + @sizeOf(usize);
-    if (fmt.i_extra != n or fmt.p_extra == null) return vlc.VLC_EGENERIC;
-    const e: *const [n]u8 = @ptrCast(fmt.p_extra);
-    if (!std.mem.eql(u8, e[0..extra_magic.len], extra_magic)) return vlc.VLC_EGENERIC;
-    const shared: *Shared = @ptrFromInt(std.mem.readInt(usize, e[extra_magic.len..], .native));
+    var pres: ?*present.Presentation = null;
+    const shared: *Shared = if (present.Presentation.fromExtra(fmt)) |x| blk: {
+        pres = x.pres;
+        break :blk x.pres.clock;
+    } else blk: {
+        const n = extra_magic.len + @sizeOf(usize);
+        if (fmt.i_extra != n or fmt.p_extra == null) return vlc.VLC_EGENERIC;
+        const e: *const [n]u8 = @ptrCast(fmt.p_extra);
+        if (!std.mem.eql(u8, e[0..extra_magic.len], extra_magic)) return vlc.VLC_EGENERIC;
+        break :blk @ptrFromInt(std.mem.readInt(usize, e[extra_magic.len..], .native));
+    };
 
     const ds = gpa.create(DecSys) catch return vlc.VLC_ENOMEM;
     shared.ref();
+    if (pres) |p| p.ref();
     const spu_fmt = fmt.unnamed_0.subs.spu;
     ds.* = .{
         .shared = shared,
+        .pres = pres,
         .stream = @intCast(fmt.i_id & 0x1f),
         .width = if (spu_fmt.i_original_frame_width > 0) @intCast(spu_fmt.i_original_frame_width) else 1920,
         .height = if (spu_fmt.i_original_frame_height > 0) @intCast(spu_fmt.i_original_frame_height) else 1080,
     };
     dec.p_sys = @ptrCast(ds);
     dec.pf_decode = decode;
+    if (pres != null) dec.pf_flush = flush;
     dec.fmt_out.i_codec = fourcc;
     shared.register(dec, true);
     return vlc.VLC_SUCCESS;
@@ -161,8 +176,18 @@ fn close(o: *vlc.vlc_object_t) callconv(.c) void {
     const dec: *vlc.decoder_t = @ptrCast(o);
     const ds: *DecSys = @ptrCast(@alignCast(dec.p_sys));
     ds.shared.register(dec, false);
+    if (ds.pres) |p| {
+        p.dropPeriods(ds.stream, null);
+        p.unref();
+    }
     ds.shared.unref();
     gpa.destroy(ds);
+}
+
+/// Advanced Content: a seek drops what this stream had on the sub-picture plane.
+fn flush(dec_c: [*c]vlc.decoder_t) callconv(.c) void {
+    const ds: *DecSys = @ptrCast(@alignCast(dec_c.*.p_sys));
+    if (ds.pres) |p| p.dropPeriods(ds.stream, null);
 }
 
 fn decode(dec_c: [*c]vlc.decoder_t, block_c: [*c]vlc.block_t) callconv(.c) c_int {
@@ -189,6 +214,12 @@ fn decodeUnit(dec: *vlc.decoder_t, unit: []const u8, pts: i64, palette: *const [
     var bitmap: ?*spu.Bitmap = null;
     var bitmap_key: spu.State = .{};
     defer if (bitmap) |bm| bm.unref();
+    var periods: [spu.max_events]present.SpuPeriod = undefined;
+    var n_periods: usize = 0;
+    defer if (ds.pres) |p| {
+        p.addPeriods(ds.stream, periods[0..n_periods]);
+        for (periods[0..n_periods]) |q| q.bitmap.unref();
+    };
 
     for (events, 0..) |ev, i| {
         if (!ev.st.on) continue;
@@ -202,7 +233,14 @@ fn decodeUnit(dec: *vlc.decoder_t, unit: []const u8, pts: i64, palette: *const [
             bitmap_key = st;
         }
         const bm = bitmap.?;
+        const stop = if (i + 1 < events.len) pts + events[i + 1].delay_us else 0;
 
+        if (ds.pres != null) {
+            bm.ref();
+            periods[n_periods] = .{ .stream = ds.stream, .bitmap = bm, .own = spu.ownColors(st, palette), .start = pts + ev.delay_us, .stop = stop };
+            n_periods += 1;
+            continue;
+        }
         const pic = try gpa.create(Pic);
         pic.* = .{ .shared = ds.shared, .bitmap = bm, .stream = ds.stream, .depth8 = st.depth8, .own = spu.ownColors(st, palette) };
         const sub = hddvd_spu_new(dec, pic) orelse {
@@ -214,7 +252,7 @@ fn decodeUnit(dec: *vlc.decoder_t, unit: []const u8, pts: i64, palette: *const [
         sub.*.i_start = pts + ev.delay_us;
         // Each display period lasts until the next DCSQ (which starts the next period or stops the display),
         // or, for the last one, until the next unit (ephemer).
-        sub.*.i_stop = if (i + 1 < events.len) pts + events[i + 1].delay_us else 0;
+        sub.*.i_stop = stop;
         sub.*.b_ephemer = true;
         sub.*.b_subtitle = !st.forced;
         sub.*.b_absolute = true;
@@ -243,7 +281,16 @@ fn update(sys: *anyopaque, sub: *vlc.subpicture_t) callconv(.c) void {
 
     const bm = pic.bitmap;
     const region = hddvd_region_new_yuva(bm.w, bm.h) orelse return;
-    const planes = &region.*.p_picture.*.p;
+    paint(region, bm, &pic.own, if (hl) |*h| h else null, pic.depth8);
+    region.*.i_x = bm.x;
+    region.*.i_y = bm.y;
+    sub.p_region = region;
+}
+
+/// Draws `bm` into a YUVA region of its size: inside the highlight's button rectangle in the highlight's
+/// colours, elsewhere in `own`.
+pub fn paint(region: *vlc.subpicture_region_t, bm: *const spu.Bitmap, own: *const spu.Lut, hl: ?*const hli.Highlight, depth8: bool) void {
+    const planes = &region.p_picture.*.p;
     const yp = planes[0].p_pixels;
     const up = planes[1].p_pixels;
     const vp = planes[2].p_pixels;
@@ -252,23 +299,20 @@ fn update(sys: *anyopaque, sub: *vlc.subpicture_t) callconv(.c) void {
 
     for (0..bm.h) |y| {
         const ay = bm.y + y;
-        const row_hl = if (hl) |*h| ay >= h.sy and ay <= h.ey else false;
+        const row_hl = if (hl) |h| ay >= h.sy and ay <= h.ey else false;
         for (0..bm.w) |x| {
             const v = bm.px[y * bm.w + x];
             const ax = bm.x + x;
             const c = if (row_hl and ax >= hl.?.sx and ax <= hl.?.ex)
-                (if (pic.depth8) hl.?.lut8[v] else hl.?.lut2[v & 3])
+                (if (depth8) hl.?.lut8[v] else hl.?.lut2[v & 3])
             else
-                pic.own[v];
+                own[v];
             yp[y * pitch[0] + x] = c[0];
             up[y * pitch[1] + x] = c[1];
             vp[y * pitch[2] + x] = c[2];
             ap[y * pitch[3] + x] = c[3];
         }
     }
-    region.*.i_x = bm.x;
-    region.*.i_y = bm.y;
-    sub.p_region = region;
 }
 
 fn destroy(sys: *anyopaque) callconv(.c) void {

@@ -234,6 +234,7 @@ pub const Playlist = struct {
     streaming_buffer_kb: u32 = 0,
     network_timeout_ms: ?u32 = null,
     time_base: TimeBase = .fps60,
+    /// Application ticks per second: 60 and 24 at 1000/1001 of that (like the 60fps time base), 50 exact.
     tick_base: u8 = 60,
     default_language: []const u8 = "",
     first_play: ?Title = null,
@@ -307,7 +308,8 @@ pub fn fromDom(gpa: std.mem.Allocator, root: *const dom.Node) Error!Playlist {
     const set = root.child(ns, "TitleSet") orelse return error.BadPlaylist;
     if (eq(set.attr("timeBase"), "50fps")) pl.time_base = .fps50;
     b.tb = pl.time_base;
-    if (set.attr("tickBase")) |s| pl.tick_base = if (std.mem.eql(u8, s, "24fps")) 24 else if (std.mem.eql(u8, s, "50fps")) 50 else 60;
+    // Omitted: the frame rate (§6.2.3.3).
+    pl.tick_base = if (set.attr("tickBase")) |s| (if (std.mem.eql(u8, s, "24fps")) 24 else if (std.mem.eql(u8, s, "50fps")) 50 else 60) else @intCast(pl.time_base.fps());
     pl.default_language = try b.str(set.attr("defaultLanguage"));
 
     var titles: std.ArrayList(Title) = .empty;

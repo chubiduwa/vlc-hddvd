@@ -213,6 +213,32 @@ bool hddvd_es_selected(demux_t *demux, es_out_id_t *es)
     return on;
 }
 
+/* A sub-picture ES of our own on the input's output (not through the ps demuxer), for one of our decoders. */
+es_out_id_t *hddvd_es_add_spu(demux_t *demux, vlc_fourcc_t codec, const void *extra, size_t len, const char *desc)
+{
+    es_format_t fmt;
+    es_format_Init(&fmt, SPU_ES, codec);
+    fmt.i_priority = ES_PRIORITY_NOT_DEFAULTABLE;
+    fmt.b_packetized = true;
+    fmt.psz_description = strdup(desc);
+    fmt.p_extra = malloc(len);
+    if (fmt.p_extra != NULL)
+    {
+        memcpy(fmt.p_extra, extra, len);
+        fmt.i_extra = len;
+    }
+    es_out_id_t *es = es_out_Add(demux->out, &fmt); /* copies the format */
+    /* Ours to free (not es_format_Clean: VLC's C runtime on Windows). */
+    free(fmt.psz_description);
+    free(fmt.p_extra);
+    return es;
+}
+
+void hddvd_es_del(demux_t *demux, es_out_id_t *es)
+{
+    es_out_Del(demux->out, es);
+}
+
 void hddvd_es_send(demux_t *demux, es_out_id_t *es, block_t *block)
 {
     es_out_Send(demux->out, es, block);

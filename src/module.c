@@ -31,6 +31,8 @@ int HddvdAdecOpen(vlc_object_t *);
 void HddvdAdecClose(vlc_object_t *);
 int HddvdPipOpen(vlc_object_t *);
 void HddvdPipClose(vlc_object_t *);
+int HddvdOverlayOpen(vlc_object_t *);
+void HddvdOverlayClose(vlc_object_t *);
 int hddvd_get_position(demux_t *, double *);
 int hddvd_set_position(demux_t *, double);
 int hddvd_get_length(demux_t *, int64_t *);
@@ -40,6 +42,7 @@ int hddvd_get_title_info(demux_t *, input_title_t ***, int *);
 int hddvd_set_title(demux_t *, int);
 int hddvd_set_seekpoint(demux_t *, int);
 int hddvd_nav(demux_t *, int action);
+void hddvd_set_pause(demux_t *, bool paused);
 uint64_t hddvd_stream_size(stream_t *);
 
 vlc_module_begin()
@@ -61,6 +64,9 @@ vlc_module_begin()
     add_string("hddvd-sub-mix", NULL, "Sub audio level (debugging)",
                "Advanced Content: mix the sub audio (e.g. a commentary) at this level (0-1) without waiting for "
                "the disc's application.", true)
+    add_bool("hddvd-test-page", false, "Graphics test page (debugging)",
+             "Advanced Content: draw a test page in the graphics plane (clocks, a moving box, a clear rectangle "
+             "and the cursor) to check the overlay over playback, pause and seek.", true)
 
     /* Sub-pictures with button highlights (spudec.zig); only takes the ESes the demux marks with its fourcc. */
     add_submodule()
@@ -68,13 +74,18 @@ vlc_module_begin()
     set_capability("spu decoder", 50)
     set_callbacks(HddvdSpuOpen, HddvdSpuClose)
 
-    /* Advanced Content: the main video with corrected frame times (adv/vdec.zig), the sub video as an overlay
-     * (adv/pipdec.zig), main + sub + effect audio mixed (adv/adec.zig). Only take the ESes the demux marks with
+    /* Advanced Content: the main video with corrected frame times (adv/vdec.zig), the sub video decoded for the
+     * overlay (adv/pipdec.zig), the overlay holding the sub video, sub-picture, graphics and cursor planes
+     * (adv/overlay.zig), main + sub + effect audio mixed (adv/adec.zig). Only take the ESes the demux marks with
      * their fourccs. */
     add_submodule()
     set_description("HD DVD sub video")
     set_capability("spu decoder", 50)
     set_callbacks(HddvdPipOpen, HddvdPipClose)
+    add_submodule()
+    set_description("HD DVD graphics overlay")
+    set_capability("spu decoder", 50)
+    set_callbacks(HddvdOverlayOpen, HddvdOverlayClose)
     add_submodule()
     set_description("HD DVD main video")
     set_capability("video decoder", 50)
@@ -97,6 +108,7 @@ int HddvdDemuxControl(demux_t *demux, int query, va_list args)
             return VLC_SUCCESS;
 
         case DEMUX_SET_PAUSE_STATE:
+            hddvd_set_pause(demux, (bool)va_arg(args, int));
             return VLC_SUCCESS;
 
         case DEMUX_GET_PTS_DELAY:
@@ -211,4 +223,10 @@ void hddvd_set_update(demux_t *demux, unsigned flags, int title, int seekpoint)
     demux->info.i_update |= flags;
     demux->info.i_title = title;
     demux->info.i_seekpoint = seekpoint;
+}
+
+/* var_InheritBool() is static inline. */
+bool hddvd_inherit_bool(vlc_object_t *obj, const char *name)
+{
+    return var_InheritBool(obj, name);
 }
