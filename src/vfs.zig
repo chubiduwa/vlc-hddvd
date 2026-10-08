@@ -9,6 +9,8 @@ const udf = @import("udf.zig");
 
 pub const Error = error{NotFound} || vlcio.Error || udf.Error;
 
+extern fn hddvd_list_dir(obj: *vlc.vlc_object_t, url: [*:0]const u8, cb: *const fn (?*anyopaque, [*:0]const u8) callconv(.c) void, ctx: ?*anyopaque) c_int;
+
 pub const Fs = struct {
     gpa: std.mem.Allocator,
     obj: *vlc.vlc_object_t,
@@ -95,6 +97,44 @@ pub const Fs = struct {
         }
     }
 
+    /// Names of the entries of a disc-relative folder (free with freeNames).
+    pub fn listDir(fs: *Fs, gpa: std.mem.Allocator, rel: []const u8) Error![][]u8 {
+        switch (fs.backend) {
+            .image => |*img| return img.volume.listDir(gpa, rel) catch |err| switch (err) {
+                error.NotFound => error.NotFound,
+                else => err,
+            },
+            .dir => |root| {
+                const p = try std.fmt.allocPrint(fs.gpa, "{s}/{s}", .{ root, rel });
+                defer fs.gpa.free(p);
+                const url = try vlcio.pathToUrl(fs.gpa, p);
+                defer fs.gpa.free(url);
+                var ctx: ListCtx = .{ .gpa = gpa };
+                errdefer freeNames(gpa, ctx.names.items);
+                if (hddvd_list_dir(fs.obj, url.ptr, ListCtx.add, &ctx) != vlc.VLC_SUCCESS) return error.NotFound;
+                if (ctx.failed) return error.OutOfMemory;
+                return ctx.names.toOwnedSlice(gpa);
+            },
+        }
+    }
+
+    const ListCtx = struct {
+        gpa: std.mem.Allocator,
+        names: std.ArrayList([]u8) = .empty,
+        failed: bool = false,
+
+        fn add(p: ?*anyopaque, name: [*:0]const u8) callconv(.c) void {
+            const ctx: *ListCtx = @ptrCast(@alignCast(p));
+            const n = ctx.gpa.dupe(u8, std.mem.span(name)) catch return {
+                ctx.failed = true;
+            };
+            ctx.names.append(ctx.gpa, n) catch {
+                ctx.gpa.free(n);
+                ctx.failed = true;
+            };
+        }
+    };
+
     /// Reads a whole file, or returns null if it does not exist.
     pub fn readFile(fs: *Fs, gpa: std.mem.Allocator, rel: []const u8) Error!?[]u8 {
         var f = fs.openFile(rel) catch |err| switch (err) {
@@ -108,6 +148,8 @@ pub const Fs = struct {
         return buf;
     }
 };
+
+pub const freeNames = udf.freeNames;
 
 pub const File = struct {
     fs: *Fs,

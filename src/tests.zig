@@ -7,4 +7,11 @@ test {
     _ = @import("udf.zig");
     _ = @import("vm.zig");
     _ = @import("ifo.zig");
+    _ = @import("adv/dom.zig");
+    _ = @import("adv/xpl.zig");
+    _ = @import("adv/vti.zig");
+    _ = @import("adv/tmap.zig");
+    _ = @import("adv/aca.zig");
+    _ = @import("adv/timeline.zig");
+    _ = @import("adv/player.zig");
 }

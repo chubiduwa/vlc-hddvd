@@ -293,10 +293,44 @@ pub const Volume = struct {
         const data = try v.gpa.alloc(u8, @intCast(dir.size));
         defer v.gpa.free(data);
         if (try v.pread(dir, 0, data) != data.len) return error.ReadFailed;
+        var it: DirIterator = .{ .data = data };
+        while (try it.next()) |e| if (std.ascii.eqlIgnoreCase(e.name, name)) return e.icb;
+        return error.NotFound;
+    }
 
-        var p: usize = 0;
-        var name_buf: [255]u8 = undefined;
-        while (p + 38 <= data.len) {
+    /// Names of the entries of directory `path` (allocated with gpa; free with freeNames).
+    pub fn listDir(v: *Volume, gpa: std.mem.Allocator, path: []const u8) Error![][]u8 {
+        const dir = try v.lookup(path);
+        defer v.freeInfo(dir);
+        if (!dir.is_dir) return error.NotFound;
+        const data = try v.gpa.alloc(u8, @intCast(dir.size));
+        defer v.gpa.free(data);
+        if (try v.pread(dir, 0, data) != data.len) return error.ReadFailed;
+        var names: std.ArrayList([]u8) = .empty;
+        errdefer freeNames(gpa, names.items);
+        var it: DirIterator = .{ .data = data };
+        while (try it.next()) |e| try names.append(gpa, try gpa.dupe(u8, e.name));
+        return names.toOwnedSlice(gpa);
+    }
+};
+
+pub fn freeNames(gpa: std.mem.Allocator, names: []const []u8) void {
+    for (names) |n| gpa.free(n);
+    gpa.free(names);
+}
+
+/// File Identifier Descriptors of a directory's data, skipping the parent entry.
+const DirIterator = struct {
+    data: []const u8,
+    p: usize = 0,
+    name_buf: [255]u8 = undefined,
+
+    const Entry = struct { name: []const u8, icb: LongAd };
+
+    fn next(it: *DirIterator) Error!?Entry {
+        const data = it.data;
+        while (it.p + 38 <= data.len) {
+            const p = it.p;
             if (try tagId(data[p..]) != 257) return error.BadUdf; // File Identifier Descriptor
             const chars = data[p + 18];
             const l_fi = data[p + 19];
@@ -304,13 +338,11 @@ pub const Volume = struct {
             const l_iu = try le16(data, p + 36);
             const id_off = p + 38 + l_iu;
             if (id_off + l_fi > data.len) return error.BadUdf;
-            if (chars & 8 == 0 and l_fi > 0) { // not the parent entry
-                const entry = decodeName(data[id_off..][0..l_fi], &name_buf);
-                if (std.ascii.eqlIgnoreCase(entry, name)) return icb;
-            }
-            p += (38 + @as(usize, l_iu) + l_fi + 3) & ~@as(usize, 3);
+            it.p += (38 + @as(usize, l_iu) + l_fi + 3) & ~@as(usize, 3);
+            if (chars & 8 == 0 and l_fi > 0) // not the parent entry
+                return .{ .name = decodeName(data[id_off..][0..l_fi], &it.name_buf), .icb = icb };
         }
-        return error.NotFound;
+        return null;
     }
 };
 
@@ -544,6 +576,13 @@ fn testReadFiles(meta: bool) !void {
     try testing.expect(root.is_dir);
     try testing.expectError(error.NotFound, v.lookup("HVDVD_TS/HV002I01.IFO"));
     try testing.expectError(error.NotFound, v.lookup("HVDVD_TS/TINY/X"));
+
+    const names = try v.listDir(testing.allocator, "HVDVD_TS");
+    defer freeNames(testing.allocator, names);
+    try testing.expectEqual(2, names.len);
+    try testing.expectEqualStrings("HV001I01.IFO", names[0]);
+    try testing.expectEqualStrings("TINY", names[1]);
+    try testing.expectError(error.NotFound, v.listDir(testing.allocator, "HVDVD_TS/TINY"));
 }
 
 test "read files from a UDF image with a physical partition" {

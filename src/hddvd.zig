@@ -1,4 +1,5 @@
-//! HD DVD Standard Content input for VLC 3.0 with menus and interactivity (an access_demux).
+//! HD DVD input for VLC 3.0 with menus and interactivity (an access_demux): Standard Content here, Advanced
+//! Content in adv/player.zig (chosen at open; every control and ES hook dispatches on adv.owns()).
 //!
 //! - vfs.zig opens the disc (a folder or a UDF image); ifo.zig loads its navigation data (nav.zig).
 //! - vm.zig, the navigation VM, decides which cell to present; this module streams that cell's sectors to
@@ -17,6 +18,7 @@ const vfs = @import("vfs.zig");
 const vm_mod = @import("vm.zig");
 const hli = @import("hli.zig");
 const spudec = @import("spudec.zig");
+const adv = @import("adv/player.zig");
 
 const Vm = vm_mod.Vm;
 const sector_size = nav.sector_size;
@@ -590,6 +592,8 @@ fn open(o: *vlc.vlc_object_t) callconv(.c) c_int {
         log(o, vlc.VLC_MSG_ERR, @src(), "cannot open %s (%s)", .{ demux.psz_file, @errorName(err).ptr });
         return vlc.VLC_EGENERIC;
     };
+    // ADV_OBJ/DISCID.DAT marks Advanced Content, which a player plays even if Standard VTSs exist (Vol. 1 §4.1.1).
+    if (adv.detect(fs)) return adv.open(demux, fs);
     const d = ifo.loadDisc(gpa, fs) catch |err| {
         log(o, vlc.VLC_MSG_ERR, @src(), "not an HD DVD Standard Content disc: %s (%s)", .{ demux.psz_file, @errorName(err).ptr });
         fs.close();
@@ -668,6 +672,7 @@ fn openPs(demux: *vlc.demux_t) !void {
 
 fn close(o: *vlc.vlc_object_t) callconv(.c) void {
     const demux: *vlc.demux_t = @ptrCast(o);
+    if (adv.owns(demux)) return adv.close(demux);
     const sys = sysOf(demux);
     hddvd_mouse_delete(demux, sys.mouse);
     if (sys.ps) |ps| vlc.demux_Delete(ps); // deletes its ESes and so their decoders
@@ -704,17 +709,20 @@ fn pgcTime(sys: *Sys) i64 {
 }
 
 fn getLength(demux: *vlc.demux_t, out: *i64) callconv(.c) c_int {
+    if (adv.owns(demux)) return adv.getLength(demux, out);
     const sys = sysOf(demux);
     out.* = if (sys.vm.inMenu()) 0 else if (sys.vm.pgc()) |p| p.duration_us else 0;
     return vlc.VLC_SUCCESS;
 }
 
 fn getTime(demux: *vlc.demux_t, out: *i64) callconv(.c) c_int {
+    if (adv.owns(demux)) return adv.getTime(demux, out);
     out.* = pgcTime(sysOf(demux));
     return vlc.VLC_SUCCESS;
 }
 
 fn getPosition(demux: *vlc.demux_t, out: *f64) callconv(.c) c_int {
+    if (adv.owns(demux)) return adv.getPosition(demux, out);
     const sys = sysOf(demux);
     const p = sys.vm.pgc() orelse return vlc.VLC_EGENERIC;
     out.* = if (p.duration_us > 0) @as(f64, @floatFromInt(pgcTime(sys))) / @as(f64, @floatFromInt(p.duration_us)) else 0;
@@ -723,6 +731,7 @@ fn getPosition(demux: *vlc.demux_t, out: *f64) callconv(.c) c_int {
 
 /// Time_Search within the current title PGC.
 fn setTime(demux: *vlc.demux_t, t: i64) callconv(.c) c_int {
+    if (adv.owns(demux)) return adv.setTime(demux, t);
     const sys = sysOf(demux);
     if (sys.vm.inMenu() or !sys.vm.uopAllowed(Uop.time_ptt_search, sys.evobu_uop)) return vlc.VLC_EGENERIC;
     const p = sys.vm.pgc() orelse return vlc.VLC_EGENERIC;
@@ -743,6 +752,7 @@ fn setTime(demux: *vlc.demux_t, t: i64) callconv(.c) c_int {
 }
 
 fn setPosition(demux: *vlc.demux_t, f: f64) callconv(.c) c_int {
+    if (adv.owns(demux)) return adv.setPosition(demux, f);
     const sys = sysOf(demux);
     const p = sys.vm.pgc() orelse return vlc.VLC_EGENERIC;
     return setTime(demux, @intFromFloat(@as(f64, @floatFromInt(p.duration_us)) * std.math.clamp(f, 0, 1)));
@@ -753,6 +763,7 @@ const menu_points = [_][*:0]const u8{ "Resume", "Title", "Root", "Sub-picture", 
 /// VLC's title list: "HD DVD Menu" (interactive, one entry per menu) then the disc's titles and chapters.
 /// NOTE (Windows): VLC frees these with its own C runtime's free(); fine on macOS/Linux.
 fn getTitleInfo(demux: *vlc.demux_t, out_titles: *[*c][*c]vlc.input_title_t, out_count: *c_int) callconv(.c) c_int {
+    if (adv.owns(demux)) return adv.getTitleInfo(demux, out_titles, out_count);
     const sys = sysOf(demux);
     const titles = sys.disc.titles;
     const n = titles.len + 1;
@@ -803,6 +814,7 @@ fn callMenu(demux: *vlc.demux_t, which: vm_mod.Menu) bool {
 }
 
 fn setTitle(demux: *vlc.demux_t, i: c_int) callconv(.c) c_int {
+    if (adv.owns(demux)) return adv.setTitle(demux, i);
     const sys = sysOf(demux);
     if (i == 0) {
         if (callMenu(demux, .title) or callMenu(demux, .root)) {
@@ -819,6 +831,7 @@ fn setTitle(demux: *vlc.demux_t, i: c_int) callconv(.c) c_int {
 }
 
 fn setSeekpoint(demux: *vlc.demux_t, i: c_int) callconv(.c) c_int {
+    if (adv.owns(demux)) return adv.setSeekpoint(demux, i);
     const sys = sysOf(demux);
     if (sys.menu_requested) {
         // Part of a "title 0" menu request just served (title or root menu); other entries pick that menu.
@@ -849,6 +862,7 @@ fn setSeekpoint(demux: *vlc.demux_t, i: c_int) callconv(.c) c_int {
 
 /// DEMUX_NAV_*: 0 activate, 1 up, 2 down, 3 left, 4 right, 5 popup, 6 menu.
 fn navControl(demux: *vlc.demux_t, action: c_int) callconv(.c) c_int {
+    if (adv.owns(demux)) return adv.navControl(demux, action);
     const sys = sysOf(demux);
     log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "nav %d: phase %s, button %u%s", .{
         action, @tagName(sys.vm.phase).ptr, @as(c_uint, sys.vm.button()), @as([*:0]const u8, if (sys.hli != null) ", HLI" else ""),
@@ -900,6 +914,7 @@ fn currentPacketId(sys: *const Sys) c_int {
 /// Gives each ES its stream id, sub-picture streams the PGC palette and HD frame size, and audio/sub-picture
 /// streams their language.
 fn esFixup(demux: *vlc.demux_t, fmt: *vlc.es_format_t) callconv(.c) void {
+    if (adv.owns(demux)) return adv.esFixup(demux, fmt);
     const sys = sysOf(demux);
     if (fmt.i_id < 0) fmt.i_id = currentPacketId(sys);
     const id = fmt.i_id;
@@ -926,6 +941,7 @@ fn esFixup(demux: *vlc.demux_t, fmt: *vlc.es_format_t) callconv(.c) void {
 }
 
 fn esAdded(demux: *vlc.demux_t, id: c_int, es: *vlc.es_out_id_t) callconv(.c) void {
+    if (adv.owns(demux)) return adv.esAdded(demux, id, es);
     const sys = sysOf(demux);
     log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "ES added: id 0x%x", .{@as(c_uint, @bitCast(id))});
     sys.tracks.append(gpa, .{ .es = es, .id = id }) catch {};
@@ -933,6 +949,7 @@ fn esAdded(demux: *vlc.demux_t, id: c_int, es: *vlc.es_out_id_t) callconv(.c) vo
 }
 
 fn esDeleted(demux: *vlc.demux_t, es: *vlc.es_out_id_t) callconv(.c) void {
+    if (adv.owns(demux)) return adv.esDeleted(demux, es);
     const sys = sysOf(demux);
     for (sys.tracks.items, 0..) |t, i| if (t.es == es) {
         _ = sys.tracks.swapRemove(i);
@@ -948,6 +965,7 @@ fn esDeleted(demux: *vlc.demux_t, es: *vlc.es_out_id_t) callconv(.c) void {
 /// Reassembles sub-picture units and sends each whole unit, prefixed with the current PGC palette, to our
 /// sub-picture decoder (spudec.zig). Returns the block to send on, or null if it was consumed.
 fn esFilter(demux: *vlc.demux_t, es: *vlc.es_out_id_t, block: *vlc.block_t) callconv(.c) ?*vlc.block_t {
+    if (adv.owns(demux)) return adv.esFilter(demux, es, block);
     const sys = sysOf(demux);
     const t = for (sys.spus.items) |*t| {
         if (t.es == es) break t;

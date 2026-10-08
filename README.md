@@ -82,7 +82,7 @@ Open the disc with the `hddvd://` scheme (URL-encode the path: `'` → `%27`, sp
 `.iso` file or a folder:
 
 ```sh
-vlc "hddvd:///path/to/Dragon%27s%20Lair.iso"
+vlc "hddvd:///path/to/Bob%27s%20Disc.iso"
 vlc "hddvd:///Volumes/DISC"
 vlc "hddvd:///C:/Discs/Disc.iso"          # Windows
 ```

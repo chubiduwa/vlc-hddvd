@@ -19,6 +19,8 @@
 #include <vlc_input.h>
 #include <vlc_vout.h>
 #include <vlc_block.h>
+#include <vlc_input_item.h>
+#include <vlc_stream.h>
 
 /* Implemented in Zig. */
 void hddvd_es_fixup(demux_t *, es_format_t *);
@@ -267,4 +269,41 @@ void hddvd_seekpoint_set_name(seekpoint_t *s, const char *name)
 {
     if (name != NULL)
         s->psz_name = strdup(name);
+}
+
+/* Lists a folder through VLC's directory access (so file names never go through our C runtime's opendir):
+ * calls cb(ctx, name) for each entry. */
+int hddvd_list_dir(vlc_object_t *obj, const char *url, void (*cb)(void *, const char *), void *ctx)
+{
+    stream_t *s = vlc_stream_NewURL(obj, url);
+    if (s == NULL)
+        return VLC_EGENERIC;
+    int ret = VLC_EGENERIC;
+    input_item_t *item = input_item_New(url, NULL);
+    input_item_node_t *node = item != NULL ? input_item_node_Create(item) : NULL;
+    if (node != NULL)
+    {
+        ret = vlc_stream_ReadDir(s, node);
+        if (ret == VLC_SUCCESS)
+            for (int i = 0; i < node->i_children; i++)
+                cb(ctx, node->pp_children[i]->p_item->psz_name);
+        input_item_node_Delete(node);
+    }
+    if (item != NULL)
+        input_item_Release(item);
+    vlc_stream_Delete(s);
+    return ret;
+}
+
+void hddvd_fmt_set_description(es_format_t *fmt, const char *desc)
+{
+    free(fmt->psz_description);
+    fmt->psz_description = desc != NULL && desc[0] != 0 ? strdup(desc) : NULL;
+}
+
+/* ISO 639 code as a string, e.g. "en". */
+void hddvd_fmt_set_language_str(es_format_t *fmt, const char *lang)
+{
+    free(fmt->psz_language);
+    fmt->psz_language = strdup(lang);
 }
