@@ -153,7 +153,7 @@ pub fn highlight(h: *const Hli, btn: u8, action: bool, palette: *const [16]u32) 
         const yuv = palette[(coli >> shift) & 0xf];
         e.* = .{ @truncate(yuv >> 16), @truncate(yuv), @truncate(yuv >> 8), alpha2(@intCast((coli >> (shift - 16)) & 0xf)) };
     }
-    const c8 = h.colors8[b.color - 1][if (action) 1024 else 0 ..][0..1024];
+    const c8 = h.colors8[b.color - 1][if (action) 1024 else 0..][0..1024];
     for (&out.lut8, 0..) |*e, i| e.* = .{ c8[i * 3], c8[i * 3 + 2], c8[i * 3 + 1], alpha8(c8[768 + i]) };
     return out;
 }

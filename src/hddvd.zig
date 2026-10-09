@@ -279,10 +279,10 @@ fn syncCell(demux: *vlc.demux_t, move: Move) void {
         return;
     };
     log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "cell: %s VTS %u PGC %u PG %u cell %u (LB %u-%u, still %u, %u cmds)", .{
-        @tagName(sys.vm.domain).ptr,                     @as(c_uint, sys.vm.vtsn),
-        @as(c_uint, sys.vm.pgcn),                        @as(c_uint, sys.vm.pgn),
-        @as(c_uint, sys.vm.celln),                       @as(c_uint, c.first_sector),
-        @as(c_uint, c.last_sector),                      @as(c_uint, c.still),
+        @tagName(sys.vm.domain).ptr, @as(c_uint, sys.vm.vtsn),
+        @as(c_uint, sys.vm.pgcn),    @as(c_uint, sys.vm.pgn),
+        @as(c_uint, sys.vm.celln),   @as(c_uint, c.first_sector),
+        @as(c_uint, c.last_sector),  @as(c_uint, c.still),
         @as(c_uint, c.cmd_count),
     });
 
@@ -500,7 +500,7 @@ fn navigate(demux: *vlc.demux_t, dir: hli.Dir) void {
     const h = &sys.hli.?;
     const cur = sys.vm.button();
     if (cur == 0 or cur > h.n_buttons) return;
-    const target = h.buttons[cur - 1].adjacent[@intFromEnum(dir)];
+    const target = h.buttons[cur - 1].adjacent[@backingInt(dir)];
     if (target != 0 and target != cur) selectButton(demux, target, true);
 }
 

@@ -393,7 +393,7 @@ pub const Page = struct {
                         break :blk w.written();
                     };
                     for (mine[k..end]) |*x| under = x.value(a, under);
-                    if (prop.longhands().len > 0) setSpecIn(&spec, prop, under) else spec[@intFromEnum(prop)] = under;
+                    if (prop.longhands().len > 0) setSpecIn(&spec, prop, under) else spec[@backingInt(prop)] = under;
                     k = end;
                 }
                 if (scripted) {
@@ -409,7 +409,7 @@ pub const Page = struct {
     fn compute(spec: *const [style.count]?[]const u8, parent: *const style.Style, env: style.Env) style.Style {
         var s: style.Style = .initial(env.aperture_h);
         s.inherit(parent);
-        for (style.order) |prop| if (spec[@intFromEnum(prop)]) |raw| {
+        for (style.order) |prop| if (spec[@backingInt(prop)]) |raw| {
             _ = style.apply(&s, prop, raw, env);
         };
         return s;
@@ -491,13 +491,13 @@ pub const Page = struct {
     fn setSpecIn(spec: *[style.count]?[]const u8, prop: style.Prop, raw: []const u8) void {
         switch (prop) {
             .border => for (prop.longhands()) |l| {
-                spec[@intFromEnum(l)] = raw;
+                spec[@backingInt(l)] = raw;
             },
             .padding => {
                 // 1–4 widths: before end after start, as parsed in style.zig (the sides are slices of `raw`).
                 const v = style.firstValue(raw);
                 if (std.mem.eql(u8, v, "inherit")) {
-                    for (prop.longhands()) |l| spec[@intFromEnum(l)] = v;
+                    for (prop.longhands()) |l| spec[@backingInt(l)] = v;
                     return;
                 }
                 var t: [4][]const u8 = undefined;
@@ -515,9 +515,9 @@ pub const Page = struct {
                     4 => t,
                     else => return,
                 };
-                for (prop.longhands(), sides) |l, side| spec[@intFromEnum(l)] = side;
+                for (prop.longhands(), sides) |l, side| spec[@backingInt(l)] = side;
             },
-            else => spec[@intFromEnum(prop)] = raw,
+            else => spec[@backingInt(prop)] = raw,
         }
     }
 

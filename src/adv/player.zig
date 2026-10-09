@@ -491,7 +491,7 @@ fn positionSpan(demux: *vlc.demux_t, span: timeline.Span, t: u64) bool {
     p.ref_ts = tsOf(timeline.pts(span, p.tb(), evob.start_ptm, t));
     if (p.pres) |pr| pr.setTimeline(t, p.ref_ts, if (p.curTitle()) |ti| ti.duration else 0);
     log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "clip %s: frames %u-%u, sectors %u-%u", .{
-        z(&zb, evob.name),     @as(c_uint, @intCast(t)), @as(c_uint, @intCast(span.end)),
+        z(&zb, evob.name),              @as(c_uint, @intCast(t)),     @as(c_uint, @intCast(span.end)),
         @as(c_uint, @intCast(r.first)), @as(c_uint, @intCast(r.end)),
     });
     return true;

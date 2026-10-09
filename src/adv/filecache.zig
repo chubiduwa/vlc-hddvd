@@ -34,7 +34,7 @@ pub const State = enum(u3) {
     used = 4,
 
     pub fn max(a: State, b: State) State {
-        return if (@intFromEnum(a) >= @intFromEnum(b)) a else b;
+        return if (@backingInt(a) >= @backingInt(b)) a else b;
     }
 };
 
@@ -119,13 +119,15 @@ pub const FileCache = struct {
             var victim: ?usize = null;
             for (c.resources.items, 0..) |r, i| {
                 if (r.state != .available and r.state != .non_exist) continue;
-                const v = c.resources.items[victim orelse {
-                    victim = i;
-                    continue;
-                }];
+                const v = c.resources.items[
+                    victim orelse {
+                        victim = i;
+                        continue;
+                    }
+                ];
                 // App level before title level; then the highest priority number; then the oldest.
                 const better = if (r.level != v.level)
-                    @intFromEnum(r.level) > @intFromEnum(v.level)
+                    @backingInt(r.level) > @backingInt(v.level)
                 else if (r.priority != v.priority)
                     r.priority > v.priority
                 else

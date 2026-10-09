@@ -93,7 +93,7 @@ pub const Target = union(enum) {
 /// The navigation gesture `dir` from the focused element `from` (null: nothing focused in this page), for
 /// the application whose id is `app_id` (§7.2.8.1, Table 7.2.8-1).
 pub fn navigate(page: *Page, from: ?*Elem, dir: style.Dir, app_id: []const u8, rank: []const u32) Target {
-    if (from) |f| if (f.style.nav[@intFromEnum(dir)]) |nav| {
+    if (from) |f| if (f.style.nav[@backingInt(dir)]) |nav| {
         if (nav.app.len > 0 and !std.mem.eql(u8, nav.app, app_id)) return .{ .other = nav };
         const n = page.doc.getElementById(nav.elem) orelse return .none;
         const e = Page.elemOf(n) orelse return .none;

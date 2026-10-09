@@ -17,7 +17,7 @@ pub const TimeBase = enum(u8) {
     fps50 = 50,
 
     pub fn fps(t: TimeBase) u64 {
-        return @intFromEnum(t);
+        return @backingInt(t);
     }
 
     /// Frames to microseconds.

@@ -236,9 +236,9 @@ pub const Access = struct {
             missing += 1;
         };
         log(a.obj, vlc.VLC_MSG_DBG, @src(), "%s %s: %u scripts, %s markup, %u resources, %u missing", .{
-            kind,                                         z(&b, src),
-            @as(c_uint, @intCast(m.scripts.len)),         if (m.markup != null) "a".ptr else "no".ptr,
-            @as(c_uint, @intCast(m.resources.len)),       missing,
+            kind,                                   z(&b, src),
+            @as(c_uint, @intCast(m.scripts.len)),   if (m.markup != null) "a".ptr else "no".ptr,
+            @as(c_uint, @intCast(m.resources.len)), missing,
         });
     }
 

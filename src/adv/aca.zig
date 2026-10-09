@@ -135,7 +135,7 @@ pub fn parse(gpa: std.mem.Allocator, d: []const u8) Error!Archive {
             .offset = std.mem.readInt(u32, d[p..][0..4], .big),
             .size = std.mem.readInt(u32, d[p + 4 ..][0..4], .big),
             .crc = std.mem.readInt(u32, d[p + 8 ..][0..4], .big),
-            .mime = @enumFromInt(d[p + 12]),
+            .mime = @fromBackingInt(@intCast(d[p + 12])),
             .name = d[p + 14 ..][0..nl],
         };
         p += 14 + @as(usize, nl) + 32;

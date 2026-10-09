@@ -787,7 +787,7 @@ pub const Vm = struct {
     /// Menu_Call(menu): CallSS from a title (saving the resume point), JumpSS from a menu.
     pub fn menuCall(vm: *Vm, menu: Menu) bool {
         vm.budget = 0;
-        const id: u4 = @intFromEnum(menu);
+        const id: u4 = @backingInt(menu);
         const dom: u2 = if (menu == .title) 1 else 2;
         // Check the target exists before leaving the current position.
         const lus = if (dom == 1) vm.disc.vmgm else if (vm.vts()) |v| v.menus else &.{};

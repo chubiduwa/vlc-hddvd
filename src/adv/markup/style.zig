@@ -273,7 +273,7 @@ pub fn copyProp(s: *Style, from: *const Style, p: Prop) void {
         .linefeedTreatment => s.linefeedTreatment = from.linefeedTreatment,
         .lineHeight => s.lineHeight = from.lineHeight,
         .navDown, .navLeft, .navLeftDown, .navLeftUp, .navRight, .navRightDown, .navRightUp, .navUp => {
-            const i = @intFromEnum(navDir(p).?);
+            const i = @backingInt(navDir(p).?);
             s.nav[i] = from.nav[i];
         },
         .navIndex => s.navIndex = from.navIndex,
@@ -397,7 +397,7 @@ fn parseInto(s: *Style, p: Prop, raw: []const u8, env: Env) ParseError!bool {
         .inlineProgressionDimension => s.inlineProgressionDimension = try parseAutoLen(raw, em),
         .linefeedTreatment => s.linefeedTreatment = try kw(LinefeedTreatment, raw),
         .lineHeight => s.lineHeight = if (std.mem.eql(u8, raw, "auto")) null else (try parseLen(raw, em, true)).resolve(s.fontSize[1]),
-        .navDown, .navLeft, .navLeftDown, .navLeftUp, .navRight, .navRightDown, .navRightUp, .navUp => s.nav[@intFromEnum(navDir(p).?)] = try parseNav(raw),
+        .navDown, .navLeft, .navLeftDown, .navLeftUp, .navRight, .navRightDown, .navRightUp, .navUp => s.nav[@backingInt(navDir(p).?)] = try parseNav(raw),
         .navIndex => s.navIndex = try parseNavIndex(raw),
         .opacity => {
             const v = std.fmt.parseFloat(f32, raw) catch return error.Bad;
@@ -629,12 +629,12 @@ fn parseUris(raw: []const u8, a: std.mem.Allocator) ParseError![]const []const u
 }
 
 const named_colors = [_]struct { []const u8, Color }{
-    .{ "aqua", .{ 0, 255, 255, 255 } },    .{ "black", .{ 0, 0, 0, 255 } },       .{ "blue", .{ 0, 0, 255, 255 } },
-    .{ "fuchsia", .{ 255, 0, 255, 255 } }, .{ "gray", .{ 128, 128, 128, 255 } },  .{ "green", .{ 0, 128, 0, 255 } },
-    .{ "lime", .{ 0, 255, 0, 255 } },      .{ "maroon", .{ 128, 0, 0, 255 } },    .{ "navy", .{ 0, 0, 128, 255 } },
-    .{ "olive", .{ 128, 128, 0, 255 } },   .{ "purple", .{ 128, 0, 128, 255 } },  .{ "red", .{ 255, 0, 0, 255 } },
+    .{ "aqua", .{ 0, 255, 255, 255 } },     .{ "black", .{ 0, 0, 0, 255 } },      .{ "blue", .{ 0, 0, 255, 255 } },
+    .{ "fuchsia", .{ 255, 0, 255, 255 } },  .{ "gray", .{ 128, 128, 128, 255 } }, .{ "green", .{ 0, 128, 0, 255 } },
+    .{ "lime", .{ 0, 255, 0, 255 } },       .{ "maroon", .{ 128, 0, 0, 255 } },   .{ "navy", .{ 0, 0, 128, 255 } },
+    .{ "olive", .{ 128, 128, 0, 255 } },    .{ "purple", .{ 128, 0, 128, 255 } }, .{ "red", .{ 255, 0, 0, 255 } },
     .{ "silver", .{ 192, 192, 192, 255 } }, .{ "teal", .{ 0, 128, 128, 255 } },   .{ "white", .{ 255, 255, 255, 255 } },
-    .{ "yellow", .{ 255, 255, 0, 255 } },  .{ "transparent", .{ 0, 0, 0, 0 } },
+    .{ "yellow", .{ 255, 255, 0, 255 } },   .{ "transparent", .{ 0, 0, 0, 0 } },
 };
 
 /// CSS2 colours (keywords, #rgb, #rrggbb, rgb()) and `rgba(r,g,b,a)` with each component 0–255 or 0%–100%
@@ -746,7 +746,7 @@ pub fn format(w: *std.Io.Writer, s: *const Style, p: Prop, pct_base: f32) !void 
         .linefeedTreatment => try w.writeAll(@tagName(s.linefeedTreatment)),
         .lineHeight => if (s.lineHeight) |v| try w.print("{d}px", .{@as(i64, @intFromFloat(@round(v)))}) else try w.writeAll("auto"),
         .navDown, .navLeft, .navLeftDown, .navLeftUp, .navRight, .navRightDown, .navRightUp, .navUp => {
-            if (s.nav[@intFromEnum(navDir(p).?)]) |n| {
+            if (s.nav[@backingInt(navDir(p).?)]) |n| {
                 if (n.app.len > 0) try w.print("{s}#", .{n.app});
                 try w.writeAll(n.elem);
             } else try w.writeAll("none");
@@ -849,7 +849,7 @@ test "applying, inheriting, normalized values" {
     defer testing.allocator.free(bi);
     try testing.expectEqualStrings("url('a.png') url('b.png') url('cd.png')", bi);
     try testing.expect(apply(&s, .navRight, "menu#ok", env));
-    try testing.expectEqualStrings("menu", s.nav[@intFromEnum(Dir.right)].?.app);
+    try testing.expectEqualStrings("menu", s.nav[@backingInt(Dir.right)].?.app);
     try testing.expect(apply(&s, .navIndex, "3 4", env));
     const ni = try fmtTest(&s, .navIndex);
     defer testing.allocator.free(ni);

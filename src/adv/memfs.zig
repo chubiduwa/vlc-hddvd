@@ -169,7 +169,7 @@ pub const Fs = struct {
         errdefer out.deinit(gpa);
         for (fs.nodes.keys(), fs.nodes.values()) |k, v| {
             if (!isUnder(k, dir) or v.dir != dirs) continue;
-            const rest = k[if (dir.len == 0) 0 else dir.len + 1 ..];
+            const rest = k[if (dir.len == 0) 0 else dir.len + 1..];
             if (std.mem.indexOfScalar(u8, rest, '/') != null) continue;
             try out.append(gpa, rest);
         }

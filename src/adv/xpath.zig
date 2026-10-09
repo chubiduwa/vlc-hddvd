@@ -583,12 +583,12 @@ fn isNodeType(n: []const u8) bool {
 
 fn axisOf(n: []const u8) ?Axis {
     const table = .{
-        .{ "child", Axis.child },                         .{ "descendant", Axis.descendant },
+        .{ "child", Axis.child },                           .{ "descendant", Axis.descendant },
         .{ "descendant-or-self", Axis.descendant_or_self }, .{ "attribute", Axis.attribute },
-        .{ "self", Axis.self },                           .{ "parent", Axis.parent },
-        .{ "ancestor", Axis.ancestor },                   .{ "ancestor-or-self", Axis.ancestor_or_self },
-        .{ "following-sibling", Axis.following_sibling }, .{ "preceding-sibling", Axis.preceding_sibling },
-        .{ "following", Axis.following },                 .{ "preceding", Axis.preceding },
+        .{ "self", Axis.self },                             .{ "parent", Axis.parent },
+        .{ "ancestor", Axis.ancestor },                     .{ "ancestor-or-self", Axis.ancestor_or_self },
+        .{ "following-sibling", Axis.following_sibling },   .{ "preceding-sibling", Axis.preceding_sibling },
+        .{ "following", Axis.following },                   .{ "preceding", Axis.preceding },
         .{ "namespace", Axis.namespace },
     };
     inline for (table) |e| if (std.mem.eql(u8, n, e[0])) return e[1];
@@ -1268,4 +1268,3 @@ test "host: variables, property functions, GPRM, defaultNode" {
     h.in_end = true;
     try testing.expectEqualStrings("b2", try ids_of(try run("defaultNode()[state:focused()=false()]", doc, &h)));
 }
-
