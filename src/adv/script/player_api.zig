@@ -1114,8 +1114,11 @@ pub const ChapterRef = struct {
         return .{ t, t.chapters[ch.index] };
     }
 
+    /// The chapter's index in its title, from 0 (Annex Z only says "the number of the chapter"). Discs depend on
+    /// it: a scene menu marks `currentChapter.number + 1` as current, and its next-chapter command
+    /// jumps to `chapters[number + 1]`.
     fn number(ch: *ChapterRef) u32 {
-        return ch.index + 1;
+        return ch.index;
     }
 
     fn elapsedTime(ch: *ChapterRef, cx: *js.Context) js.Error!Value {
@@ -1948,7 +1951,8 @@ pub fn timelineEvents(w: *World, jumped: bool) void {
     // The chapter.
     const ch: ?u32 = if (title.chapterAt(now) > 0) @intCast(title.chapterAt(now)) else null;
     if (ch != m.last_chapter or !same_title) {
-        if (ch) |n| apps.sendSystem(.{ .kind = .chapter, .type = "chapter", .old = if (same_title) if (m.last_chapter) |o| @intCast(o) else null else null, .new = @intCast(n) }, null);
+        // Chapter numbers from 0, as Chapter.number: `newValue` indexes `Title.chapters`.
+        if (ch) |n| apps.sendSystem(.{ .kind = .chapter, .type = "chapter", .old = if (same_title) if (m.last_chapter) |o| @intCast(o - 1) else null else null, .new = @intCast(n - 1) }, null);
         m.last_chapter = ch;
     }
     // Clips.
@@ -2303,11 +2307,11 @@ test "the Player API on a title" {
     s.world.eng = &e;
     defer s.world.eng = null;
     try js.testing.run(cx,
-        \\assertEq(log.join(","), "title_begin:t1,chapter:NaN>1,clip_begin:c1,video_track:NaN>1,audio_track:NaN>1,subtitle_track:NaN>1,scheduled_event:ev,chapter:1>2");
+        \\assertEq(log.join(","), "title_begin:t1,chapter:NaN>0,clip_begin:c1,video_track:NaN>1,audio_track:NaN>1,subtitle_track:NaN>1,scheduled_event:ev,chapter:0>1");
         \\assertEq(Player.majorVersion, 1); assertEq(Player.menuLanguage, "en"); assertEq(Player.playlist.location, "file:///dvddisc/ADV_OBJ/VPLST000.XPL");
         \\var pl = Player.playlist; var t1 = pl.titles.t1;
         \\assertEq(pl.currentTitle, t1, "same object"); assertEq(t1.attributes.displayName, "Main"); assertEq(t1.attributes.onEnd, "t2");
-        \\assertEq(t1.chapters.length, 2); assertEq(pl.currentChapter.number, 2); assertEq(pl.currentChapter.attributes.displayName, "Two");
+        \\assertEq(t1.chapters.length, 2); assertEq(pl.currentChapter.number, 1, "from 0"); assertEq(pl.titles.t2.chapters.length, 1, "no ChapterList: one chapter"); assertEq(pl.titles.t2.chapters[0].number, 0); assertEq(pl.currentChapter.attributes.displayName, "Two");
         \\assertEq(t1.elapsedTime, "00:00:01:10"); assertEq(pl.titles.t2.elapsedTime, undefined);
         \\assertEq(t1.audioTracks.length, 2); assertEq(t1.audioTracks[1].languageCode, "ja"); assertEq(t1.audioTracks[1].languageCodeExtension, 1);
         \\assertEq(t1.audioTracks[0].getMediaAttribute("00:00:00:00", "sampleFrequency"), "48");

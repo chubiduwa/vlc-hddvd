@@ -211,7 +211,7 @@ pub const Title = struct {
         return null;
     }
 
-    /// Chapter number (1-based) at `time`, or 0 when the title has none.
+    /// Chapter number (1-based) at `time`, or 0 before the first chapter.
     pub fn chapterAt(t: *const Title, time: u64) usize {
         var n: usize = 0;
         for (t.chapters, 1..) |c, i| {
@@ -482,6 +482,8 @@ const Builder = struct {
         t.clips = clips.items;
         t.apps = apps.items;
         t.resources = try b.resources(e, "TitleResource");
+        // Without a ChapterList, the title is one chapter from its start (Vol. 3 §6.2.3.5).
+        if (t.chapters.len == 0) t.chapters = try a.dupe(Chapter, &.{.{ .begin = 0 }});
         return t;
     }
 
