@@ -102,20 +102,16 @@ const EsTrack = struct { es: *vlc.es_out_id_t, id: c_int };
 /// A stream forwarded into a main ES (sub video into the main video, sub audio into the main audio).
 const SubStream = struct { es: ?*vlc.es_out_id_t = null, id: c_int = -1, codec: u32 = 0 };
 
-/// A sub video layout change over time: from one area and crop to another, linearly.
-/// A video's area and crop as last set (null: the default), and a change in progress (changeLayout with a
-/// duration).
+/// A video's layout as last set (null: the default), and a change in progress (changeLayout with a duration),
+/// from one placement to another, linearly.
 const VideoLayout = struct {
-    rect: ?compose.Rect = null,
-    crop: ?[4]u32 = null,
+    cur: ?compose.Layout = null,
     anim: ?LayoutAnim = null,
 };
 
 const LayoutAnim = struct {
-    from: compose.Rect,
-    to: compose.Rect,
-    from_crop: [4]u32,
-    to_crop: [4]u32,
+    from: compose.Layout.Placed,
+    to: compose.Layout.Placed,
     start: i64,
     duration: i64,
 };
@@ -379,7 +375,7 @@ fn debugOptions(o: *vlc.vlc_object_t, pr: *present.Presentation) void {
             if (n == v.len) break;
             v[n] = std.fmt.parseInt(i32, t, 10) catch break;
         }
-        if (n >= 4) pr.setSubLayout(.{ .x = v[0], .y = v[1], .w = v[2], .h = v[3] }, @intCast(std.math.clamp(v[4], 0, 255)));
+        if (n >= 4) pr.setSubLayout(.{ .rect = .{ .x = v[0], .y = v[1], .w = v[2], .h = v[3] } }, @intCast(std.math.clamp(v[4], 0, 255)));
     }
     if (hddvd_inherit_string(o, "hddvd-sub-mix")) |str| {
         defer hddvd_free(str);
@@ -569,6 +565,7 @@ fn positionSpan(demux: *vlc.demux_t, span: timeline.Span, t: u64) bool {
     if (p.pres) |pr| if (p.vti.attrOf(evob)) |a| {
         pr.lockIt();
         pr.luma_key = if (a.luma != 0) .{ @intCast(a.luma >> 8), @intCast(a.luma & 0xff) } else null;
+        pr.sub_aspect = a.subAspect();
         pr.unlock();
     };
     p.span = span;
@@ -852,38 +849,34 @@ fn selectTracks(demux: *vlc.demux_t, audio: ?u8) void {
 fn setLayout(demux: *vlc.demux_t, l: @FieldType(engine.Command, "layout")) void {
     const p = playerOf(demux);
     const pr = p.pres orelse return;
-    const aw: i32 = pr.aperture_w;
-    const ah: i32 = pr.aperture_h;
     const lay = if (l.main) &p.main_layout else &p.sub_layout;
-    // A null scale: the main video goes back to its default place; the sub video fills the aperture.
-    const rect: ?compose.Rect = if (l.scale) |sc| .{
+    // A null scale: the height fitted to the aperture's and centred, the crop ignored.
+    const layout: compose.Layout = if (l.scale) |sc| .{ .placed = .{
         .x = l.x,
         .y = l.y,
-        .w = @intCast(@as(u64, l.crop[2]) * sc[0] / @max(sc[1], 1)),
-        .h = @intCast(@as(u64, l.crop[3]) * sc[0] / @max(sc[1], 1)),
-    } else if (l.main) null else .{ .x = 0, .y = 0, .w = aw, .h = ah };
-    const full = l.crop[0] == 0 and l.crop[1] == 0 and l.crop[2] == aw and l.crop[3] == ah;
-    const crop: ?[4]u32 = if (full or l.scale == null) null else l.crop;
-    if (l.main) if (rect) |r| log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "main video layout %d,%d %dx%d", .{ r.x, r.y, r.w, r.h });
+        .scale = @as(f32, @floatFromInt(sc[0])) / @as(f32, @floatFromInt(@max(sc[1], 1))),
+        .crop = .{ @intCast(l.crop[0]), @intCast(l.crop[1]), @intCast(l.crop[2]), @intCast(l.crop[3]) },
+    } } else .fit;
+    log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "%s video layout: origin %d,%d, scale %u/%u, crop %u,%u %ux%u", .{
+        if (l.main) "main".ptr else "sub".ptr,       l.x,                                         l.y,
+        if (l.scale) |sc| @as(c_uint, sc[0]) else 0, if (l.scale) |sc| @as(c_uint, sc[1]) else 0, l.crop[0],
+        l.crop[1],                                   l.crop[2],                                   l.crop[3],
+    });
     lay.anim = null;
-    if (l.ticks > 0) if (lay.rect) |f| if (rect) |to| {
-        const fc = lay.crop orelse [4]u32{ 0, 0, @intCast(aw), @intCast(ah) };
+    if (l.ticks > 0) if (lay.cur) |cur| if (cur == .placed and layout == .placed) {
         lay.anim = .{
-            .from = f,
-            .to = to,
-            .from_crop = fc,
-            .to_crop = l.crop,
+            .from = cur.placed,
+            .to = layout.placed,
             .start = hddvd_now_us(),
             .duration = engine.TickRate.of(p.pl.tick_base).us(l.ticks),
         };
     };
-    lay.rect = rect;
-    lay.crop = crop;
-    if (lay.anim == null) setArea(pr, l.main, rect, crop);
+    lay.cur = layout;
+    if (lay.anim == null) setPlace(pr, l.main, layout);
 }
 
-fn setArea(pr: *present.Presentation, main: bool, rect: ?compose.Rect, crop: ?[4]u32) void {
-    if (main) pr.setMainArea(rect, crop) else pr.setSubArea(rect, crop);
+fn setPlace(pr: *present.Presentation, main: bool, layout: compose.Layout) void {
+    if (main) pr.setMainPlace(layout) else pr.setSubPlace(layout);
 }
 
 /// Moves the layout changes in progress on.
@@ -901,27 +894,23 @@ fn animateLayout(demux: *vlc.demux_t) void {
         const el = hddvd_now_us() - a.start;
         if (el >= a.duration) {
             lay.anim = null;
-            setArea(pr, main, lay.rect, lay.crop);
+            setPlace(pr, main, lay.cur.?);
             continue;
         }
-        const k: f64 = @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(a.duration));
+        const k: f32 = @floatCast(@as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(a.duration)));
         const lerp = struct {
-            fn i(x: i32, y: i32, t: f64) i32 {
-                return @intFromFloat(@round(@as(f64, @floatFromInt(x)) + (@as(f64, @floatFromInt(y)) - @as(f64, @floatFromInt(x))) * t));
-            }
-            fn u(x: u32, y: u32, t: f64) u32 {
-                return @intCast(@max(i(@intCast(x), @intCast(y), t), 0));
+            fn i(x: i32, y: i32, t: f32) i32 {
+                return @intFromFloat(@round(@as(f32, @floatFromInt(x)) + @as(f32, @floatFromInt(y - x)) * t));
             }
         };
-        setArea(pr, main, .{
+        var at: compose.Layout.Placed = .{
             .x = lerp.i(a.from.x, a.to.x, k),
             .y = lerp.i(a.from.y, a.to.y, k),
-            .w = lerp.i(a.from.w, a.to.w, k),
-            .h = lerp.i(a.from.h, a.to.h, k),
-        }, .{
-            lerp.u(a.from_crop[0], a.to_crop[0], k), lerp.u(a.from_crop[1], a.to_crop[1], k),
-            lerp.u(a.from_crop[2], a.to_crop[2], k), lerp.u(a.from_crop[3], a.to_crop[3], k),
-        });
+            .scale = a.from.scale + (a.to.scale - a.from.scale) * k,
+            .crop = undefined,
+        };
+        for (&at.crop, a.from.crop, a.to.crop) |*c, f, t| c.* = lerp.i(f, t, k);
+        setPlace(pr, main, .{ .placed = at });
     }
 }
 
@@ -932,8 +921,7 @@ fn resetLayouts(demux: *vlc.demux_t) void {
     p.main_layout = .{};
     p.sub_layout = .{};
     const pr = p.pres orelse return;
-    pr.setMainArea(null, null);
-    pr.setSubArea(null, null);
+    pr.setMainPlace(.fit);
     pr.setSubLayout(null, 0);
     debugOptions(asObj(demux), pr); // --hddvd-pip stands for an application's layout
 }
@@ -963,7 +951,7 @@ fn loadPlaylist(demux: *vlc.demux_t, u: []const u8) !void {
         pr.setAperture(p.pl.aperture_w, p.pl.aperture_h);
         pr.time_base = p.pl.time_base;
         pr.setSubLayout(null, 0);
-        pr.setMainArea(null, null);
+        pr.setMainPlace(.fit);
         startHost(demux, pr);
     }
     p.cur_title = -1;

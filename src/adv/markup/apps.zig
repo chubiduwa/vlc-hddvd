@@ -517,17 +517,23 @@ pub const Apps = struct {
                 break :blk null;
             };
             if (a.script) |sc| {
-                var failed: usize = 0;
+                // The script files are one program (Script.runScripts).
+                var files: std.ArrayList(Script.Source) = .empty;
+                defer {
+                    for (files.items) |f| s.gpa.free(f.bytes);
+                    files.deinit(s.gpa);
+                }
+                var missing: usize = 0;
                 for (m.scripts) |u| {
                     const code = s.cfg.loader.read(s.cfg.loader.ctx, u) catch |err| {
                         s.log("application {s}: cannot read {s} ({s})", .{ a.src, u, @errorName(err) });
-                        failed += 1;
+                        missing += 1;
                         continue;
                     };
-                    defer s.gpa.free(code);
-                    if (!sc.runScript(code, u)) failed += 1;
+                    files.append(s.gpa, .{ .name = u, .bytes = code }) catch s.gpa.free(code);
                 }
-                s.log("application {s}: {d} scripts run, {d} failed", .{ a.src, m.scripts.len, failed });
+                const ok = files.items.len == 0 or sc.runScripts(files.items, a.src);
+                s.log("application {s}: {d} scripts run{s}{s}", .{ a.src, files.items.len, if (ok) "" else ", with an uncaught exception", if (missing > 0) ", some missing" else "" });
             }
         }
         const markup = m.markup orelse {

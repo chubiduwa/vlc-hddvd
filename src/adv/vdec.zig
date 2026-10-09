@@ -168,7 +168,7 @@ fn setOutput(s: *Sys, aw: u32, ah: u32) c_int {
 
 /// The main video's size in square pixels (the Main Video coordinate system, Vol. 1 §4.3.12: 720×480 4:3 is
 /// 640×480, 1440×1080 16:9 is 1920×1080).
-fn squareSize(f: *const vlc.video_format_t) [2]u32 {
+pub fn squareSize(f: *const vlc.video_format_t) [2]u32 {
     const num: u64 = if (f.i_sar_num == 0 or f.i_sar_den == 0) 1 else f.i_sar_num;
     const den: u64 = if (f.i_sar_num == 0 or f.i_sar_den == 0) 1 else f.i_sar_den;
     return .{ @intCast((@as(u64, f.i_visible_width) * num + den / 2) / den), f.i_visible_height };
@@ -185,19 +185,20 @@ pub fn onPicture(ctx: *anyopaque, pic: *vlc.picture_t) void {
     pres.lockIt();
     const aw: u32 = pres.aperture_w;
     const ah: u32 = pres.aperture_h;
-    const rect = pres.main_rect;
-    const crop = pres.main_crop;
+    const layout = pres.main_layout;
     const outer = pres.outer;
     pres.unlock();
     if (aw != s.out_w or ah != s.out_h) if (setOutput(s, aw, ah) != 0) return;
     const out = hddvd_dec_new_picture(s.dec) orelse return;
     if (yuvOf(out)) |dst| {
         const sq = squareSize(&fmt);
-        const r = rect orelse compose.mainDefault(sq[0], sq[1], aw, ah);
-        const shown = if (crop) |c| src.crop(c, sq[0], sq[1]) else src;
-        const covers = r.x <= 0 and r.y <= 0 and r.x + r.w >= aw and r.y + r.h >= ah;
-        if (!covers) compose.fill(dst, outer);
-        compose.scaleFrame(dst, r, shown, !pic.b_progressive);
+        if (compose.place(layout, sq[0], sq[1], aw, ah)) |placed| {
+            const r = placed.dest;
+            const shown = if (placed.crop) |c| src.crop(c, placed.space[0], placed.space[1]) else src;
+            const covers = r.x <= 0 and r.y <= 0 and r.x + r.w >= aw and r.y + r.h >= ah;
+            if (!covers) compose.fill(dst, outer);
+            compose.scaleFrame(dst, r, shown, !pic.b_progressive);
+        } else compose.fill(dst, outer); // nothing of it shown
     }
     out.date = s.timer.frame(pic.date, pic.i_nb_fields);
     out.b_force = pic.b_force;

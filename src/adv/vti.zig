@@ -57,6 +57,16 @@ pub const Attr = struct {
     pub fn hasSubVideo(a: *const Attr) bool {
         return a.sub_video != 0;
     }
+
+    /// The sub video's display aspect ratio (EVOB_VS_ATR b25–b24: 00b 4:3, 11b 16:9), or null.
+    pub fn subAspect(a: *const Attr) ?[2]u32 {
+        if (a.sub_video == 0) return null;
+        return switch ((a.sub_video >> 24) & 3) {
+            0 => .{ 4, 3 },
+            3 => .{ 16, 9 },
+            else => null,
+        };
+    }
 };
 
 pub const Vti = struct {
@@ -179,7 +189,7 @@ pub fn testVti(gpa: std.mem.Allocator, n: u16) ![]u8 {
     std.mem.writeInt(u32, d[at + 8 ..][0..4], 12, .big);
     const r = d[at + 12 ..][0..1024];
     std.mem.writeInt(u16, r[0..2], 0x0500, .big);
-    std.mem.writeInt(u32, r[6..10], 0x60105000, .big); // sub video present
+    std.mem.writeInt(u32, r[6..10], 0x63105000, .big); // sub video present: VC-1, 16:9
     std.mem.writeInt(u16, r[14..16], 1, .big);
     std.mem.writeInt(u16, r[228..230], 2, .big);
     r[230] = 0x80;
@@ -215,6 +225,7 @@ test "parse a VTI" {
     try testing.expectEqualStrings("E1.EVO", e.name);
     const a = v.attrOf(e).?;
     try testing.expect(a.hasSubVideo());
+    try testing.expectEqual(@as(?[2]u32, .{ 16, 9 }), a.subAspect());
     try testing.expectEqual(@as(?u5, 0), a.hdSubpStream(0));
     try testing.expectEqual(@as(?u5, 3), a.hdSubpStream(1));
     try testing.expectEqual(null, a.hdSubpStream(2));

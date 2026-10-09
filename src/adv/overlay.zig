@@ -232,9 +232,9 @@ fn subVideo(view: *View, ts: i64, clears: []const planes.ClearRect, tail: **?*vl
     defer pip.unref();
     pres.lockIt();
     const alpha = pres.sub_alpha;
-    const rect = pres.sub_rect;
-    const crop = pres.sub_crop;
+    const layout = pres.sub_layout;
     const key = pres.luma_key;
+    const aspect = pres.sub_aspect;
     pres.unlock();
 
     pip.lockIt();
@@ -242,13 +242,20 @@ fn subVideo(view: *View, ts: i64, clears: []const planes.ClearRect, tail: **?*vl
     const f = pip.take(ts) orelse return;
     if (alpha == 0) return; // hidden
     const full = vdec.yuvOf(f.pic) orelse return;
-    const src = if (crop) |c| full.crop(c, pres.aperture_w, pres.aperture_h) else full;
-    const r = rect orelse compose.Rect{
-        .x = @divTrunc(@as(i32, pres.aperture_w) - @as(i32, @intCast(src.width())), 2),
-        .y = @divTrunc(@as(i32, pres.aperture_h) - @as(i32, @intCast(src.height())), 2),
-        .w = @intCast(src.width()),
-        .h = @intCast(src.height()),
-    };
+    // Its size in square pixels (Vol. 1 §4.3.12, Table 4.3.12-1: 720×480 16:9 is 853×480), which
+    // applications lay out. An SD sub video's aspect ratio is in the EVOB attributes: its stream may not carry
+    // one (VC-1 then decodes as square pixels).
+    const sq = subSquareSize(&f.pic.format, aspect);
+    const aw: u32 = pres.aperture_w;
+    const ah: u32 = pres.aperture_h;
+    const placed = compose.place(layout orelse .{ .rect = .{
+        .x = @divTrunc(@as(i32, @intCast(aw)) - @as(i32, @intCast(sq[0])), 2),
+        .y = @divTrunc(@as(i32, @intCast(ah)) - @as(i32, @intCast(sq[1])), 2),
+        .w = @intCast(sq[0]),
+        .h = @intCast(sq[1]),
+    } }, sq[0], sq[1], aw, ah) orelse return;
+    const src = if (placed.crop) |c| full.crop(c, placed.space[0], placed.space[1]) else full;
+    const r = placed.dest;
     if (r.w <= 0 or r.h <= 0) return;
     const region = hddvd_region_new_rgba(@intCast(r.w), @intCast(r.h)) orelse return;
     const plane = &region.*.p_picture.*.p[0];
@@ -260,6 +267,12 @@ fn subVideo(view: *View, ts: i64, clears: []const planes.ClearRect, tail: **?*vl
     compose.toRgba(px, pitch, w, h, src, alpha, key, matrix);
     planes.punch(px, pitch, 4, 3, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, clears, true);
     append(tail, region, r.x, r.y);
+}
+
+fn subSquareSize(f: *const vlc.video_format_t, aspect: ?[2]u32) [2]u32 {
+    const h = f.i_visible_height;
+    if (aspect) |a| if (h > 0 and h <= 576) return .{ (h * a[0] + a[1] / 2) / a[1], h };
+    return vdec.squareSize(f);
 }
 
 /// The sub-picture periods visible, in their own colours.

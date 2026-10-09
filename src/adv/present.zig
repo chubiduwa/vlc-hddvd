@@ -63,17 +63,16 @@ pub const Presentation = struct {
     time_base: xpl.TimeBase = .fps60,
 
     // Under lock:
-    /// Main video area (null: the default place, its height fitted to the aperture's and centred) and the part of
-    /// it shown in Main Video coordinates (square pixels; null: all of it), from changeLayout, and the colour
+    /// The main video's layout (by default its height fitted to the aperture's and centred), and the colour
     /// outside it (Y, Cb, Cr). Our main video decoder (vdec.zig) composites it into the aperture.
-    main_rect: ?compose.Rect = null,
-    main_crop: ?[4]u32 = null,
+    main_layout: compose.Layout = .fit,
     outer: [3]u8 = .{ 16, 128, 128 },
-    /// Sub video area (null: its native size, centred) and opacity (0 = hidden, the default, §4.3.13.3.4).
-    sub_rect: ?compose.Rect = null,
+    /// The sub video's layout (null: its native size, centred) and opacity (0 = hidden, the default,
+    /// §4.3.13.3.4).
+    sub_layout: ?compose.Layout = null,
     sub_alpha: u8 = 0,
-    /// The part of the sub video shown, in aperture coordinates (null: all of it).
-    sub_crop: ?[4]u32 = null,
+    /// Sub video display aspect ratio (from the EVOB attributes), or null.
+    sub_aspect: ?[2]u32 = null,
     /// Sub video luma key range (from the EVOB attributes), or null.
     luma_key: ?[2]u8 = null,
     /// The applications' audio levels (Annex W, Table W-4; null: not set, the usual mix): main volumes, and the
@@ -143,28 +142,26 @@ pub const Presentation = struct {
         p.cursor = .init(w, h);
     }
 
-    /// Sets the sub video layout (null rect: native size, centred; alpha 0: hidden).
-    pub fn setSubLayout(p: *Presentation, rect: ?compose.Rect, alpha: u8) void {
+    /// Sets the sub video's layout and opacity (null: native size, centred; alpha 0: hidden).
+    pub fn setSubLayout(p: *Presentation, layout: ?compose.Layout, alpha: u8) void {
         p.lockIt();
-        p.sub_rect = rect;
+        p.sub_layout = layout;
         p.sub_alpha = alpha;
         p.unlock();
         _ = p.layout_gen.fetchAdd(1, .release);
     }
 
-    /// The main video's area and crop (an application's changeLayout).
-    pub fn setMainArea(p: *Presentation, rect: ?compose.Rect, crop: ?[4]u32) void {
+    /// The main video's layout (an application's changeLayout).
+    pub fn setMainPlace(p: *Presentation, layout: compose.Layout) void {
         p.lockIt();
         defer p.unlock();
-        p.main_rect = rect;
-        p.main_crop = crop;
+        p.main_layout = layout;
     }
 
-    /// The sub video's area and crop (an application's changeLayout), keeping its opacity.
-    pub fn setSubArea(p: *Presentation, rect: ?compose.Rect, crop: ?[4]u32) void {
+    /// The sub video's layout (an application's changeLayout), keeping its opacity.
+    pub fn setSubPlace(p: *Presentation, layout: ?compose.Layout) void {
         p.lockIt();
-        p.sub_rect = rect;
-        p.sub_crop = crop;
+        p.sub_layout = layout;
         p.unlock();
         _ = p.layout_gen.fetchAdd(1, .release);
     }

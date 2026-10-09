@@ -342,8 +342,71 @@ pub const Script = struct {
 
     // ---- scripts and pages ----
 
-    /// Runs one of the application's script files; an error is reported and does not stop the others.
-    /// Runs a script file of the application; false if it threw (the exception is reported).
+    pub const Source = struct { name: []const u8, bytes: []const u8 };
+
+    /// Runs the application's script files in order, as one program. Vol. 3 §6.2.4 has each file "executed as
+    /// global code", but players compile an application's scripts together and discs rely on it: a script may
+    /// read a `var` that a later file declares (hoisted, it is undefined rather than a ReferenceError). An
+    /// exception is reported with the file and line it comes from. False if it threw.
+    pub fn runScripts(s: *Script, files: []const Source, program: []const u8) bool {
+        var all: std.ArrayList(u8) = .empty;
+        defer all.deinit(s.gpa);
+        var starts: std.ArrayList(u32) = .empty; // first line of each file in the program
+        defer starts.deinit(s.gpa);
+        var line: u32 = 1;
+        for (files) |f| {
+            const u = js.decodeScript(s.gpa, f.bytes) catch return false;
+            defer s.gpa.free(u);
+            starts.append(s.gpa, line) catch return false;
+            all.appendSlice(s.gpa, u) catch return false;
+            all.append(s.gpa, '\n') catch return false;
+            line += @intCast(std.mem.count(u8, u, "\n") + 1);
+        }
+        var buf: [512]u8 = undefined;
+        const n = std.fmt.bufPrintSentinel(&buf, "{s}", .{program}, 0) catch "scripts";
+        defer s.cx.runJobs();
+        s.cx.runScript(all.items, n) catch {
+            const msg = s.cx.takeException(s.gpa) catch return false;
+            defer s.gpa.free(msg);
+            const mapped = mapLines(s.gpa, msg, n, files, starts.items) catch return false;
+            defer s.gpa.free(mapped);
+            if (s.cx.log) |f| f(s.cx.owner, mapped);
+            return false;
+        };
+        return true;
+    }
+
+    /// Rewrites "<name>:<line>" in `msg` (a position in the joined program) to "<file>:<line in it>".
+    fn mapLines(gpa: std.mem.Allocator, msg: []const u8, program: []const u8, files: []const Source, starts: []const u32) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(gpa);
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, msg, i, program)) |at| {
+            try out.appendSlice(gpa, msg[i..at]);
+            var j = at + program.len;
+            if (j < msg.len and msg[j] == ':') {
+                var k = j + 1;
+                while (k < msg.len and std.ascii.isDigit(msg[k])) k += 1;
+                const l = std.fmt.parseInt(u32, msg[j + 1 .. k], 10) catch 0;
+                if (l > 0) {
+                    var fi: usize = 0;
+                    for (starts, 0..) |st, idx| if (st <= l) {
+                        fi = idx;
+                    };
+                    try out.print(gpa, "{s}:{d}", .{ files[fi].name, l - starts[fi] + 1 });
+                    i = k;
+                    continue;
+                }
+                j = at + program.len;
+            }
+            try out.appendSlice(gpa, program);
+            i = j;
+        }
+        try out.appendSlice(gpa, msg[i..]);
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Runs a script of the application; false if it threw (the exception is reported).
     pub fn runScript(s: *Script, bytes: []const u8, file: []const u8) bool {
         var buf: [512]u8 = undefined;
         const n = std.fmt.bufPrintSentinel(&buf, "{s}", .{file}, 0) catch "script";
@@ -1334,4 +1397,20 @@ test "XMLParser: parse, write and statuses" {
     try e.run("assertEq(back, '\\u00e9');", "xml6.js");
     const saved = try e.store.read("file:///required/save.xml");
     try std.testing.expect(std.mem.startsWith(u8, saved, "\xfe\xff\x00<\x00?\x00x"));
+}
+
+test "an application's scripts are one program" {
+    const e = try testenv.Env.create();
+    defer e.destroy();
+    // The first file reads a var and calls a function that only the second declares.
+    try std.testing.expect(e.script.runScripts(&.{
+        .{ .name = "a.js", .bytes = "var early = late;\nvar called = lateFn();" },
+        .{ .name = "b.js", .bytes = "var late = 5;\nfunction lateFn() { return 7; }" },
+    }, "app.xmf"));
+    try e.run("assertEq(early, undefined); assertEq(called, 7); assertEq(late, 5);", "check.js");
+    // Positions in the joined program name the file and its own line.
+    const files = [_]Script.Source{ .{ .name = "a.js", .bytes = "" }, .{ .name = "b.js", .bytes = "" } };
+    const m = try Script.mapLines(std.testing.allocator, "TypeError: x\n    at f (app.xmf:5:3)\n    at <eval> (app.xmf:2:1)", "app.xmf", &files, &.{ 1, 4 });
+    defer std.testing.allocator.free(m);
+    try std.testing.expectEqualStrings("TypeError: x\n    at f (b.js:2:3)\n    at <eval> (a.js:2:1)", m);
 }

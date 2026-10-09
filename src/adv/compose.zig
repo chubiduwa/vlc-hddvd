@@ -173,6 +173,55 @@ pub fn mainDefault(dw: u32, dh: u32, aw: u32, ah: u32) Rect {
     };
 }
 
+/// Where a video goes in the aperture.
+pub const Layout = union(enum) {
+    /// Its height fitted to the aperture's and centred (changeLayout with a null scale; the main video's
+    /// default, Vol. 1 §4.3.13.3).
+    fit,
+    /// Scaled into a rectangle (a debugging option).
+    rect: Rect,
+    /// changeLayout with a scale (Annex Z.10.19.3, Z.10.20.3): the video scaled by `scale` has its origin at
+    /// (x, y), and `crop` is a rectangle of the scaled video, from that origin; only that part is shown, at
+    /// (x + crop.x, y + crop.y). The discs compute the crop on the scaled video (a ¾ scale with the default crop
+    /// passes the scaled size), so the crop is not scaled again.
+    placed: Placed,
+
+    pub const Placed = struct { x: i32, y: i32, scale: f32, crop: [4]i32 };
+};
+
+/// Where a video's part goes: `dest` in the aperture, showing `crop` (x, y, w, h) of a `space` the whole
+/// picture fills (for Yuv.crop; null: all of it).
+pub const Placement = struct {
+    dest: Rect,
+    crop: ?[4]u32 = null,
+    space: [2]u32 = .{ 0, 0 },
+};
+
+/// Places a video of `sw`×`sh` square pixels (its Main or Sub Video coordinate system, Vol. 1 §4.3.12) in a
+/// `aw`×`ah` aperture by `l`. Null when nothing is shown.
+pub fn place(l: Layout, sw: u32, sh: u32, aw: u32, ah: u32) ?Placement {
+    switch (l) {
+        .fit => return .{ .dest = mainDefault(sw, sh, aw, ah) },
+        .rect => |r| return if (r.w > 0 and r.h > 0) .{ .dest = r } else null,
+        .placed => |p| {
+            if (sw == 0 or sh == 0 or !(p.scale > 0)) return null;
+            const fw: i64 = @intFromFloat(@round(@as(f32, @floatFromInt(sw)) * p.scale));
+            const fh: i64 = @intFromFloat(@round(@as(f32, @floatFromInt(sh)) * p.scale));
+            // The crop, within the scaled video.
+            const x0 = std.math.clamp(@as(i64, p.crop[0]), 0, fw);
+            const y0 = std.math.clamp(@as(i64, p.crop[1]), 0, fh);
+            const x1 = std.math.clamp(@as(i64, p.crop[0]) + p.crop[2], 0, fw);
+            const y1 = std.math.clamp(@as(i64, p.crop[1]) + p.crop[3], 0, fh);
+            if (x1 <= x0 or y1 <= y0) return null;
+            return .{
+                .dest = .{ .x = @intCast(p.x + x0), .y = @intCast(p.y + y0), .w = @intCast(x1 - x0), .h = @intCast(y1 - y0) },
+                .crop = .{ @intCast(x0), @intCast(y0), @intCast(x1 - x0), @intCast(y1 - y0) },
+                .space = .{ @intCast(fw), @intCast(fh) },
+            };
+        },
+    }
+}
+
 /// YUV to RGB matrix: BT.601 for SD sources, BT.709 for HD (studio range).
 pub const Matrix = enum { bt601, bt709 };
 
@@ -369,4 +418,23 @@ test "interlaced pictures are scaled field by field" {
     // Progressive scaling blends them.
     scaleFrame(dst.pic, .{ .x = 0, .y = 0, .w = 2, .h = 8 }, src.pic, false);
     try testing.expect(dst.pic.y.row(2)[0] != 10 and dst.pic.y.row(2)[0] != 200);
+}
+
+test "placing a video by an application's layout" {
+    // A 853×480 sub video at scale 1, its letterbox bars cropped (a centred 854×354 band, 62 rows down), origin at
+    // (200, 606): the band is shown at (200, 668), 853 wide (the crop is clamped to the video).
+    const band = place(.{ .placed = .{ .x = 200, .y = 606, .scale = 1, .crop = .{ 0, 62, 854, 354 } } }, 853, 480, 1920, 1080).?;
+    try testing.expectEqual(Rect{ .x = 200, .y = 668, .w = 853, .h = 354 }, band.dest);
+    try testing.expectEqual([4]u32{ 0, 62, 853, 354 }, band.crop.?);
+    try testing.expectEqual([2]u32{ 853, 480 }, band.space);
+    // At ¾ with the scaled size as the crop: the whole video, 640×360, at the origin.
+    const small = place(.{ .placed = .{ .x = 1284, .y = 624, .scale = 0.75, .crop = .{ 0, 0, 640, 360 } } }, 853, 480, 1920, 1080).?;
+    try testing.expectEqual(Rect{ .x = 1284, .y = 624, .w = 640, .h = 360 }, small.dest);
+    try testing.expectEqual([2]u32{ 640, 360 }, small.space);
+    // The centred ¾ width of a half-size video: shown where the crop starts.
+    const mid = place(.{ .placed = .{ .x = 100, .y = 50, .scale = 0.5, .crop = .{ 54, 0, 320, 240 } } }, 853, 480, 1920, 1080).?;
+    try testing.expectEqual(Rect{ .x = 154, .y = 50, .w = 320, .h = 240 }, mid.dest);
+    // Fitted: the default place; a crop outside the video shows nothing.
+    try testing.expectEqual(Rect{ .x = 240, .y = 0, .w = 1440, .h = 1080 }, place(.fit, 640, 480, 1920, 1080).?.dest);
+    try testing.expectEqual(@as(?Placement, null), place(.{ .placed = .{ .x = 0, .y = 0, .scale = 1, .crop = .{ 900, 0, 10, 10 } } }, 853, 480, 1920, 1080));
 }
