@@ -8,6 +8,7 @@ const std = @import("std");
 const vlc = @import("vlc");
 const engine = @import("engine.zig");
 const testpage = @import("testpage.zig");
+const apps = @import("../markup/apps.zig");
 const planes = @import("../planes.zig");
 const present = @import("../present.zig");
 
@@ -25,6 +26,8 @@ pub const Options = struct {
     /// Frames per second of the title time base.
     fps: u32,
     test_page: bool = false,
+    /// The disc's applications (not with the test page).
+    apps: ?apps.Config = null,
 };
 
 pub const Host = struct {
@@ -56,7 +59,14 @@ pub const Host = struct {
             .eng = .init(gpa, pres.aperture_w, pres.aperture_h, opts.tick_base),
         };
         errdefer h.eng.deinit();
-        if (opts.test_page) h.eng.setScene(try testpage.TestPage.create(gpa, opts.fps), hddvd_now_us());
+        if (opts.test_page) {
+            h.eng.setScene(try testpage.TestPage.create(gpa, opts.fps), hddvd_now_us());
+        } else if (opts.apps) |cfg| {
+            var c = cfg;
+            c.log = logApps;
+            c.log_ctx = obj;
+            h.eng.setScene(try apps.Apps.create(gpa, c, pres.aperture_w, pres.aperture_h), hddvd_now_us());
+        }
         pres.ref();
         vlc.vlc_mutex_init(&h.lock);
         vlc.vlc_cond_init(&h.wake);
@@ -88,6 +98,11 @@ pub const Host = struct {
         h.commands.deinit(gpa);
         h.pres.unref();
         gpa.destroy(h);
+    }
+
+    fn logApps(ctx: *anyopaque, msg: []const u8) void {
+        const obj: *vlc.vlc_object_t = @ptrCast(@alignCast(ctx));
+        log(obj, vlc.VLC_MSG_DBG, @src(), "%.*s", .{ @as(c_int, @intCast(msg.len)), msg.ptr });
     }
 
     /// Queues an event for the engine (any thread).

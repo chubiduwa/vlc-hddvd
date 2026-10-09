@@ -45,13 +45,26 @@ pub fn build(b: *std.Build) void {
     vlc_c.addIncludePath(vlc_include);
     for (defines) |d| vlc_c.defineCMacro(d[0], d[1]);
 
+    // stb_image and stb_truetype (build.zig.zon), for images and fonts: @import("stb"), plus src/stb.c.
+    const stb_dir = b.dependency("stb", .{}).path("");
+    const stb_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/stb.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    stb_c.addIncludePath(stb_dir);
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/hddvd.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "vlc", .module = vlc_c.createModule() }},
+        .imports = &.{
+            .{ .name = "vlc", .module = vlc_c.createModule() },
+            .{ .name = "stb", .module = stb_c.createModule() },
+        },
     });
+    addStb(b, mod, stb_dir);
 
     mod.addIncludePath(b.path("src"));
     mod.addIncludePath(vlc_include);
@@ -79,11 +92,26 @@ pub fn build(b: *std.Build) void {
 
     // `zig build test`: unit tests of the modules that do not depend on VLC, built for and run on the host
     // whatever -Dtarget is. Test code is only compiled here, never into the plugin.
-    const tests = b.addTest(.{ .root_module = b.createModule(.{
+    const stb_host = b.addTranslateC(.{
+        .root_source_file = b.path("src/stb.h"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    stb_host.addIncludePath(stb_dir);
+    const test_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = b.graph.host,
         .optimize = optimize,
         .link_libc = true, // spu.zig allocates with std.heap.c_allocator, like the plugin
-    }) });
+        .imports = &.{.{ .name = "stb", .module = stb_host.createModule() }},
+    });
+    addStb(b, test_mod, stb_dir);
+    const tests = b.addTest(.{ .root_module = test_mod });
     b.step("test", "Run the unit tests").dependOn(&b.addRunArtifact(tests).step);
+}
+
+fn addStb(b: *std.Build, m: *std.Build.Module, stb_dir: std.Build.LazyPath) void {
+    m.addIncludePath(stb_dir);
+    m.addCSourceFiles(.{ .files = &.{"src/stb.c"}, .flags = &.{ "-std=gnu11", "-fno-sanitize=undefined" } });
+    _ = b;
 }

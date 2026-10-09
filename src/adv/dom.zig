@@ -327,6 +327,25 @@ pub const Document = struct {
         return d.node.firstElement();
     }
 
+    /// A copy of `n` (from any document) owned by this one, detached (DOM importNode).
+    pub fn importNode(d: *Document, n: *const Node, deep: bool) !*Node {
+        const c = try d.newNode(n.type);
+        c.ns = try d.intern(n.ns);
+        c.prefix = try d.intern(n.prefix);
+        c.local = try d.intern(n.local);
+        c.data = try d.gpa.dupe(u8, n.data);
+        for (n.attrs.items) |a| {
+            const v = try d.gpa.dupe(u8, a.value);
+            errdefer d.gpa.free(v);
+            try c.attrs.append(d.gpa, .{ .ns = try d.intern(a.ns), .prefix = try d.intern(a.prefix), .local = try d.intern(a.local), .value = v });
+        }
+        if (deep) {
+            var ch = n.first;
+            while (ch) |x| : (ch = x.next) c.appendChild(try d.importNode(x, true));
+        }
+        return c;
+    }
+
     /// The element whose "id" attribute (in no namespace, or xml:id) is `id`.
     pub fn getElementById(d: *Document, id: []const u8) ?*Node {
         var cur = d.node.first;

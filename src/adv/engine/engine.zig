@@ -109,7 +109,9 @@ pub const Engine = struct {
     /// The last tick processed (counted from `start`).
     last_tick: ?u64 = null,
 
+    /// The current title (null: the First Play title), once one has begun.
     title: ?u16 = null,
+    in_title: bool = false,
     title_duration: u64 = 0,
     title_time: u64 = 0,
     play_state: PlayState = .playing,
@@ -210,6 +212,7 @@ pub const Engine = struct {
         switch (ev) {
             .title_begin => |t| {
                 e.title = t.title;
+                e.in_title = true;
                 e.title_duration = t.duration;
                 e.title_time = 0;
                 if (t.tick_divisor != e.divisor) {

@@ -64,6 +64,9 @@ vlc_module_begin()
     add_string("hddvd-sub-mix", NULL, "Sub audio level (debugging)",
                "Advanced Content: mix the sub audio (e.g. a commentary) at this level (0-1) without waiting for "
                "the disc's application.", true)
+    add_string("hddvd-markup-show", NULL, "Show markup elements (debugging)",
+               "Advanced Content: show these elements of the applications' pages (ids, separated by commas), "
+               "whatever their style says, to check the rendering before the disc's scripts run.", true)
     add_bool("hddvd-test-page", false, "Graphics test page (debugging)",
              "Advanced Content: draw a test page in the graphics plane (clocks, a moving box, a clear rectangle "
              "and the cursor) to check the overlay over playback, pause and seek.", true)

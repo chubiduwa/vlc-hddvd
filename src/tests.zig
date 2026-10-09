@@ -28,4 +28,12 @@ test {
     _ = @import("adv/planes.zig");
     _ = @import("adv/engine/engine.zig");
     _ = @import("adv/engine/testpage.zig");
+    _ = @import("adv/image.zig");
+    _ = @import("adv/font.zig");
+    _ = @import("adv/xpath.zig");
+    _ = @import("adv/markup/style.zig");
+    _ = @import("adv/markup/page.zig");
+    _ = @import("adv/markup/layout.zig");
+    _ = @import("adv/markup/paint.zig");
+    _ = @import("adv/markup/apps.zig");
 }

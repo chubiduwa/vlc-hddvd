@@ -46,6 +46,8 @@ pub const Access = struct {
     /// Applications of the current title already checked (debug), and the Playlist Application.
     checked: std.DynamicBitSetUnmanaged = .{},
     checked_playlist: bool = false,
+    /// The demux thread updates the File Cache while the engine thread reads it.
+    lock: vlc.vlc_mutex_t = undefined,
 
     pub fn create(obj: *vlc.vlc_object_t, fs: *vfs.Fs, disc: aca.DiscId) !*Access {
         const a = try gpa.create(Access);
@@ -63,10 +65,12 @@ pub const Access = struct {
             .collector = .{ .gpa = gpa },
             .menu_language = lang,
         };
+        vlc.vlc_mutex_init(&a.lock);
         return a;
     }
 
     pub fn destroy(a: *Access) void {
+        vlc.vlc_mutex_destroy(&a.lock);
         a.collector.deinit();
         a.res.deinit();
         a.store.deinit();
@@ -129,6 +133,8 @@ pub const Access = struct {
     /// is there, else from the URI's own location (Annex Z.3). Archive members are only in the File Cache.
     /// Caller frees.
     pub fn read(a: *Access, u: []const u8) ![]u8 {
+        vlc.vlc_mutex_lock(&a.lock);
+        defer vlc.vlc_mutex_unlock(&a.lock);
         if (a.res.lookup(u)) |d| return gpa.dupe(u8, d);
         if (uri.archiveMember(u) != null) return error.FileNotFound;
         const d = try a.fetch(u);
@@ -140,6 +146,8 @@ pub const Access = struct {
 
     /// Startup (§4.3.22.2 step 5): the Data Cache is configured for this playlist.
     pub fn configure(a: *Access, pl: *const xpl.Playlist) void {
+        vlc.vlc_mutex_lock(&a.lock);
+        defer vlc.vlc_mutex_unlock(&a.lock);
         a.res.configure(pl);
         a.checked_playlist = false;
     }
@@ -150,21 +158,31 @@ pub const Access = struct {
 
     /// A title starts (null: the FirstPlayTitle) at title time `t`.
     pub fn startTitle(a: *Access, pl: *const xpl.Playlist, title: *const xpl.Title, first_play: bool, t: u64) void {
+        vlc.vlc_mutex_lock(&a.lock);
+        defer vlc.vlc_mutex_unlock(&a.lock);
         a.collector.reset();
         a.res.setTitle(pl, title, first_play, a.language(pl)) catch {};
         a.checked.resize(gpa, title.apps.len, false) catch {};
         a.checked.unsetAll();
-        a.update(pl, title, first_play, t, t > 0);
+        a.updateLocked(pl, title, first_play, t, t > 0);
     }
 
     /// The timeline jumped within the title.
     pub fn jumped(a: *Access, pl: *const xpl.Playlist, title: *const xpl.Title, first_play: bool, t: u64) void {
+        vlc.vlc_mutex_lock(&a.lock);
+        defer vlc.vlc_mutex_unlock(&a.lock);
         a.collector.reset();
-        a.update(pl, title, first_play, t, true);
+        a.updateLocked(pl, title, first_play, t, true);
     }
 
     /// The title time on screen moved on.
     pub fn update(a: *Access, pl: *const xpl.Playlist, title: *const xpl.Title, first_play: bool, t: u64, jump: bool) void {
+        vlc.vlc_mutex_lock(&a.lock);
+        defer vlc.vlc_mutex_unlock(&a.lock);
+        a.updateLocked(pl, title, first_play, t, jump);
+    }
+
+    fn updateLocked(a: *Access, pl: *const xpl.Playlist, title: *const xpl.Title, first_play: bool, t: u64, jump: bool) void {
         var apps_buf: [64]resman.App = undefined;
         const apps = apps_buf[0..@min(title.apps.len, apps_buf.len)];
         resman.defaultApps(title, t, apps);
@@ -174,6 +192,8 @@ pub const Access = struct {
 
     /// A sector read from the P-EVOB: Advanced packs are collected into archives for the File Cache.
     pub fn sector(a: *Access, s: []const u8) void {
+        vlc.vlc_mutex_lock(&a.lock);
+        defer vlc.vlc_mutex_unlock(&a.lock);
         const file = (a.collector.feed(s) catch null) orelse return;
         log(a.obj, vlc.VLC_MSG_DBG, @src(), "Advanced stream: %.*s complete (id %u, %u bytes)", .{
             @as(c_int, @intCast(file.name.len)), file.name.ptr, @as(c_uint, file.id), @as(c_uint, @intCast(file.data.len)),

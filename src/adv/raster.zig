@@ -182,6 +182,58 @@ pub const Canvas = struct {
     }
 };
 
+/// Draws the `sr` part of `src` (a crop) scaled to the rectangle `to`, mirrored horizontally and/or
+/// vertically, faded by `opacity` (bilinear; a copy when the size is unchanged).
+pub fn drawImage(c: Canvas, clip: Rect, to: Rect, src: Canvas, sr_in: Rect, flip_x: bool, flip_y: bool, opacity: u8) void {
+    if (opacity == 0 or to.empty()) return;
+    const sr = sr_in.intersect(src.bounds()) orelse return;
+    const a = clip.intersect(c.bounds()) orelse return;
+    const d = a.intersect(to) orelse return;
+    const same = sr.w == to.w and sr.h == to.h;
+    // Source position of a destination pixel centre, in 1/256 pixels, relative to the crop.
+    const sx_step: i64 = @divTrunc(@as(i64, sr.w) << 8, to.w);
+    const sy_step: i64 = @divTrunc(@as(i64, sr.h) << 8, to.h);
+    for (@intCast(d.y)..@intCast(d.bottom())) |y| {
+        var v: i64 = @as(i64, @as(i32, @intCast(y)) - to.y);
+        if (flip_y) v = to.h - 1 - v;
+        const drow = c.row(y);
+        for (@intCast(d.x)..@intCast(d.right())) |x| {
+            var u: i64 = @as(i64, @as(i32, @intCast(x)) - to.x);
+            if (flip_x) u = to.w - 1 - u;
+            const p = if (same)
+                src.px[@as(usize, @intCast(sr.y + v)) * src.w + @as(usize, @intCast(sr.x + u))]
+            else
+                sampleIn(src, sr, u * sx_step + (sx_step >> 1) - 128, v * sy_step + (sy_step >> 1) - 128);
+            drow[x] = over(drow[x], fade(p, opacity));
+        }
+    }
+}
+
+/// Bilinear sample inside the crop `sr` at (fx, fy), in 1/256 pixels relative to its top left.
+fn sampleIn(src: Canvas, sr: Rect, fx: i64, fy: i64) Px {
+    const max_x: i64 = sr.w - 1;
+    const max_y: i64 = sr.h - 1;
+    const x0 = std.math.clamp(fx >> 8, 0, max_x);
+    const y0 = std.math.clamp(fy >> 8, 0, max_y);
+    const x1 = @min(x0 + 1, max_x);
+    const y1 = @min(y0 + 1, max_y);
+    const wx: u32 = if (fx < 0) 0 else @intCast(fx & 255);
+    const wy: u32 = if (fy < 0) 0 else @intCast(fy & 255);
+    const ox: i64 = sr.x;
+    const oy: i64 = sr.y;
+    const p00 = src.px[@intCast((oy + y0) * src.w + ox + x0)];
+    const p10 = src.px[@intCast((oy + y0) * src.w + ox + x1)];
+    const p01 = src.px[@intCast((oy + y1) * src.w + ox + x0)];
+    const p11 = src.px[@intCast((oy + y1) * src.w + ox + x1)];
+    var out: Px = undefined;
+    for (0..4) |i| {
+        const top = @as(u32, p00[i]) * (256 - wx) + @as(u32, p10[i]) * wx;
+        const bot = @as(u32, p01[i]) * (256 - wx) + @as(u32, p11[i]) * wx;
+        out[i] = @intCast((top * (256 - wy) + bot * wy + (1 << 15)) >> 16);
+    }
+    return out;
+}
+
 /// Bilinear sample at (fx, fy) in 1/256 pixels, clamped to the edges.
 fn sample(src: Canvas, fx: i64, fy: i64) Px {
     const max_x: i64 = src.w - 1;
@@ -270,4 +322,23 @@ test "scaled blit" {
     try testing.expectEqual(@as(u8, 0), d.at(0, 0)[0]);
     try testing.expectEqual(@as(u8, 255), d.at(3, 0)[0]);
     try testing.expect(d.at(1, 0)[0] > 0 and d.at(1, 0)[0] < d.at(2, 0)[0]);
+}
+
+test "drawImage crops, flips and scales" {
+    const gpa = testing.allocator;
+    var src = try Canvas.init(gpa, 4, 1);
+    defer src.deinit(gpa);
+    for (src.px, 0..) |*p, i| p.* = .{ @intCast(i * 10), 0, 0, 255 };
+    var c = try Canvas.init(gpa, 4, 1);
+    defer c.deinit(gpa);
+    // The middle two pixels, mirrored, at their size.
+    drawImage(c, c.bounds(), .{ .x = 1, .y = 0, .w = 2, .h = 1 }, src, .{ .x = 1, .y = 0, .w = 2, .h = 1 }, true, false, 255);
+    try testing.expectEqual(@as(u8, 20), c.at(1, 0)[0]);
+    try testing.expectEqual(@as(u8, 10), c.at(2, 0)[0]);
+    try testing.expectEqual(@as(u8, 0), c.at(0, 0)[3]);
+    // One pixel scaled up stays that colour.
+    var big = try Canvas.init(gpa, 8, 8);
+    defer big.deinit(gpa);
+    drawImage(big, big.bounds(), big.bounds(), src, .{ .x = 3, .y = 0, .w = 1, .h = 1 }, false, false, 255);
+    try testing.expectEqual(@as(u8, 30), big.at(7, 7)[0]);
 }

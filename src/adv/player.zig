@@ -162,6 +162,8 @@ pub const Player = struct {
     overlay_at: i64 = 0,
     /// The latest timestamp sent to any ES.
     last_pts: i64 = 0,
+    /// --hddvd-markup-show (owned).
+    markup_show: []u8 = &.{},
 
     fn tb(p: *const Player) xpl.TimeBase {
         return p.pl.time_base;
@@ -190,6 +192,7 @@ pub const Player = struct {
         p.spus.deinit(gpa);
         p.tracks.deinit(gpa);
         p.commands.deinit(gpa);
+        gpa.free(p.markup_show);
         p.vti.deinit();
         p.pl.deinit();
         p.access.destroy();
@@ -263,10 +266,20 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
         const e = pr.extra(0);
         p.overlay_es = hddvd_es_add_spu(demux, overlay.fourcc, &e, e.len, "HD DVD graphics");
         p.mouse = hddvd_mouse_new(demux);
+        if (hddvd_inherit_string(o, "hddvd-markup-show")) |str| {
+            defer hddvd_free(str);
+            p.markup_show = gpa.dupe(u8, std.mem.span(str)) catch &.{};
+        }
         p.host = host_mod.Host.create(o, pr, p.mouse, .{
             .tick_base = p.pl.tick_base,
             .fps = @intCast(p.pl.time_base.fps()),
             .test_page = hddvd_inherit_bool(o, "hddvd-test-page"),
+            .apps = .{
+                .pl = &p.pl,
+                .loader = .{ .ctx = p.access, .read = readForApps },
+                .menu_language = if (p.access.menu_language.len > 0) p.access.menu_language else p.pl.default_language,
+                .show = p.markup_show,
+            },
         }) catch |err| blk: {
             log(o, vlc.VLC_MSG_ERR, @src(), "cannot start the application engine (%s)", .{@errorName(err).ptr});
             break :blk null;
@@ -612,6 +625,12 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
 }
 
 // ---- applications -------------------------------------------------------------------------------------------
+
+/// The applications read files as Annex Z.3 says: from the File Cache, else from where the URI points.
+fn readForApps(ctx: *anyopaque, u: []const u8) anyerror![]u8 {
+    const acc: *access_mod.Access = @ptrCast(@alignCast(ctx));
+    return acc.read(u);
+}
 
 /// Carries out what the engine asked for.
 fn runCommands(demux: *vlc.demux_t) void {
