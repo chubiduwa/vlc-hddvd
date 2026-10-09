@@ -1,8 +1,13 @@
 //! Our main video decoder for Advanced Content (private fourcc `hdvc`): VLC's own decoder (nested, through
 //! codec_glue.c), with the frame times corrected. EVOBs time only the first frame of each EVOBU, and VLC
 //! interpolates the others with a fixed frame duration, which breaks 3:2 pulldown into a hitch every half
-//! second (retime.zig). The pictures are copied through unchanged; the sub video and the graphics are VLC
-//! overlays above them (pipdec.zig, …).
+//! second (retime.zig).
+//!
+//! It outputs the Main Video Plane: aperture-sized pictures (square pixels) with the main video in its place
+//! (Vol. 1 §4.3.13.3): by default its height fitted to the aperture's and centred, so 4:3 or SD video gets side
+//! panels in the Outer Frame Color, or where an application's changeLayout put it. VLC thus sees one picture
+//! size for every title, its window keeps its shape, and the graphics (VLC overlays above, pipdec.zig, …) keep
+//! their place. A full-aperture video in its default place is copied through.
 
 const std = @import("std");
 const vlc = @import("vlc");
@@ -37,6 +42,9 @@ const Sys = struct {
     pres: *present.Presentation,
     main: ?*Nested = null,
     format: ?vlc.video_format_t = null,
+    /// The output size (the aperture when the format was last set).
+    out_w: u32 = 0,
+    out_h: u32 = 0,
     timer: retime.Retimer = retime.Retimer.init(0, 0),
     /// Timestamp of the last block, to reject pictures with nonsensical dates.
     last_pts: i64 = 0,
@@ -124,27 +132,73 @@ pub fn onFormat(ctx: *anyopaque, inner: *vlc.decoder_t) c_int {
         return vlc.VLC_EGENERIC;
     }
     if (s.format) |old| if (old.i_visible_width == f.i_visible_width and old.i_visible_height == f.i_visible_height and
+        old.i_sar_num == f.i_sar_num and old.i_sar_den == f.i_sar_den and
         old.i_frame_rate == f.i_frame_rate and old.i_frame_rate_base == f.i_frame_rate_base) return vlc.VLC_SUCCESS;
-    log(@ptrCast(s.dec), vlc.VLC_MSG_DBG, @src(), "main video: %ux%u, %u/%u fps", .{ f.i_visible_width, f.i_visible_height, f.i_frame_rate, f.i_frame_rate_base });
+    log(@ptrCast(s.dec), vlc.VLC_MSG_DBG, @src(), "main video: %ux%u (sar %u:%u), %u/%u fps", .{
+        f.i_visible_width, f.i_visible_height, f.i_sar_num, f.i_sar_den, f.i_frame_rate, f.i_frame_rate_base,
+    });
     s.format = f.*;
     s.timer = retime.Retimer.init(f.i_frame_rate, f.i_frame_rate_base);
+    s.pres.lockIt();
+    const aw = s.pres.aperture_w;
+    const ah = s.pres.aperture_h;
+    s.pres.unlock();
+    return setOutput(s, aw, ah);
+}
+
+/// Outputs `aw`×`ah` pictures (the aperture), square pixels, at the main video's rate.
+fn setOutput(s: *Sys, aw: u32, ah: u32) c_int {
     const out = &s.dec.fmt_out.unnamed_0.video;
-    out.* = f.*;
+    out.* = s.format.?;
     out.i_chroma = vlc.VLC_CODEC_I420;
     out.p_palette = null;
+    out.i_width = aw;
+    out.i_height = ah;
+    out.i_visible_width = aw;
+    out.i_visible_height = ah;
+    out.i_x_offset = 0;
+    out.i_y_offset = 0;
+    out.i_sar_num = 1;
+    out.i_sar_den = 1;
     s.dec.fmt_out.i_codec = vlc.VLC_CODEC_I420;
+    s.out_w = aw;
+    s.out_h = ah;
     return hddvd_dec_update_video(s.dec);
+}
+
+/// The main video's size in square pixels (the Main Video coordinate system, Vol. 1 §4.3.12: 720×480 4:3 is
+/// 640×480, 1440×1080 16:9 is 1920×1080).
+fn squareSize(f: *const vlc.video_format_t) [2]u32 {
+    const num: u64 = if (f.i_sar_num == 0 or f.i_sar_den == 0) 1 else f.i_sar_num;
+    const den: u64 = if (f.i_sar_num == 0 or f.i_sar_den == 0) 1 else f.i_sar_den;
+    return .{ @intCast((@as(u64, f.i_visible_width) * num + den / 2) / den), f.i_visible_height };
 }
 
 pub fn onPicture(ctx: *anyopaque, pic: *vlc.picture_t) void {
     const s: *Sys = @ptrCast(@alignCast(ctx));
     defer vlc.picture_Release(pic);
-    if (s.format == null) return;
+    const fmt = s.format orelse return;
     // A picture dated far from the stream (a decoder guessing a timestamp) cannot be placed: drop it.
     if (pic.date <= 0 or (s.last_pts > 0 and @abs(pic.date - s.last_pts) > 10_000_000)) return;
     const src = yuvOf(pic) orelse return;
+    const pres = s.pres;
+    pres.lockIt();
+    const aw: u32 = pres.aperture_w;
+    const ah: u32 = pres.aperture_h;
+    const rect = pres.main_rect;
+    const crop = pres.main_crop;
+    const outer = pres.outer;
+    pres.unlock();
+    if (aw != s.out_w or ah != s.out_h) if (setOutput(s, aw, ah) != 0) return;
     const out = hddvd_dec_new_picture(s.dec) orelse return;
-    if (yuvOf(out)) |dst| compose.copy(dst, src);
+    if (yuvOf(out)) |dst| {
+        const sq = squareSize(&fmt);
+        const r = rect orelse compose.mainDefault(sq[0], sq[1], aw, ah);
+        const shown = if (crop) |c| src.crop(c, sq[0], sq[1]) else src;
+        const covers = r.x <= 0 and r.y <= 0 and r.x + r.w >= aw and r.y + r.h >= ah;
+        if (!covers) compose.fill(dst, outer);
+        compose.scaleFrame(dst, r, shown, !pic.b_progressive);
+    }
     out.date = s.timer.frame(pic.date, pic.i_nb_fields);
     out.b_force = pic.b_force;
     out.b_progressive = pic.b_progressive;

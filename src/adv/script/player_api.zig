@@ -870,6 +870,9 @@ fn jumpTitle(s: *Script, index: u16, time: u64, bookmark: bool) js.Error!void {
     if (bookmark) Bm.save(s);
     const same = s.world.title_index != null and s.world.title_index.? == index;
     if (!same) {
+        // Another title plays (step 10): from a pause, VLC resumes too. The demux, which carries out the jump,
+        // is not called while VLC is paused.
+        if (m.play_state == PlayState.pause) command(s, .{ .pause = false });
         m.play_state = PlayState.play;
         m.play_speed = null;
     }
@@ -2030,6 +2033,11 @@ pub fn defaultKey(w: *World, key: u8) void {
                 e.command(.{ .jump_title = .{ .title = i, .time = t.chapters[n].begin } });
             } else if (w.pl) |pl| {
                 if (t.on_end.len > 0) if (pl.titleById(t.on_end)) |next| {
+                    if (next != i) {
+                        if (m.play_state == PlayState.pause) e.command(.{ .pause = false }); // as Title.jump
+                        m.play_state = PlayState.play;
+                        m.play_speed = null;
+                    }
                     e.command(.{ .jump_title = .{ .title = @intCast(next), .time = 0 } });
                     return;
                 };
@@ -2383,4 +2391,22 @@ test "the Player API on a title" {
     };
     try std.testing.expectEqual(@as(u32, 1), jumps);
     try std.testing.expect(pauses >= 2);
+    // A jump to another title from a pause plays it (Z.10.13.3 step 10): VLC is resumed before the jump.
+    for (e.outbox.items) |cmd| switch (cmd) {
+        .effect_play => |p| gpa.free(p.data),
+        .load_playlist => |u| gpa.free(u),
+        else => {},
+    };
+    e.outbox.clearRetainingCapacity();
+    s.world.eng = &e;
+    try js.testing.run(cx,
+        \\var pl = Player.playlist; pl.pause(); pl.titles.t1.jump("00:00:02:00", false); assertEq(pl.playState, pl.PLAYSTATE_PAUSE, "same title");
+        \\pl.titles.t2.jump("00:00:00:00", false); assertEq(pl.playState, pl.PLAYSTATE_PLAY);
+    , "player5.js");
+    const out = e.outbox.items;
+    try std.testing.expectEqual(@as(usize, 4), out.len);
+    try std.testing.expectEqual(true, out[0].pause);
+    try std.testing.expectEqual(@as(u16, 0), out[1].jump_title.title);
+    try std.testing.expectEqual(false, out[2].pause);
+    try std.testing.expectEqual(@as(u16, 1), out[3].jump_title.title);
 }

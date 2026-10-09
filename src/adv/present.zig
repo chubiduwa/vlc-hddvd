@@ -63,9 +63,11 @@ pub const Presentation = struct {
     time_base: xpl.TimeBase = .fps60,
 
     // Under lock:
-    /// Main video area (null: the whole aperture) and the colour outside it (Y, Cb, Cr). Not applied yet: the
-    /// main video is VLC's video plane (only the sub video and graphics are ours).
+    /// Main video area (null: the default place, its height fitted to the aperture's and centred) and the part of
+    /// it shown in Main Video coordinates (square pixels; null: all of it), from changeLayout, and the colour
+    /// outside it (Y, Cb, Cr). Our main video decoder (vdec.zig) composites it into the aperture.
     main_rect: ?compose.Rect = null,
+    main_crop: ?[4]u32 = null,
     outer: [3]u8 = .{ 16, 128, 128 },
     /// Sub video area (null: its native size, centred) and opacity (0 = hidden, the default, §4.3.13.3.4).
     sub_rect: ?compose.Rect = null,
@@ -148,6 +150,14 @@ pub const Presentation = struct {
         p.sub_alpha = alpha;
         p.unlock();
         _ = p.layout_gen.fetchAdd(1, .release);
+    }
+
+    /// The main video's area and crop (an application's changeLayout).
+    pub fn setMainArea(p: *Presentation, rect: ?compose.Rect, crop: ?[4]u32) void {
+        p.lockIt();
+        defer p.unlock();
+        p.main_rect = rect;
+        p.main_crop = crop;
     }
 
     /// The sub video's area and crop (an application's changeLayout), keeping its opacity.

@@ -103,6 +103,14 @@ const EsTrack = struct { es: *vlc.es_out_id_t, id: c_int };
 const SubStream = struct { es: ?*vlc.es_out_id_t = null, id: c_int = -1, codec: u32 = 0 };
 
 /// A sub video layout change over time: from one area and crop to another, linearly.
+/// A video's area and crop as last set (null: the default), and a change in progress (changeLayout with a
+/// duration).
+const VideoLayout = struct {
+    rect: ?compose.Rect = null,
+    crop: ?[4]u32 = null,
+    anim: ?LayoutAnim = null,
+};
+
 const LayoutAnim = struct {
     from: compose.Rect,
     to: compose.Rect,
@@ -201,10 +209,9 @@ pub const Player = struct {
     sub_track: ?u8 = null,
     reselect: bool = false,
     subtitle_visible: bool = true,
-    /// The sub video's area and crop as last set, and a change in progress (changeLayout with a duration).
-    sub_rect: ?compose.Rect = null,
-    sub_crop: ?[4]u32 = null,
-    sub_anim: ?LayoutAnim = null,
+    /// The main and sub videos' layouts as last set (changeLayout).
+    main_layout: VideoLayout = .{},
+    sub_layout: VideoLayout = .{},
     /// Our callback for VLC's disc-menu key (nav_glue.c).
     menu_key: MenuKey = undefined,
 
@@ -489,6 +496,7 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
     // The File Cache before the presentation (§4.3.22.2 step 7; a Playlist Application's resources missing
     // at the end of the First Play hold the timeline until loaded, §4.3.19.6.2.2).
     p.access.startTitle(&p.pl, title, index == null, t);
+    resetLayouts(demux);
     p.res_tick = hddvd_now_us();
     if (p.host) |h| h.post(.{ .title_begin = .{
         .title = if (index) |i| @intCast(i) else null,
@@ -839,82 +847,95 @@ fn selectTracks(demux: *vlc.demux_t, audio: ?u8) void {
     }
 }
 
-/// Main or sub video layout (changeLayout). The main video is VLC's own video plane and keeps its place; the
-/// sub video moves, at once or over the duration.
+/// Main or sub video layout (changeLayout), at once or over the duration. The main video is placed by our
+/// main video decoder (vdec.zig), the sub video by the overlay.
 fn setLayout(demux: *vlc.demux_t, l: @FieldType(engine.Command, "layout")) void {
     const p = playerOf(demux);
     const pr = p.pres orelse return;
     const aw: i32 = pr.aperture_w;
     const ah: i32 = pr.aperture_h;
-    const rect: compose.Rect = if (l.scale) |sc| .{
+    const lay = if (l.main) &p.main_layout else &p.sub_layout;
+    // A null scale: the main video goes back to its default place; the sub video fills the aperture.
+    const rect: ?compose.Rect = if (l.scale) |sc| .{
         .x = l.x,
         .y = l.y,
         .w = @intCast(@as(u64, l.crop[2]) * sc[0] / @max(sc[1], 1)),
         .h = @intCast(@as(u64, l.crop[3]) * sc[0] / @max(sc[1], 1)),
-    } else .{ .x = 0, .y = 0, .w = aw, .h = ah };
+    } else if (l.main) null else .{ .x = 0, .y = 0, .w = aw, .h = ah };
     const full = l.crop[0] == 0 and l.crop[1] == 0 and l.crop[2] == aw and l.crop[3] == ah;
-    if (l.main) {
-        pr.lockIt();
-        pr.main_rect = if (l.scale == null) null else rect;
-        pr.unlock();
-        log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "main video layout %d,%d %dx%d (not applied: VLC places the main video)", .{
-            rect.x, rect.y, rect.w, rect.h,
-        });
-        return;
-    }
-    const crop: ?[4]u32 = if (full) null else l.crop;
-    const from = p.sub_rect;
-    p.sub_anim = null;
-    if (l.ticks > 0) if (from) |f| {
-        const fc = p.sub_crop orelse [4]u32{ 0, 0, @intCast(aw), @intCast(ah) };
-        p.sub_anim = .{
+    const crop: ?[4]u32 = if (full or l.scale == null) null else l.crop;
+    if (l.main) if (rect) |r| log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "main video layout %d,%d %dx%d", .{ r.x, r.y, r.w, r.h });
+    lay.anim = null;
+    if (l.ticks > 0) if (lay.rect) |f| if (rect) |to| {
+        const fc = lay.crop orelse [4]u32{ 0, 0, @intCast(aw), @intCast(ah) };
+        lay.anim = .{
             .from = f,
-            .to = rect,
+            .to = to,
             .from_crop = fc,
             .to_crop = l.crop,
             .start = hddvd_now_us(),
             .duration = engine.TickRate.of(p.pl.tick_base).us(l.ticks),
         };
     };
-    p.sub_rect = rect;
-    p.sub_crop = crop;
-    if (p.sub_anim == null) pr.setSubArea(rect, crop);
+    lay.rect = rect;
+    lay.crop = crop;
+    if (lay.anim == null) setArea(pr, l.main, rect, crop);
 }
 
-/// Moves a sub video layout change on.
+fn setArea(pr: *present.Presentation, main: bool, rect: ?compose.Rect, crop: ?[4]u32) void {
+    if (main) pr.setMainArea(rect, crop) else pr.setSubArea(rect, crop);
+}
+
+/// Moves the layout changes in progress on.
 fn animateLayout(demux: *vlc.demux_t) void {
     const p = playerOf(demux);
-    const a = p.sub_anim orelse return;
     const pr = p.pres orelse return;
-    // The change follows the title timeline: it waits while paused.
-    if (p.paused) {
-        p.sub_anim.?.start += 10_000;
-        return;
-    }
-    const el = hddvd_now_us() - a.start;
-    if (el >= a.duration) {
-        p.sub_anim = null;
-        pr.setSubArea(p.sub_rect, p.sub_crop);
-        return;
-    }
-    const k: f64 = @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(a.duration));
-    const lerp = struct {
-        fn i(x: i32, y: i32, t: f64) i32 {
-            return @intFromFloat(@round(@as(f64, @floatFromInt(x)) + (@as(f64, @floatFromInt(y)) - @as(f64, @floatFromInt(x))) * t));
+    for ([_]bool{ true, false }) |main| {
+        const lay = if (main) &p.main_layout else &p.sub_layout;
+        const a = lay.anim orelse continue;
+        // The change follows the title timeline: it waits while paused.
+        if (p.paused) {
+            lay.anim.?.start += 10_000;
+            continue;
         }
-        fn u(x: u32, y: u32, t: f64) u32 {
-            return @intCast(@max(i(@intCast(x), @intCast(y), t), 0));
+        const el = hddvd_now_us() - a.start;
+        if (el >= a.duration) {
+            lay.anim = null;
+            setArea(pr, main, lay.rect, lay.crop);
+            continue;
         }
-    };
-    pr.setSubArea(.{
-        .x = lerp.i(a.from.x, a.to.x, k),
-        .y = lerp.i(a.from.y, a.to.y, k),
-        .w = lerp.i(a.from.w, a.to.w, k),
-        .h = lerp.i(a.from.h, a.to.h, k),
-    }, .{
-        lerp.u(a.from_crop[0], a.to_crop[0], k), lerp.u(a.from_crop[1], a.to_crop[1], k),
-        lerp.u(a.from_crop[2], a.to_crop[2], k), lerp.u(a.from_crop[3], a.to_crop[3], k),
-    });
+        const k: f64 = @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(a.duration));
+        const lerp = struct {
+            fn i(x: i32, y: i32, t: f64) i32 {
+                return @intFromFloat(@round(@as(f64, @floatFromInt(x)) + (@as(f64, @floatFromInt(y)) - @as(f64, @floatFromInt(x))) * t));
+            }
+            fn u(x: u32, y: u32, t: f64) u32 {
+                return @intCast(@max(i(@intCast(x), @intCast(y), t), 0));
+            }
+        };
+        setArea(pr, main, .{
+            .x = lerp.i(a.from.x, a.to.x, k),
+            .y = lerp.i(a.from.y, a.to.y, k),
+            .w = lerp.i(a.from.w, a.to.w, k),
+            .h = lerp.i(a.from.h, a.to.h, k),
+        }, .{
+            lerp.u(a.from_crop[0], a.to_crop[0], k), lerp.u(a.from_crop[1], a.to_crop[1], k),
+            lerp.u(a.from_crop[2], a.to_crop[2], k), lerp.u(a.from_crop[3], a.to_crop[3], k),
+        });
+    }
+}
+
+/// A new title: the layouts go back to their defaults (Table W-5: the main video in its default place, the sub
+/// video hidden); the Outer Frame Color is kept.
+fn resetLayouts(demux: *vlc.demux_t) void {
+    const p = playerOf(demux);
+    p.main_layout = .{};
+    p.sub_layout = .{};
+    const pr = p.pres orelse return;
+    pr.setMainArea(null, null);
+    pr.setSubArea(null, null);
+    pr.setSubLayout(null, 0);
+    debugOptions(asObj(demux), pr); // --hddvd-pip stands for an application's layout
 }
 
 /// Playlist.load: a soft reset with another playlist (§4.3.22.3). The applications are restarted.
@@ -936,13 +957,13 @@ fn loadPlaylist(demux: *vlc.demux_t, u: []const u8) !void {
     p.audio_track = null;
     p.sub_track = null;
     p.subtitle_visible = true;
-    p.sub_rect = null;
-    p.sub_crop = null;
-    p.sub_anim = null;
+    p.main_layout = .{};
+    p.sub_layout = .{};
     if (p.pres) |pr| {
         pr.setAperture(p.pl.aperture_w, p.pl.aperture_h);
         pr.time_base = p.pl.time_base;
         pr.setSubLayout(null, 0);
+        pr.setMainArea(null, null);
         startHost(demux, pr);
     }
     p.cur_title = -1;
