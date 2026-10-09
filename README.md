@@ -101,6 +101,7 @@ Append `#title[:chapter]` to start at a title, e.g. `hddvd:///path/to/Disc.iso#2
 | Disc menu | Ctrl+M | Shift+M |
 | Back / cancel (interactive menus) | Delete (⌫) | Backspace |
 | Remote's number keys (e.g. text entry in games) | 0–9 | 0–9 |
+| Remote's A / B / C / D buttons (used by some discs, e.g. zoom, bookmark) | Shift+F1–F4 | Shift+F1–F4 |
 | Previous / next chapter | Ctrl+U / Ctrl+D | Shift+P / Shift+N |
 
 ## Build

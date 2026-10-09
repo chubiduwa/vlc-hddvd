@@ -169,6 +169,8 @@ pub const Host = struct {
         // Keys VLC has no navigation action for: Backspace is the Cancel gesture (VK_ESC), since VLC takes Esc.
         // The Mac's backspace key ("delete") reaches VLC as KEY_DELETE, a PC's as KEY_BACKSPACE. The digit keys
         // are the remote's VK_0–VK_9 (Annex V), which games use for text entry; their codes are the same.
+        // Shift+F1–F4 are the remote's A–D buttons (VK_A_BUTTON–VK_D_BUTTON, mandatory in Annex V, free for the
+        // applications): F1–F4 as the HDi authoring simulator had them, with Shift since VLC binds plain F1–F10.
         while (true) {
             const k = hddvd_key_poll(h.mouse);
             if (k == 0) break;
@@ -176,6 +178,8 @@ pub const Host = struct {
                 engine.keys.esc
             else if (k >= '0' and k <= '9')
                 @intCast(k)
+            else if (k >= 0x02270000 and k <= 0x022A0000 and k & 0xFFFF == 0) // KEY_MODIFIER_SHIFT | KEY_F1..KEY_F4
+                @intCast(0x70 + ((k >> 16) & 0xFF) - 0x27)
             else
                 null;
             if (vk) |code| {
