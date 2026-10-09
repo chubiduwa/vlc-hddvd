@@ -580,6 +580,11 @@ fn tsOf(pts90: u64) i64 {
 
 /// Jumps within the current title at once (a user seek): the decoders are flushed.
 fn jump(demux: *vlc.demux_t, t: u64) bool {
+    return jumpTo(demux, t, true);
+}
+
+/// `jump`, telling the applications (a timeline jump) or not (re-reading after VLC flushed the decoders).
+fn jumpTo(demux: *vlc.demux_t, t: u64, notify: bool) bool {
     const p = playerOf(demux);
     const title = p.curTitle() orelse return false;
     const span = timeline.spanFrom(title, t) orelse return false;
@@ -591,7 +596,7 @@ fn jump(demux: *vlc.demux_t, t: u64) bool {
     // Frames before the target (from the start of its EVOBU) are decoded but not shown.
     _ = hddvd_es_out_control(demux.out, vlc.ES_OUT_SET_NEXT_DISPLAY_TIME, p.ref_ts);
     for (p.spus.items) |*s| s.buf.clearRetainingCapacity();
-    if (p.host) |h| h.post(.{ .jump = at });
+    if (notify) if (p.host) |h| h.post(.{ .jump = at });
     restartOverlay(demux);
     updateTitleInfo(demux);
     return true;
@@ -1113,13 +1118,31 @@ pub fn getTitleInfo(demux: *vlc.demux_t, out_titles: *[*c][*c]vlc.input_title_t,
 }
 
 /// Title 0, the menu: VK_MENU to the applications. Titles 1..N: the playlist's.
+/// VLC flushes every decoder (`es_out_SetTime(-1)`) before a title or chapter control, the disc-menu key's
+/// included. That deletes the overlay's subpicture: the next demux call sends its block again at once. While
+/// paused, the demux is only called while VLC buffers again, so it must not wait for the keep-alive period.
+fn flushedByVlc(p: *Player) void {
+    p.overlay_at = 0;
+}
+
+/// After the disc-menu key's flush, the stream is read again from the frame on screen, as a seek: what had been
+/// read ahead is lost, and VC-1 cannot decode from the middle of an EVOBU. Paused, VLC only reads until its
+/// buffers are full again, so without this the picture (and the menu over it) would stay empty until resumed.
+fn resyncAfterFlush(demux: *vlc.demux_t) void {
+    const p = playerOf(demux);
+    if (p.stopped or p.span == null) return;
+    _ = jumpTo(demux, titleNow(p), false);
+}
+
 pub fn setTitle(demux: *vlc.demux_t, i: c_int) c_int {
     const p = playerOf(demux);
+    flushedByVlc(p);
     if (i == 0) {
         const h = p.host orelse return vlc.VLC_EGENERIC;
         h.post(.{ .key_down = keys.menu });
         h.post(.{ .key_up = keys.menu });
         p.menu_requested = true;
+        resyncAfterFlush(demux);
         return vlc.VLC_SUCCESS;
     }
     if (i < 1 or i > p.pl.titles.len) return vlc.VLC_EGENERIC;
@@ -1130,8 +1153,10 @@ pub fn setTitle(demux: *vlc.demux_t, i: c_int) c_int {
 
 pub fn setSeekpoint(demux: *vlc.demux_t, i: c_int) c_int {
     const p = playerOf(demux);
+    flushedByVlc(p);
     if (p.menu_requested) {
         p.menu_requested = false;
+        resyncAfterFlush(demux); // VLC flushed again before this control
         return vlc.VLC_SUCCESS;
     }
     const ti = p.title orelse return vlc.VLC_EGENERIC;

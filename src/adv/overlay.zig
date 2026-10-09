@@ -47,6 +47,9 @@ const Live = struct {
 const Sys = struct {
     pres: *present.Presentation,
     live: *Live,
+    /// Flushed since the last subpicture started: the next block starts another. A flush only marks the
+    /// subpicture for deletion, which the video output does at its next redraw, so it may still count as live.
+    flushed: bool = false,
 };
 
 fn open(o: *vlc.vlc_object_t) callconv(.c) c_int {
@@ -63,6 +66,7 @@ fn open(o: *vlc.vlc_object_t) callconv(.c) c_int {
     s.* = .{ .pres = x.pres, .live = live };
     dec.p_sys = @ptrCast(s);
     dec.pf_decode = decode;
+    dec.pf_flush = flush;
     dec.fmt_out.i_codec = vlc.VLC_CODEC_RGBA;
     x.pres.clock.register(dec, true);
     return vlc.VLC_SUCCESS;
@@ -77,6 +81,11 @@ fn close(o: *vlc.vlc_object_t) callconv(.c) void {
     gpa.destroy(s);
 }
 
+fn flush(dec_c: [*c]vlc.decoder_t) callconv(.c) void {
+    const s: *Sys = @ptrCast(@alignCast(dec_c.*.p_sys));
+    s.flushed = true;
+}
+
 /// Any block (the demux sends one after each clock reset, and now and then) starts the subpicture if there
 /// is none, at the block's time.
 fn decode(dec_c: [*c]vlc.decoder_t, block_c: [*c]vlc.block_t) callconv(.c) c_int {
@@ -85,9 +94,15 @@ fn decode(dec_c: [*c]vlc.decoder_t, block_c: [*c]vlc.block_t) callconv(.c) c_int
     const block: *vlc.block_t = block_c orelse return vlc.VLC_SUCCESS;
     const pts = block.i_pts;
     hddvd_block_release(block);
-    if (pts > 0 and s.live.count.load(.acquire) == 0) start(dec, s, pts);
+    if (pts > 0 and (s.flushed or s.live.count.load(.acquire) == 0)) {
+        s.flushed = false;
+        @call(.auto, vlc.vlc_Log, .{ @as(*vlc.vlc_object_t, @ptrCast(dec)), vlc.VLC_MSG_DBG, "hddvd", @src().file, @as(c_uint, @src().line), @src().fn_name, "overlay: new subpicture at %lld", @as(c_longlong, pts) });
+        start(dec, s, pts);
+    }
     return vlc.VLC_SUCCESS;
 }
+
+const early_start: i64 = 10_000_000;
 
 fn start(dec: *vlc.decoder_t, s: *Sys, pts: i64) void {
     const view = gpa.create(View) catch return;
@@ -99,7 +114,11 @@ fn start(dec: *vlc.decoder_t, s: *Sys, pts: i64) void {
         destroy(view);
         return;
     };
-    sub.*.i_start = pts;
+    // Started a while before the block's time: VLC draws a paused picture's subtitles at the date of the pause,
+    // and a subpicture recreated during a pause (after the disc-menu key's flush) would otherwise start just
+    // after it and stay hidden until playback resumes. It lasts until replaced, so starting early changes nothing
+    // else. (The decoder's preroll check is on the block's time, not this one.)
+    sub.*.i_start = @max(1, pts - early_start);
     sub.*.i_stop = 0;
     sub.*.b_ephemer = true;
     sub.*.b_subtitle = true; // follows the video's clock (and VLC shifts it across pauses)
