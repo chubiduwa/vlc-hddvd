@@ -184,8 +184,10 @@ fn onFormat(s: *Sys, kind: c_int, inner: *vlc.decoder_t) c_int {
         @as([*:0]const u8, if (kind == kind_main) "main" else "sub"), @as([*]const u8, @ptrCast(&inner.fmt_out.i_codec)), a.i_rate, @as(c_uint, @intCast(in.layout.n)),
     });
     if (kind == kind_sub) {
+        // Decoders report their format with every block: only a change restarts the queue.
+        const same = prev.rate == in.rate and prev.layout.mask == in.layout.mask and prev.format == in.format;
         s.sub_in = in;
-        if (s.out_rate != 0) setupSub(s);
+        if (s.out_rate != 0 and (!same or s.sub_resampler == null)) setupSub(s);
         return vlc.VLC_SUCCESS;
     }
     s.main_in = in;
