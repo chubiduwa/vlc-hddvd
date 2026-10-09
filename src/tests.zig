@@ -36,4 +36,6 @@ test {
     _ = @import("adv/markup/layout.zig");
     _ = @import("adv/markup/paint.zig");
     _ = @import("adv/markup/apps.zig");
+    _ = @import("adv/markup/focus.zig");
+    _ = @import("adv/engine/keys.zig");
 }

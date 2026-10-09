@@ -26,6 +26,7 @@ const overlay = @import("overlay.zig");
 const access_mod = @import("access.zig");
 const engine = @import("engine/engine.zig");
 const host_mod = @import("engine/host.zig");
+const keys = engine.keys;
 
 const gpa = std.heap.c_allocator;
 const sector_size = 2048;
@@ -150,6 +151,8 @@ pub const Player = struct {
     sub_video: SubStream = .{},
     sub_audio: SubStream = .{},
     cur_title: c_int = -1,
+    /// VLC's disc-menu key sets "title 0" then seekpoint 2: the seekpoint that follows is part of it.
+    menu_requested: bool = false,
     cur_seekpoint: c_int = -1,
 
     // Applications.
@@ -556,10 +559,10 @@ fn titleNow(p: *Player) u64 {
     return span.titleTime(tmap.timeAt(m, sector) / 4);
 }
 
-/// VLC title = playlist title index; chapter from the title time on screen.
+/// VLC title = playlist title index + 1 (0 is the menu); chapter from the title time on screen.
 fn updateTitleInfo(demux: *vlc.demux_t) void {
     const p = playerOf(demux);
-    const t: c_int = if (p.title) |i| @intCast(i) else return;
+    const t: c_int = if (p.title) |i| @intCast(i + 1) else return;
     const title = &p.pl.titles[p.title.?];
     const ch = title.chapterAt(titleNow(p));
     const sp: c_int = if (ch > 0) @intCast(ch - 1) else 0;
@@ -577,6 +580,7 @@ fn updateTitleInfo(demux: *vlc.demux_t) void {
 fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
     const demux: *vlc.demux_t = demux_c;
     const p = playerOf(demux);
+    p.menu_requested = false;
     runCommands(demux);
     if (p.stopped) return 0;
     keepOverlay(demux);
@@ -779,14 +783,18 @@ pub fn setPosition(demux: *vlc.demux_t, f: f64) c_int {
     return if (jump(demux, frame)) vlc.VLC_SUCCESS else vlc.VLC_EGENERIC;
 }
 
-/// VLC's title list: the playlist's titles (by index), named, with their chapters.
+/// VLC's title list: "HD DVD Menu" (the menu key for the applications, like Standard Content's), then the
+/// playlist's titles, named, with their chapters.
 /// NOTE (Windows): VLC frees these with its own C runtime's free(); fine on macOS/Linux.
 pub fn getTitleInfo(demux: *vlc.demux_t, out_titles: *[*c][*c]vlc.input_title_t, out_count: *c_int) c_int {
     const p = playerOf(demux);
     const titles = p.pl.titles;
-    const list: [*c][*c]vlc.input_title_t = @ptrCast(@alignCast(std.c.malloc(@max(1, titles.len) * @sizeOf(*vlc.input_title_t)) orelse return vlc.VLC_ENOMEM));
+    const list: [*c][*c]vlc.input_title_t = @ptrCast(@alignCast(std.c.malloc((titles.len + 1) * @sizeOf(*vlc.input_title_t)) orelse return vlc.VLC_ENOMEM));
+    const menu = vlc.vlc_input_title_New();
+    hddvd_input_title_set_flags(menu, vlc.INPUT_TITLE_MENU | vlc.INPUT_TITLE_INTERACTIVE, "HD DVD Menu");
+    list[0] = menu;
     var name_buf: [256]u8 = undefined;
-    for (titles, 0..) |t, i| {
+    for (titles, 1..) |t, i| {
         const it = vlc.vlc_input_title_New();
         it.*.i_length = p.tb().us(t.duration);
         const label = if (t.display_name.len > 0) t.display_name else if (t.description.len > 0) t.description else t.id;
@@ -802,31 +810,57 @@ pub fn getTitleInfo(demux: *vlc.demux_t, out_titles: *[*c][*c]vlc.input_title_t,
         list[i] = it;
     }
     out_titles.* = list;
-    out_count.* = @intCast(titles.len);
+    out_count.* = @intCast(titles.len + 1);
     return vlc.VLC_SUCCESS;
 }
 
+/// Title 0, the menu: VK_MENU to the applications. Titles 1..N: the playlist's.
 pub fn setTitle(demux: *vlc.demux_t, i: c_int) c_int {
     const p = playerOf(demux);
-    if (i < 0 or i >= p.pl.titles.len) return vlc.VLC_EGENERIC;
-    if (!p.pl.titles[@intCast(i)].selectable) return vlc.VLC_EGENERIC;
-    startTitle(demux, @intCast(i), 0);
+    if (i == 0) {
+        const h = p.host orelse return vlc.VLC_EGENERIC;
+        h.post(.{ .key_down = keys.menu });
+        h.post(.{ .key_up = keys.menu });
+        p.menu_requested = true;
+        return vlc.VLC_SUCCESS;
+    }
+    if (i < 1 or i > p.pl.titles.len) return vlc.VLC_EGENERIC;
+    if (!p.pl.titles[@intCast(i - 1)].selectable) return vlc.VLC_EGENERIC;
+    startTitle(demux, @intCast(i - 1), 0);
     return if (p.stopped) vlc.VLC_EGENERIC else vlc.VLC_SUCCESS;
 }
 
 pub fn setSeekpoint(demux: *vlc.demux_t, i: c_int) c_int {
     const p = playerOf(demux);
+    if (p.menu_requested) {
+        p.menu_requested = false;
+        return vlc.VLC_SUCCESS;
+    }
     const ti = p.title orelse return vlc.VLC_EGENERIC;
     const t = &p.pl.titles[ti];
     if (i < 0 or i >= t.chapters.len) return vlc.VLC_EGENERIC;
     return if (jump(demux, t.chapters[@intCast(i)].begin)) vlc.VLC_SUCCESS else vlc.VLC_EGENERIC;
 }
 
-/// DEMUX_NAV_*: without applications there is no default action for menu keys (Annex V).
+/// DEMUX_NAV_* (0 activate, 1 up, 2 down, 3 left, 4 right, 5 popup, 6 menu) as user input keys for the
+/// applications (Annex V): Enter, the arrows, VK_MENU (the pop-up menu key) and VK_TOP_MENU. VLC has no key
+/// release, so each press is a down and an up.
 pub fn navControl(demux: *vlc.demux_t, action: c_int) c_int {
-    _ = demux;
-    _ = action;
-    return vlc.VLC_EGENERIC;
+    const p = playerOf(demux);
+    const h = p.host orelse return vlc.VLC_EGENERIC;
+    const k: keys.Key = switch (action) {
+        0 => keys.enter,
+        1 => keys.up,
+        2 => keys.down,
+        3 => keys.left,
+        4 => keys.right,
+        5 => keys.menu,
+        6 => keys.top_menu,
+        else => return vlc.VLC_EGENERIC,
+    };
+    h.post(.{ .key_down = k });
+    h.post(.{ .key_up = k });
+    return vlc.VLC_SUCCESS;
 }
 
 // ---- ES output proxy hooks ----------------------------------------------------------------------------------

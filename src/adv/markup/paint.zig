@@ -40,24 +40,32 @@ fn withOpacity(c: style.Color, o: f32) raster.Color {
 pub fn paint(gpa: std.mem.Allocator, page: *Page, lay: *const layout.Layout, res: layout.Res, f: *planes.Frame, region: Rect) void {
     const clip = region.intersect(f.canvas.bounds()) orelse return;
     const elems = page.elems.items;
-    // Paint order: (level, document order).
-    const order = gpa.alloc(struct { z: i64, i: u32 }, elems.len) catch return;
-    defer gpa.free(order);
-    const levels = gpa.alloc(i64, elems.len) catch return;
-    defer gpa.free(levels);
+    const ord = order(gpa, page) catch return;
+    defer gpa.free(ord);
+    var p: Painter = .{ .gpa = gpa, .page = page, .lay = lay, .res = res, .f = f, .clip = clip, .ox = @floatFromInt(region.x), .oy = @floatFromInt(region.y) };
+    for (ord) |i| p.elem(elems[i]);
+}
+
+/// The page's elements in paint order (indices into `page.elems`), bottom first: (z level, document order).
+/// The caller frees the list.
+pub fn order(gpa: std.mem.Allocator, page: *const Page) ![]u32 {
+    const elems = page.elems.items;
+    const Key = struct { z: i64, i: u32 };
+    const keys = try gpa.alloc(Key, elems.len);
+    defer gpa.free(keys);
     for (elems, 0..) |e, i| {
-        const parent_level: i64 = if (e.parent) |p| levels[p.index] else 0;
+        const parent_level: i64 = if (e.parent) |q| keys[q.index].z else 0;
         const own = e.style.position != .static and e.style.zIndex != null;
-        levels[i] = if (own) e.style.zIndex.? else parent_level;
-        order[i] = .{ .z = levels[i], .i = @intCast(i) };
+        keys[i] = .{ .z = if (own) e.style.zIndex.? else parent_level, .i = @intCast(i) };
     }
-    std.mem.sort(@TypeOf(order[0]), order, {}, struct {
-        fn less(_: void, a: @TypeOf(order[0]), b: @TypeOf(order[0])) bool {
+    std.mem.sort(Key, keys, {}, struct {
+        fn less(_: void, a: Key, b: Key) bool {
             return a.z < b.z or (a.z == b.z and a.i < b.i);
         }
     }.less);
-    var p: Painter = .{ .gpa = gpa, .page = page, .lay = lay, .res = res, .f = f, .clip = clip, .ox = @floatFromInt(region.x), .oy = @floatFromInt(region.y) };
-    for (order) |o| p.elem(elems[o.i]);
+    const out = try gpa.alloc(u32, elems.len);
+    for (keys, out) |k, *o| o.* = k.i;
+    return out;
 }
 
 const Painter = struct {

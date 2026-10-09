@@ -2,8 +2,9 @@
  * C glue for interactive playback (menus, buttons, stills) through the VLC 3 plugin API, reduced to
  * plumbing; all decisions are made in Zig.
  *
- *  - Mouse: VLC delivers "mouse-moved"/"mouse-clicked" on the vout thread. We only queue the latest event
- *    under a lock; the demux thread drains it (hddvd_mouse_poll), so the navigation VM is single-threaded.
+ *  - Mouse: VLC delivers "mouse-moved"/"mouse-clicked"/"mouse-button-down" on the vout thread. We queue the
+ *    events under a lock; the demux (or engine) thread drains them (hddvd_mouse_poll), so the navigation VM is
+ *    single-threaded.
  *  - ES output proxy: VLC's "ps" demuxer adds the elementary streams; it gets this proxy instead of the real
  *    es_out so Zig can fix up each es_format_t (SPU palette, languages) and learn the es_out_id_t of each
  *    stream id (for stream selection). Sub-picture units go to our own decoder (spudec.zig), which also draws
@@ -30,24 +31,55 @@ block_t *hddvd_es_filter(demux_t *, es_out_id_t *, block_t *);
 
 /* ---- mouse ------------------------------------------------------------------------------------------ */
 
+/* Events in order; consecutive moves are merged. "mouse-clicked" comes when button 1 goes down;
+ * "mouse-button-down" (a bit mask) also tells when it comes back up. */
+enum { HDDVD_MOUSE_MOVED = 1, HDDVD_MOUSE_DOWN = 2, HDDVD_MOUSE_UP = 3 };
+
 typedef struct
 {
     vlc_mutex_t lock;
     vout_thread_t *vout;
-    bool moved, clicked;
+    struct { int type, x, y; } queue[32];
+    unsigned count;
     int x, y;
+    bool down;
 } hddvd_mouse_t;
+
+static void MousePush(hddvd_mouse_t *m, int type)
+{
+    if (type == HDDVD_MOUSE_MOVED && m->count > 0 && m->queue[m->count - 1].type == HDDVD_MOUSE_MOVED)
+        m->count--;
+    if (m->count == sizeof(m->queue) / sizeof(m->queue[0]))
+        return;
+    m->queue[m->count].type = type;
+    m->queue[m->count].x = m->x;
+    m->queue[m->count].y = m->y;
+    m->count++;
+}
 
 static int EventMouse(vlc_object_t *vout, char const *var, vlc_value_t oldval, vlc_value_t val, void *data)
 {
     hddvd_mouse_t *m = data;
     vlc_mutex_lock(&m->lock);
-    m->x = val.coords.x;
-    m->y = val.coords.y;
     if (var[6] == 'm') /* mouse-moved */
-        m->moved = true;
-    else /* mouse-clicked */
-        m->clicked = true;
+    {
+        m->x = val.coords.x;
+        m->y = val.coords.y;
+        MousePush(m, HDDVD_MOUSE_MOVED);
+    }
+    else if (var[6] == 'c') /* mouse-clicked */
+    {
+        m->x = val.coords.x;
+        m->y = val.coords.y;
+        if (!m->down)
+            MousePush(m, HDDVD_MOUSE_DOWN);
+        m->down = true;
+    }
+    else if (m->down && !(val.i_int & 1)) /* mouse-button-down: button 1 released */
+    {
+        m->down = false;
+        MousePush(m, HDDVD_MOUSE_UP);
+    }
     vlc_mutex_unlock(&m->lock);
     (void)vout; (void)oldval;
     return VLC_SUCCESS;
@@ -59,6 +91,7 @@ static void MouseDetach(hddvd_mouse_t *m)
     {
         var_DelCallback(m->vout, "mouse-moved", EventMouse, m);
         var_DelCallback(m->vout, "mouse-clicked", EventMouse, m);
+        var_DelCallback(m->vout, "mouse-button-down", EventMouse, m);
         vlc_object_release(m->vout);
         m->vout = NULL;
     }
@@ -75,6 +108,7 @@ static int EventIntf(vlc_object_t *input, char const *var, vlc_value_t oldval, v
         {
             var_AddCallback(m->vout, "mouse-moved", EventMouse, m);
             var_AddCallback(m->vout, "mouse-clicked", EventMouse, m);
+            var_AddCallback(m->vout, "mouse-button-down", EventMouse, m);
         }
     }
     (void)var; (void)oldval;
@@ -105,7 +139,7 @@ void hddvd_mouse_delete(demux_t *demux, void *handle)
     free(m);
 }
 
-/* Takes the pending mouse state: returns 0 = nothing, 1 = moved, 2 = clicked (with the latest position). */
+/* Takes the next mouse event: 0 = none, 1 = moved, 2 = button 1 down, 3 = button 1 up, with its position. */
 int hddvd_mouse_poll(void *handle, int *x, int *y)
 {
     hddvd_mouse_t *m = handle;
@@ -113,13 +147,14 @@ int hddvd_mouse_poll(void *handle, int *x, int *y)
         return 0;
     int ret = 0;
     vlc_mutex_lock(&m->lock);
-    if (m->clicked)
-        ret = 2;
-    else if (m->moved)
-        ret = 1;
-    m->moved = m->clicked = false;
-    *x = m->x;
-    *y = m->y;
+    if (m->count > 0)
+    {
+        ret = m->queue[0].type;
+        *x = m->queue[0].x;
+        *y = m->queue[0].y;
+        m->count--;
+        memmove(&m->queue[0], &m->queue[1], m->count * sizeof(m->queue[0]));
+    }
     vlc_mutex_unlock(&m->lock);
     return ret;
 }

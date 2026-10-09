@@ -151,10 +151,13 @@ pub const Host = struct {
         for (events) |ev| e.post(ev) catch {};
         var x: c_int = 0;
         var y: c_int = 0;
-        switch (hddvd_mouse_poll(h.mouse, &x, &y)) {
-            1 => e.post(.{ .mouse_move = .{ .x = x, .y = y } }) catch {},
-            2 => e.post(.{ .mouse_click = .{ .x = x, .y = y } }) catch {},
-            else => {},
+        while (true) {
+            switch (hddvd_mouse_poll(h.mouse, &x, &y)) {
+                1 => e.post(.{ .mouse_move = .{ .x = x, .y = y } }) catch {},
+                2 => e.post(.{ .mouse_down = .{ .x = x, .y = y } }) catch {},
+                3 => e.post(.{ .mouse_up = .{ .x = x, .y = y } }) catch {},
+                else => break,
+            }
         }
         const now = hddvd_now_us();
         const r = e.step(now, h.pres.titleNow(now) orelse e.title_time);

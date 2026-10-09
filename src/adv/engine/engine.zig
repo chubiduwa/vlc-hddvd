@@ -15,6 +15,7 @@
 const std = @import("std");
 const planes = @import("../planes.zig");
 const raster = @import("../raster.zig");
+pub const keys = @import("keys.zig");
 
 pub const PlayState = enum { playing, paused, stopped };
 
@@ -28,9 +29,13 @@ pub const Event = union(enum) {
     /// The Title Timeline jumped to this title time (frames).
     jump: u64,
     play_state: PlayState,
-    /// Mouse position, in aperture coordinates.
+    /// Mouse position, in aperture coordinates; the button is mouse button 1 (VK_MOUSE_1).
     mouse_move: Point,
-    mouse_click: Point,
+    mouse_down: Point,
+    mouse_up: Point,
+    /// A user input key (Annex V).
+    key_down: keys.Key,
+    key_up: keys.Key,
 };
 
 /// From the engine to the demux.
@@ -81,6 +86,8 @@ pub const Scene = struct {
     pub const VTable = struct {
         /// Advances to the tick; true if what it draws changed.
         tick: *const fn (ctx: *anyopaque, e: *Engine, c: Clocks) bool,
+        /// Takes a user input event, in the tick that processes it (before `tick`).
+        input: ?*const fn (ctx: *anyopaque, e: *Engine, ev: Event) void = null,
         /// Draws into an empty frame.
         render: *const fn (ctx: *anyopaque, e: *Engine, f: *planes.Frame) void,
         deinit: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator) void,
@@ -151,7 +158,7 @@ pub const Engine = struct {
     /// Queues an event for the next tick. The Cursor Manager follows the mouse at once.
     pub fn post(e: *Engine, ev: Event) !void {
         switch (ev) {
-            .mouse_move, .mouse_click => |p| if (e.cursor.enabled) {
+            .mouse_move, .mouse_down, .mouse_up => |p| if (e.cursor.enabled) {
                 const old = e.cursor;
                 e.cursor.moveTo(p.x, p.y);
                 if (old.x != e.cursor.x or old.y != e.cursor.y) e.cursor_changed = true;
@@ -191,7 +198,10 @@ pub const Engine = struct {
         r.ticked = true;
 
         // 1. Events, in order (the script handler queue from Phase 5).
-        for (e.inbox.items) |ev| e.handle(ev);
+        for (e.inbox.items) |ev| {
+            e.handle(ev);
+            if (e.scene) |sc| if (sc.vtable.input) |f| f(sc.ctx, e, ev);
+        }
         e.inbox.clearRetainingCapacity();
         if (e.play_state == .playing) e.title_time = title_time;
         const clocks: Clocks = .{ .app = n, .page = e.rate.ticks(now - e.page_start), .title = e.title_time };
@@ -224,7 +234,7 @@ pub const Engine = struct {
             .title_end => {},
             .jump => |t| e.title_time = t,
             .play_state => |p| e.play_state = p,
-            .mouse_move, .mouse_click => {},
+            .mouse_move, .mouse_down, .mouse_up, .key_down, .key_up => {},
         }
     }
 

@@ -508,12 +508,16 @@ fn pollMouse(demux: *vlc.demux_t) void {
     const sys = sysOf(demux);
     var x: c_int = 0;
     var y: c_int = 0;
-    const ev = hddvd_mouse_poll(sys.mouse, &x, &y);
-    if (ev == 0 or !buttonsUsable(sys)) return;
-    const btn = hli.hit(&sys.hli.?, x, y);
-    if (btn == 0) return;
-    if (ev == 2) return activateButton(demux, btn);
-    if (btn != sys.vm.button()) selectButton(demux, btn, false);
+    while (true) {
+        const ev = hddvd_mouse_poll(sys.mouse, &x, &y);
+        if (ev == 0) return;
+        if (!buttonsUsable(sys)) continue;
+        const btn = hli.hit(&sys.hli.?, x, y);
+        if (btn == 0) continue;
+        if (ev == 2) {
+            activateButton(demux, btn);
+        } else if (ev == 1 and btn != sys.vm.button()) selectButton(demux, btn, false);
+    }
 }
 
 // ---- demux loop ---------------------------------------------------------------------------------------

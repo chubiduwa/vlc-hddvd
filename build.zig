@@ -58,6 +58,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/hddvd.zig"),
         .target = target,
         .optimize = optimize,
+        // Release builds carry no debug info (it holds the build machine's paths); Debug keeps it.
+        .strip = optimize != .debug,
         .link_libc = true,
         .imports = &.{
             .{ .name = "vlc", .module = vlc_c.createModule() },

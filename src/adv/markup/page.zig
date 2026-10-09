@@ -89,8 +89,13 @@ pub const Elem = struct {
     style: style.Style,
     state: State = .{},
     box: Box = .{},
-    /// Resolved navIndex (set by focus.zig).
-    nav_index: [2]i32 = .{ 0, 0 },
+    /// The navIndex generated for `auto` at the page load (focus.zig); null if it was not auto then.
+    nav_auto: ?[2]i32 = null,
+    /// Input in progress (focus.zig): a key activation ends after this tick; a pointer activation is held
+    /// until the button is released; focus follows when the activation ends.
+    key_actioned: ?u64 = null,
+    pressed: bool = false,
+    focus_after: bool = false,
     /// Kept across syncs: false once the node left the page.
     live: bool = true,
 };
