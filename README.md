@@ -8,19 +8,22 @@ An HD DVD plugin for VLC 3.0.
 
 - **HD DVD Standard Content** (`HVDVD_TS`): menus, buttons, still frames and interactive titles, with the disc's
   own navigation logic.
+- **HD DVD Advanced Content** (HDi, `ADV_OBJ`): the disc's pop-up menus and applications (scripts, animations,
+  menu sounds, bookmarks for the session, games), picture-in-picture and commentary audio, every title,
+  chapter, audio and subtitle track.
 - **Disc images** (`.iso`) read directly, or a folder holding a disc (a mounted disc, or a copy of one).
 - **HD DVD sub-pictures and button highlights.**
 - **VLC controls:** arrow keys, Enter and the mouse for buttons; the disc-menu key; Playback > Title and Chapter.
 
 Not supported yet:
 
-- Advanced Content
-- angles on interleaved cells
+- Advanced Content: network features, Advanced Subtitles, switching to Standard Content, bookmarks kept after
+  closing VLC
 
 Not going to be supported:
 
 - encrypted (AACS) discs
-- physical drives (unless already unencrypted already)
+- physical drives (unless the disc is unencrypted)
 
 ## Install
 
@@ -96,6 +99,8 @@ Append `#title[:chapter]` to start at a title, e.g. `hddvd:///path/to/Disc.iso#2
 | Move between buttons | Arrow keys | Arrow keys |
 | Press a button | Enter, or click | Enter, or click |
 | Disc menu | Ctrl+M | Shift+M |
+| Back / cancel (interactive menus) | Delete (⌫) | Backspace |
+| Remote's number keys (e.g. text entry in games) | 0–9 | 0–9 |
 | Previous / next chapter | Ctrl+U / Ctrl+D | Shift+P / Shift+N |
 
 ## Build
