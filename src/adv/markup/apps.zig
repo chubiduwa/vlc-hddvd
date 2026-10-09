@@ -1519,7 +1519,9 @@ test "scripts: lifecycle, events, input and the Animated Property API" {
         .{
             "file:///dvddisc/ADV_OBJ/m.xmu",
             \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style" xml:lang="en"><head>
-            \\<timing clock="page"><par><cue select="id('a')" begin="2f" dur="1s"><event name="hello"><param name="a" value="1"/></event></cue></par></timing>
+            \\<timing clock="page"><par dur="60s"><cue select="id('a')" begin="2f" dur="1s"><event name="hello"><param name="a" value="1"/></event></cue>
+            \\<par begin="id('a')[$Mode='on']" end="id('a')[$Mode!='on']"><cue select="id('a')" begin="0s" dur="10s"><set style:backgroundFrame="1"/></cue></par>
+            \\</par></timing>
             \\</head><body>
             \\<button id="a" style:position="absolute" style:x="0px" style:y="0px" style:width="50px" style:height="50px"/>
             \\<button id="b" style:position="absolute" style:x="0px" style:y="100px" style:width="50px" style:height="50px"
@@ -1590,8 +1592,12 @@ test "scripts: lifecycle, events, input and the Animated Property API" {
         \\b.style.animateProperty("opacity", "0;1", 1);
         \\assertEq(b.state.focused, "false"); b.state.focused = "true"; assertEq(b.state.focused, "true");
         \\assertEq(b.core.id, "b"); assertEq(document.getProperties(b, "http://www.dvdforum.org/2005/ihd#style").namespace, "http://www.dvdforum.org/2005/ihd#style");
+        \\// A variable the script sets starts the markup's timing (Z.12.7.2).
+        \\document.setXPathVariable("Mode", "on"); assertEq(document.getXPathVariable("Mode"), "on");
     , "check.js");
     step(&e, &now, &t);
+    step(&e, &now, &t);
+    try testing.expectEqual(@as(u16, 1), Page.elemOf(p.doc.getElementById("a").?).?.style.backgroundFrame);
     const b = Page.elemOf(p.doc.getElementById("b").?).?;
     try testing.expectEqual(@as(f32, 10), b.box.x);
     try testing.expectEqual(@as(f32, 100 + 0) - 80, b.box.y);

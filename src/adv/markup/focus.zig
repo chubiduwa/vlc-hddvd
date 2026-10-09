@@ -95,6 +95,7 @@ pub const Target = union(enum) {
 pub fn navigate(page: *Page, from: ?*Elem, dir: style.Dir, app_id: []const u8, rank: []const u32) Target {
     if (from) |f| if (f.style.nav[@backingInt(dir)]) |nav| {
         if (nav.app.len > 0 and !std.mem.eql(u8, nav.app, app_id)) return .{ .other = nav };
+        if (nav.elem.len == 0) return .none; // an explicit none: blocked
         const n = page.doc.getElementById(nav.elem) orelse return .none;
         const e = Page.elemOf(n) orelse return .none;
         return if (focusable(e)) .{ .elem = e } else .none;
@@ -195,7 +196,7 @@ fn byId(p: *Page, id: []const u8) *Elem {
 const grid =
     \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style" xml:lang="en"><body>
     \\ <button id="a" style:position="absolute" style:x="100px" style:y="100px" style:width="10px" style:height="10px"/>
-    \\ <button id="b" style:position="absolute" style:x="200px" style:y="100px" style:width="10px" style:height="10px"/>
+    \\ <button id="b" style:navDown="none" style:position="absolute" style:x="200px" style:y="100px" style:width="10px" style:height="10px"/>
     \\ <button id="c" style:position="absolute" style:x="100px" style:y="200px" style:width="10px" style:height="10px"/>
     \\ <button id="d" style:position="absolute" style:x="200px" style:y="200px" style:width="10px" style:height="10px"
     \\   style:navUp="a" style:navRightUp="other#x"/>
@@ -246,6 +247,9 @@ test "navIndex generation and navigation gestures" {
     // Explicit properties win, and can name another application.
     try testing.expectEqualStrings("a", go(p, byId(p, "d"), .up, rk).?);
     try testing.expectEqualStrings("other", go(p, byId(p, "d"), .right_up, rk).?);
+    // An explicit none blocks its direction; the others still follow navIndex.
+    try testing.expectEqual(@as(?[]const u8, null), go(p, byId(p, "b"), .down, rk));
+    try testing.expectEqualStrings("e", go(p, byId(p, "b"), .left, rk).?);
     // A disabled target does not take focus.
     byId(p, "a").state.enabled = false;
     try testing.expectEqual(@as(?[]const u8, null), go(p, byId(p, "d"), .up, rk));

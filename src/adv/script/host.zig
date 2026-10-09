@@ -427,6 +427,7 @@ pub const Script = struct {
             dom_api.releaseDocument(s, d);
         }
         s.page_doc = if (p) |x| x.doc else null;
+        if (p) |x| x.xpath_host = s.xpathHost();
         s.overrides.clear(s.gpa);
         s.tree_dirty = false;
         if (c.JS_IsNull(s.markup_loaded) or p == null) return;
@@ -463,10 +464,31 @@ pub const Script = struct {
 
     /// A system parameter variable (Annex W.2), or null.
     pub fn systemVariable(s: *Script, var_name: []const u8) ?xpath.Value {
-        const p = s.page() orelse return api.systemVariable(s, var_name);
-        const h = p.hostForXPath();
-        const f = h.variable orelse return api.systemVariable(s, var_name);
-        return f(h.ctx, "", var_name) orelse api.systemVariable(s, var_name);
+        return api.systemVariable(s, var_name);
+    }
+
+    /// The XPath host of the application's page (its markup's timing, include conditions): the variables the
+    /// script set on the page document (setXPathVariable, Z.12.7.2), then the system parameters (Annex W.2),
+    /// and GPRM()/SPRM() (Z.10.30).
+    fn xpathHost(s: *Script) xpath.Host {
+        return .{ .ctx = s, .variable = pageVariable, .gprm = gprmOf, .sprm = sprmOf };
+    }
+
+    fn pageVariable(ctx: ?*anyopaque, ns: []const u8, local: []const u8) ?xpath.Value {
+        const s: *Script = @ptrCast(@alignCast(ctx.?));
+        if (ns.len > 0) return null;
+        if (s.page_doc) |d| if (dom_api.xpathVariable(d, local)) |v| return .{ .string = v };
+        return api.systemVariable(s, local);
+    }
+
+    fn gprmOf(ctx: ?*anyopaque, i: u32) i64 {
+        const s: *Script = @ptrCast(@alignCast(ctx.?));
+        return if (i < s.world.model.gprm.len) s.world.model.gprm[i] else 0;
+    }
+
+    fn sprmOf(ctx: ?*anyopaque, i: u32) i64 {
+        const s: *Script = @ptrCast(@alignCast(ctx.?));
+        return if (i < s.world.model.sprm.len) s.world.model.sprm[i] else 0;
     }
 
     // ---- DOM changes ----

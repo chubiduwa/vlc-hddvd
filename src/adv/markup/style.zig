@@ -528,8 +528,12 @@ fn parseFontSize(raw: []const u8, env: Env) ParseError![2]f32 {
     return out;
 }
 
+/// A nav* value. An explicit `none` is kept (an empty target: focus does not move that way), apart from the
+/// property not being set (null: navIndex decides). §7.2.5.3 makes `none` the initial value, which would make
+/// the two the same, but discs set `none` to block a direction: a game's letter pickers set navUp/navDown to
+/// `none` and take Up/Down in a script.
 fn parseNav(raw: []const u8) ParseError!?Nav {
-    if (std.mem.eql(u8, raw, "none")) return null;
+    if (std.mem.eql(u8, raw, "none")) return .{ .elem = "" };
     if (raw.len == 0 or std.mem.indexOfAny(u8, raw, " \t") != null) return error.Bad;
     if (std.mem.indexOfScalar(u8, raw, '#')) |h| return .{ .app = raw[0..h], .elem = raw[h + 1 ..] };
     return .{ .elem = raw };
@@ -747,6 +751,7 @@ pub fn format(w: *std.Io.Writer, s: *const Style, p: Prop, pct_base: f32) !void 
         .lineHeight => if (s.lineHeight) |v| try w.print("{d}px", .{@as(i64, @intFromFloat(@round(v)))}) else try w.writeAll("auto"),
         .navDown, .navLeft, .navLeftDown, .navLeftUp, .navRight, .navRightDown, .navRightUp, .navUp => {
             if (s.nav[@backingInt(navDir(p).?)]) |n| {
+                if (n.elem.len == 0) return w.writeAll("none");
                 if (n.app.len > 0) try w.print("{s}#", .{n.app});
                 try w.writeAll(n.elem);
             } else try w.writeAll("none");

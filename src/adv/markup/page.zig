@@ -558,8 +558,7 @@ pub const Page = struct {
 
     /// The XPath host for this page: the application's variables, plus property functions on its elements.
     pub fn hostForXPath(p: *Page) xpath.Host {
-        var h = p.xpath_host;
-        h.ctx = p;
+        var h = p.xpath_host; // its ctx is the application's, for its variables and GPRM/SPRM
         h.property = property;
         return h;
     }

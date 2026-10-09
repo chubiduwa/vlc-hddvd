@@ -167,13 +167,20 @@ pub const Host = struct {
             }
         }
         // Keys VLC has no navigation action for: Backspace is the Cancel gesture (VK_ESC), since VLC takes Esc.
-        // The Mac's backspace key ("delete") reaches VLC as KEY_DELETE, a PC's as KEY_BACKSPACE.
+        // The Mac's backspace key ("delete") reaches VLC as KEY_DELETE, a PC's as KEY_BACKSPACE. The digit keys
+        // are the remote's VK_0–VK_9 (Annex V), which games use for text entry; their codes are the same.
         while (true) {
             const k = hddvd_key_poll(h.mouse);
             if (k == 0) break;
-            if (k == 0x08 or k == 0x00360000) { // KEY_BACKSPACE, KEY_DELETE (vlc_actions.h), no modifiers
-                e.post(.{ .key_down = engine.keys.esc }) catch {};
-                e.post(.{ .key_up = engine.keys.esc }) catch {};
+            const vk: ?u8 = if (k == 0x08 or k == 0x00360000) // KEY_BACKSPACE, KEY_DELETE (vlc_actions.h), no modifiers
+                engine.keys.esc
+            else if (k >= '0' and k <= '9')
+                @intCast(k)
+            else
+                null;
+            if (vk) |code| {
+                e.post(.{ .key_down = code }) catch {};
+                e.post(.{ .key_up = code }) catch {};
             }
         }
         const now = hddvd_now_us();

@@ -77,6 +77,12 @@ fn existingState(doc: *dom.Document) ?*DocState {
     return @ptrCast(@alignCast(doc.host orelse return null));
 }
 
+/// A variable set by setXPathVariable on `doc`, or null.
+pub fn xpathVariable(doc: *dom.Document, name: []const u8) ?[]const u8 {
+    const st = existingState(doc) orelse return null;
+    return st.vars.get(name);
+}
+
 /// A document made by script: it belongs to its wrappers from now on.
 pub fn adoptDocument(s: *Script, doc: *dom.Document) !Value {
     const st = try stateOf(s, doc);
