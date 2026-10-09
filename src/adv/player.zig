@@ -436,8 +436,7 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
     const vti_bytes = (try fs.readFile(gpa, "HVDVD_TS/HVA00001.VTI")) orelse return error.NoVti;
     defer gpa.free(vti_bytes);
     const v = try vti_mod.parse(gpa, vti_bytes);
-    var sc = fs.openFile("HVDVD_TS/HV000I01.IFO") catch null;
-    if (sc) |*f| f.close();
+    const sc = fs.exists("HVDVD_TS/HV000I01.IFO");
     p.* = .{
         .obj = o,
         .fs = fs,
@@ -446,7 +445,7 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
         .disc_id = disc_id,
         .access = acc,
         .playlist_uri = pl_uri.?,
-        .has_standard_content = sc != null,
+        .has_standard_content = sc,
     };
     if (content) |cid| {
         p.content_id = cid;

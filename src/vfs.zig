@@ -97,6 +97,27 @@ pub const Fs = struct {
         }
     }
 
+    /// Whether a disc-relative file exists. A folder is listed rather than the file opened, so that a missing file
+    /// logs no error from VLC's file access.
+    pub fn exists(fs: *Fs, rel: []const u8) bool {
+        switch (fs.backend) {
+            .image => |*img| {
+                const info = img.volume.lookup(rel) catch return false;
+                defer img.volume.freeInfo(info);
+                return !info.is_dir;
+            },
+            .dir => {
+                const slash = std.mem.lastIndexOfScalar(u8, rel, '/');
+                const parent = if (slash) |i| rel[0..i] else "";
+                const name = if (slash) |i| rel[i + 1 ..] else rel;
+                const names = fs.listDir(fs.gpa, parent) catch return false;
+                defer freeNames(fs.gpa, names);
+                for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+                return false;
+            },
+        }
+    }
+
     /// Names of the entries of a disc-relative folder (free with freeNames).
     pub fn listDir(fs: *Fs, gpa: std.mem.Allocator, rel: []const u8) Error![][]u8 {
         switch (fs.backend) {

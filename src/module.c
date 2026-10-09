@@ -169,8 +169,14 @@ int HddvdStreamControl(stream_t *s, int query, va_list args)
 {
     switch (query)
     {
+        /* Not seekable: the ps demuxer would otherwise run FindLength on its first Demux, reading up to 40
+         * packets to find the first timestamps, failing to seek to the end, and dropping what it read (the start
+         * of every title, sequence header included). */
         case STREAM_CAN_SEEK:
         case STREAM_CAN_FASTSEEK:
+            *va_arg(args, bool *) = false;
+            return VLC_SUCCESS;
+
         case STREAM_CAN_PAUSE:
         case STREAM_CAN_CONTROL_PACE:
             *va_arg(args, bool *) = true;
