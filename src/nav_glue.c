@@ -321,6 +321,52 @@ bool hddvd_es_out_empty(demux_t *demux)
     return empty;
 }
 
+/* The disc-menu key without a title change. VLC's hotkey sets the input's "title  0" variable, whose callback
+ * changes the title, and VLC flushes every decoder for that before the demux is asked: playback skips, and a
+ * paused picture is lost. Advanced Content's title 0 only sends VK_MENU to the applications, so the variable
+ * is replaced by one that does just that. Ours carries a text, VLC's none: that is how a variable recreated by
+ * VLC (after a title list update) is told apart. */
+typedef struct { void (*cb)(void *); void *ctx; } hddvd_menu_key_t;
+
+static int MenuKeyCallback(vlc_object_t *obj, const char *var, vlc_value_t old, vlc_value_t val, void *data)
+{
+    (void)obj; (void)var; (void)old; (void)val;
+    hddvd_menu_key_t *k = data;
+    k->cb(k->ctx);
+    return VLC_SUCCESS;
+}
+
+static const char menu_key_mark[] = "hddvd menu key";
+
+static bool MenuKeyIsOurs(input_thread_t *in)
+{
+    vlc_value_t text;
+    if (var_Change(in, "title  0", VLC_VAR_GETTEXT, &text, NULL) != VLC_SUCCESS)
+        return false;
+    bool ours = text.psz_string != NULL && strcmp(text.psz_string, menu_key_mark) == 0;
+    free(text.psz_string); /* VLC's copy, from VLC's heap */
+    return ours;
+}
+
+void hddvd_menu_key_take(demux_t *demux, hddvd_menu_key_t *k)
+{
+    input_thread_t *in = demux->p_input;
+    if (in == NULL || var_Type(in, "title  0") == 0 || MenuKeyIsOurs(in))
+        return; /* not created yet, or already ours */
+    var_Destroy(in, "title  0");
+    var_Create(in, "title  0", VLC_VAR_INTEGER | VLC_VAR_ISCOMMAND);
+    vlc_value_t text = { .psz_string = (char *)menu_key_mark };
+    var_Change(in, "title  0", VLC_VAR_SETTEXT, &text, NULL);
+    var_AddCallback(in, "title  0", MenuKeyCallback, k);
+}
+
+void hddvd_menu_key_release(demux_t *demux, hddvd_menu_key_t *k)
+{
+    input_thread_t *in = demux->p_input;
+    if (in != NULL && var_Type(in, "title  0") != 0 && MenuKeyIsOurs(in))
+        var_DelCallback(in, "title  0", MenuKeyCallback, k);
+}
+
 /* Pauses or resumes the input, as VLC's pause key does: through its "state" variable, which queues an
  * INPUT_CONTROL_SET_STATE (the demux then gets DEMUX_SET_PAUSE_STATE). */
 void hddvd_input_pause(demux_t *demux, bool paused)
