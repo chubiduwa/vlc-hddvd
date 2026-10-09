@@ -22,6 +22,8 @@
 #include <vlc_block.h>
 #include <vlc_input_item.h>
 #include <vlc_stream.h>
+#include <vlc_aout.h>
+#include <string.h>
 
 /* Implemented in Zig. */
 void hddvd_es_fixup(demux_t *, es_format_t *);
@@ -373,6 +375,56 @@ void hddvd_input_pause(demux_t *demux, bool paused)
 {
     if (demux->p_input != NULL)
         var_SetInteger(demux->p_input, "state", paused ? PAUSE_S : PLAYING_S);
+}
+
+/* VLC's audio output settings, for effect sounds played while paused (adv/fxout.zig): whether VLC plays sound at
+ * all (an audio output that is not the "dummy" one), the volume as an amplitude (VLC's outputs map their volume
+ * cubically, then apply the "gain" option; 0 when muted), and the name of the selected device (empty: none or
+ * unknown). */
+typedef struct
+{
+    bool audible;
+    float amplitude;
+    char device[256];
+} hddvd_aout_settings_t;
+
+void hddvd_aout_settings(demux_t *demux, hddvd_aout_settings_t *out)
+{
+    out->audible = false;
+    out->amplitude = 1.f;
+    out->device[0] = '\0';
+    audio_output_t *aout = demux->p_input != NULL ? input_GetAout(demux->p_input) : NULL;
+    if (aout == NULL)
+        return;
+    char *module = var_InheritString(aout, "aout");
+    out->audible = module == NULL || strncmp(module, "dummy", 5) != 0;
+    free(module);
+    float volume = aout_VolumeGet(aout);
+    if (volume >= 0.f)
+        out->amplitude = volume * volume * volume;
+    if (aout_MuteGet(aout) > 0)
+        out->amplitude = 0.f;
+    out->amplitude *= var_InheritFloat(aout, "gain");
+    char *id = aout_DeviceGet(aout);
+    if (id != NULL)
+    {
+        char **ids, **names;
+        int n = aout_DevicesList(aout, &ids, &names);
+        for (int i = 0; i < n; i++)
+        {
+            if (strcmp(ids[i], id) == 0)
+                snprintf(out->device, sizeof (out->device), "%s", names[i]);
+            free(ids[i]);
+            free(names[i]);
+        }
+        if (n > 0)
+        {
+            free(ids);
+            free(names);
+        }
+        free(id);
+    }
+    vlc_object_release(aout);
 }
 
 void hddvd_sleep_ms(int ms)

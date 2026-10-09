@@ -4,6 +4,7 @@
 //!   zig build -Dtarget=x86_64-windows-gnu       # Windows x64 DLL
 //!   zig build -Dtarget=x86_64-macos             # Intel Mac
 //!   zig build -Dvlc-sdk=/usr                    # Linux, with the distribution's libvlccore-dev
+//!                                               # (and libasound2-dev; -Dalsa-include for a cross build)
 //!
 //! Plugin headers come from the VLC Windows SDK (they are platform-neutral C), or from libvlccore-dev on Linux.
 //! libvlccore comes from the SDK's import library on Windows, from VLC.app on macOS and from the system on Linux
@@ -21,6 +22,7 @@ pub fn build(b: *std.Build) void {
     const vlc_app = b.option([]const u8, "vlc-app", "VLC.app (macOS libvlccore)") orelse
         "/Applications/VLC.app";
     const vlc_lib = b.option([]const u8, "vlc-lib", "Folder with libvlccore (default: from vlc-sdk, vlc-app or the system)");
+    const alsa_include = b.option([]const u8, "alsa-include", "Linux: folder holding alsa/asoundlib.h (default: the system's)");
 
     const vlc_include: std.Build.LazyPath = .{ .cwd_relative = b.fmt("{s}/include/vlc/plugins", .{vlc_sdk}) };
     // What `pkg-config --cflags vlc-plugin` gives, plus MODULE_STRING (out-of-tree builds must set it).
@@ -64,6 +66,7 @@ pub fn build(b: *std.Build) void {
         // Release builds carry no debug info (it holds the build machine's paths); Debug keeps it.
         .strip = optimize != .debug,
         .link_libc = true,
+        .link_libcpp = true, // RtAudio
         .imports = &.{
             .{ .name = "vlc", .module = vlc_c.createModule() },
             .{ .name = "stb", .module = stb_c.createModule() },
@@ -72,6 +75,7 @@ pub fn build(b: *std.Build) void {
     });
     addStb(b, mod, stb_dir);
     qjs.addTo(mod, target, false);
+    addRtAudio(b, mod, target, alsa_include);
 
     mod.addIncludePath(b.path("src"));
     mod.addIncludePath(vlc_include);
@@ -126,6 +130,32 @@ fn addStb(b: *std.Build, m: *std.Build.Module, stb_dir: std.Build.LazyPath) void
     m.addIncludePath(stb_dir);
     m.addCSourceFiles(.{ .files = &.{"src/stb.c"}, .flags = &.{ "-std=gnu11", "-fno-sanitize=undefined" } });
     _ = b;
+}
+
+/// RtAudio (build.zig.zon) and src/fx_glue.cpp: an audio output for effect sounds while VLC is paused
+/// (adv/fxout.zig), on CoreAudio, WASAPI or ALSA.
+fn addRtAudio(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarget, alsa_include: ?[]const u8) void {
+    const dir = b.dependency("rtaudio", .{}).path("");
+    const api: []const u8 = switch (target.result.os.tag) {
+        .macos => "-D__MACOSX_CORE__",
+        .windows => "-D__WINDOWS_WASAPI__",
+        else => "-D__LINUX_ALSA__",
+    };
+    const flags: []const []const u8 = &.{ "-std=c++17", "-fno-sanitize=undefined", "-fvisibility=hidden", "-w", api };
+    m.addIncludePath(dir);
+    m.addCSourceFiles(.{ .root = dir, .files = &.{"RtAudio.cpp"}, .flags = flags });
+    m.addCSourceFiles(.{ .files = &.{"src/fx_glue.cpp"}, .flags = flags });
+    switch (target.result.os.tag) {
+        .macos => {
+            m.linkFramework("CoreAudio", .{});
+            m.linkFramework("CoreFoundation", .{});
+        },
+        .windows => for ([_][]const u8{ "ole32", "ksuser", "mfplat", "mfuuid", "wmcodecdspuuid", "winmm" }) |l| m.linkSystemLibrary(l, .{}),
+        else => {
+            if (alsa_include) |d| m.addSystemIncludePath(.{ .cwd_relative = d });
+            m.linkSystemLibrary("asound", .{});
+        },
+    }
 }
 
 const QuickJs = struct {

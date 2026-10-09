@@ -11,6 +11,8 @@ const testpage = @import("testpage.zig");
 const apps = @import("../markup/apps.zig");
 const planes = @import("../planes.zig");
 const present = @import("../present.zig");
+const mix = @import("../mix.zig");
+const fxout = @import("../fxout.zig");
 
 const gpa = std.heap.c_allocator;
 
@@ -18,6 +20,7 @@ extern fn hddvd_now_us() i64;
 extern fn hddvd_mouse_poll(m: ?*anyopaque, x: *c_int, y: *c_int) c_int;
 extern fn hddvd_key_poll(m: ?*anyopaque) u32;
 extern fn hddvd_input_pause(demux: *vlc.demux_t, paused: bool) void;
+extern fn hddvd_aout_settings(demux: *vlc.demux_t, out: *fxout.Settings) void;
 
 fn log(obj: *vlc.vlc_object_t, prio: c_int, src: std.builtin.SourceLocation, comptime fmt: [*:0]const u8, args: anytype) void {
     @call(.auto, vlc.vlc_Log, .{ obj, prio, "hddvd", src.file, @as(c_uint, src.line), src.fn_name, fmt } ++ args);
@@ -51,6 +54,8 @@ pub const Host = struct {
     eng: engine.Engine,
     /// Frames to render into: one shown, one being drawn, one spare while the overlay reads an old one.
     pool: [3]?*planes.Frame = @splat(null),
+    /// Effect sounds started while VLC is paused.
+    fx: fxout.Output = .{},
 
     pub fn create(obj: *vlc.vlc_object_t, pres: *present.Presentation, mouse: ?*anyopaque, opts: Options) !*Host {
         const h = try gpa.create(Host);
@@ -88,6 +93,7 @@ pub const Host = struct {
         vlc.vlc_cond_signal(&h.wake);
         vlc.vlc_mutex_unlock(&h.lock);
         vlc.vlc_join(h.thread, null);
+        h.fx.deinit();
         vlc.vlc_cond_destroy(&h.wake);
         vlc.vlc_mutex_destroy(&h.lock);
         h.pres.publishGraphics(null);
@@ -141,13 +147,6 @@ pub const Host = struct {
             h.turn(batch.items);
             batch.clearRetainingCapacity();
             vlc.vlc_mutex_lock(&h.lock);
-            for (h.eng.outbox.items) |cmd| switch (cmd) {
-                // Pause and resume go to VLC from here: while VLC is paused it does not call the demux, which
-                // takes the other commands, so a resume left for it would never be carried out.
-                .pause => |on| hddvd_input_pause(@ptrCast(h.obj), on),
-                else => h.commands.append(gpa, cmd) catch {},
-            };
-            h.eng.outbox.clearRetainingCapacity();
         }
         vlc.vlc_mutex_unlock(&h.lock);
         return null;
@@ -186,6 +185,67 @@ pub const Host = struct {
             } else e.dirty = true; // retried at the next tick
         }
         if (r.cursor) h.pres.setCursor(e.cursor);
+        h.dispatch(now);
+        h.fx.update(now, h, settings);
+    }
+
+    /// Hands the engine's commands on. The demux carries out most of them, but a paused VLC does not call the
+    /// demux, so pause and resume, audio levels and effect sounds are carried out here.
+    fn dispatch(h: *Host, now: i64) void {
+        const e = &h.eng;
+        defer e.outbox.clearRetainingCapacity();
+        for (e.outbox.items) |cmd| switch (cmd) {
+            .pause => |on| hddvd_input_pause(@ptrCast(h.obj), on),
+            .mixing => |m| h.pres.setMixing(m.main, m.sub, m.effect),
+            .effect_play => |p| h.playEffect(p.data, p.repeat, now),
+            .effect_stop => {
+                h.fx.stop();
+                h.pres.stopEffect();
+            },
+            else => {
+                vlc.vlc_mutex_lock(&h.lock);
+                defer vlc.vlc_mutex_unlock(&h.lock);
+                h.commands.append(gpa, cmd) catch {};
+            },
+        };
+    }
+
+    /// Plays an effect sound (takes `data`, a WAV file): through our mixer (adec.zig) while VLC plays, through
+    /// our own output while it is paused. One sound at a time: each replaces the other's.
+    fn playEffect(h: *Host, data: []u8, repeat: u32, now: i64) void {
+        defer gpa.free(data);
+        const w = mix.decodeWav(gpa, data, repeat) catch |err| {
+            log(h.obj, vlc.VLC_MSG_WARN, @src(), "effect sound: %s", .{@errorName(err).ptr});
+            return;
+        };
+        const p = h.pres;
+        p.lockIt();
+        const paused = p.paused;
+        const rows = p.effect_mix;
+        const gain = p.effect_gain;
+        p.unlock();
+        if (!paused) {
+            h.fx.stop();
+            p.playEffect(.{ .samples = w.samples, .channels = w.channels, .rate = w.rate, .at = now });
+            return;
+        }
+        defer gpa.free(w.samples);
+        p.stopEffect();
+        const s = settings(h);
+        if (h.fx.play(w.samples, w.channels, w.rate, rows, gain, s, now)) |msg| {
+            log(h.obj, vlc.VLC_MSG_WARN, @src(), "effect sound while paused: %s", .{msg});
+        } else if (!s.audible) {
+            log(h.obj, vlc.VLC_MSG_DBG, @src(), "effect sound while paused: not played, VLC has no audio output", .{});
+        } else log(h.obj, vlc.VLC_MSG_DBG, @src(), "effect sound while paused: %s at %u Hz, amplitude %.5f", .{
+            @as([*:0]const u8, @ptrCast(&h.fx.device_name)), @as(c_uint, h.fx.rate), @as(f64, s.amplitude),
+        });
+    }
+
+    /// VLC's audio output settings, which effect sounds played while paused follow.
+    fn settings(h: *Host) fxout.Settings {
+        var s: fxout.Settings = .{};
+        hddvd_aout_settings(@ptrCast(h.obj), &s);
+        return s;
     }
 
     /// A frame the overlay is not reading.

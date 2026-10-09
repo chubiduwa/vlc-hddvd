@@ -116,7 +116,8 @@ zig build test                                                                  
 
 macOS links against `/Applications/VLC.app` (`-Dvlc-app=` for another copy; an Intel build needs the universal
 or Intel VLC). Linux links against the system's `libvlccore.so` (Debian/Ubuntu: `libvlccore-dev`); `-Dvlc-lib` is
-the folder holding it.
+the folder holding it. It also needs ALSA (`libasound2-dev`): `-Dalsa-include=` names a folder holding the `alsa`
+headers folder (a link to `/usr/include/alsa`; not `/usr/include` itself, which would hide Zig's libc headers).
 
 The plugin lands in `zig-out/<platform>/lib` (`bin` on Windows); install it as in [Install](#install), with that
 folder as `VLC_PLUGIN_PATH`.

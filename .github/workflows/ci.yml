@@ -49,12 +49,15 @@ jobs:
           name: vlc-sdk
           path: ${{ runner.temp }}/vlc-sdk
       # Only libvlccore.so is taken from the system; the distribution's headers are older than the SDK's.
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvlccore-dev
+      # libasound2-dev is for RtAudio: its headers alone, since /usr/include would shadow Zig's libc headers.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvlccore-dev libasound2-dev
+      - run: mkdir -p "$RUNNER_TEMP/alsa-include" && ln -s /usr/include/alsa "$RUNNER_TEMP/alsa-include/alsa"
       - run: zig build test --summary all
       - run: >-
           zig build --release --prefix zig-out/linux-${{ matrix.arch }}
           -Dtarget=${{ matrix.arch }}-linux-gnu
           -Dvlc-sdk=${{ runner.temp }}/vlc-sdk -Dvlc-lib=/usr/lib/${{ matrix.arch }}-linux-gnu
+          -Dalsa-include=${{ runner.temp }}/alsa-include
       - uses: actions/upload-artifact@v4
         with:
           name: hddvd-linux-${{ matrix.arch }}

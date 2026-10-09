@@ -349,6 +349,22 @@ pub fn decodeWav(gpa: std.mem.Allocator, data: []const u8, repeat: u32) !Wav {
 }
 
 /// Effect sounds being played (one at a time per the spec, Annex Z EffectAudio; a new one replaces the old).
+/// Converts an effect sound (mono or stereo at `rate`) to `dst` at `out_rate`, through the applications' effect
+/// mix-down (`rows`, or the usual mix). The result is owned by the caller.
+pub fn convertEffect(gpa: std.mem.Allocator, samples: []const f32, channels: usize, rate: u32, dst: Layout, out_rate: u32, rows: ?[2][hd_channels]u8) ![]f32 {
+    const src = Layout.of(if (channels == 1) chan.center else chan.left | chan.right);
+    var resampled: std.ArrayList(f32) = .empty;
+    defer resampled.deinit(gpa);
+    var r: Resampler = .{ .in_rate = rate, .out_rate = out_rate, .channels = src.n };
+    try r.process(gpa, samples, &resampled);
+    const frames = resampled.items.len / src.n;
+    const out = try gpa.alloc(f32, frames * dst.n);
+    @memset(out, 0);
+    const m = if (rows) |hd| hdMatrix(src, dst, hd) else Matrix.default(src, dst);
+    mixFrames(out, dst, resampled.items, src, frames, &m);
+    return out;
+}
+
 pub const Effects = struct {
     /// Samples in the output layout and rate, and how far they have been played.
     samples: []f32 = &.{},

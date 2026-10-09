@@ -779,17 +779,9 @@ fn runCommands(demux: *vlc.demux_t) void {
             pr.unlock();
         },
         .sub_alpha => |a| if (p.pres) |pr| pr.setSubAlpha(a),
-        .mixing => |m| if (p.pres) |pr| pr.setMixing(m.main, m.sub, m.effect),
-        .effect_play => |e| {
-            defer gpa.free(e.data);
-            const pr = p.pres orelse continue;
-            const w = mix.decodeWav(gpa, e.data, e.repeat) catch |err| {
-                log(o, vlc.VLC_MSG_WARN, @src(), "effect sound: %s", .{@errorName(err).ptr});
-                continue;
-            };
-            pr.playEffect(.{ .samples = w.samples, .channels = w.channels, .rate = w.rate, .at = hddvd_now_us() });
-        },
-        .effect_stop => if (p.pres) |pr| pr.stopEffect(),
+        // Carried out by the engine thread (host.zig), which plays effect sounds while VLC is paused.
+        .mixing, .effect_stop => {},
+        .effect_play => |e| gpa.free(e.data),
         .load_playlist => |u| {
             defer gpa.free(u);
             // The engine is restarted: the commands after this one were for the old playlist.
@@ -962,6 +954,7 @@ fn loadPlaylist(demux: *vlc.demux_t, u: []const u8) !void {
 pub fn setPause(demux: *vlc.demux_t, paused: bool) void {
     const p = playerOf(demux);
     p.paused = paused;
+    if (p.pres) |pr| pr.setPaused(paused);
     if (p.host) |h| h.post(.{ .play_state = if (paused) .paused else .playing });
 }
 

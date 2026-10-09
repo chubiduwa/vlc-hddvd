@@ -55,4 +55,5 @@ test {
     _ = @import("adv/script/storage_api.zig");
     _ = @import("adv/script/diag_api.zig");
     _ = @import("adv/script/fileio_api.zig");
+    _ = @import("adv/fxout.zig");
 }

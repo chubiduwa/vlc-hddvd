@@ -8,8 +8,9 @@
 //! - Effect sounds are handed over by the engine through the Presentation.
 //! - VLC decodes about a second ahead of presentation, so decoded main audio is held and only mixed (with the
 //!   sub audio for the same time and any effect sound just started) shortly before it is played: a menu click
-//!   is heard within that margin, not a second later. While paused nothing is released, so effect sounds
-//!   started then are dropped once stale.
+//!   is heard within that margin, not a second later. While paused nothing is released: effect sounds started
+//!   then play through their own output (fxout.zig), and any that reach the mixer meanwhile are dropped once
+//!   stale.
 
 const std = @import("std");
 const vlc = @import("vlc");
@@ -296,16 +297,7 @@ fn startEffect(s: *Sys, e: present.Effect, now: i64, rows: ?[2][mix.hd_channels]
     defer gpa.free(e.samples);
     // Requested while paused (nothing was being output): stale by now.
     if (now - e.at > effect_stale) return;
-    const src = mix.Layout.of(if (e.channels == 1) mix.chan.center else mix.chan.left | mix.chan.right);
-    var resampled: std.ArrayList(f32) = .empty;
-    defer resampled.deinit(gpa);
-    var r: mix.Resampler = .{ .in_rate = e.rate, .out_rate = s.out_rate, .channels = src.n };
-    r.process(gpa, e.samples, &resampled) catch return;
-    const frames = resampled.items.len / src.n;
-    const out = gpa.alloc(f32, frames * s.out.n) catch return;
-    @memset(out, 0);
-    const m = if (rows) |hd| mix.hdMatrix(src, s.out, hd) else mix.Matrix.default(src, s.out);
-    mix.mixFrames(out, s.out, resampled.items, src, frames, &m);
+    const out = mix.convertEffect(gpa, e.samples, e.channels, e.rate, s.out, s.out_rate, rows) catch return;
     s.effects.start(gpa, out, s.out.n);
 }
 

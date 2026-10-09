@@ -12,6 +12,10 @@
             .url = "https://github.com/quickjs-ng/quickjs/archive/refs/tags/v0.17.0.tar.gz",
             .hash = "N-V-__8AAHXdRAAredjqGKa2uZcnUUzmDSajEa9AQDETVRYW",
         },
+        .rtaudio = .{
+            .url = "https://github.com/thestk/rtaudio/archive/refs/tags/6.0.1.tar.gz",
+            .hash = "N-V-__8AALZhEQBTDxTvF40mCmoHdQH077qDvoeDg4ziHQg-",
+        },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "README.md", "LICENSE" },
 }

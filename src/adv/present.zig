@@ -85,8 +85,8 @@ pub const Presentation = struct {
     /// An effect sound to start, taken by the mixer, or the one playing to stop.
     effect: ?Effect = null,
     stop_effect: bool = false,
-    /// Bumped by the mixer when an effect sound finishes (for the engine's callbacks).
-    effects_done: u32 = 0,
+    /// VLC is paused: its audio output does not play, so effect sounds go to their own output (fxout.zig).
+    paused: bool = false,
 
     /// The sub video decoder's frames (pipdec.zig), while it is open.
     pip: ?*pipdec.Pip = null,
@@ -214,6 +214,12 @@ pub const Presentation = struct {
         if (p.effect) |old| gpa.free(old.samples);
         p.effect = null;
         p.stop_effect = true;
+    }
+
+    pub fn setPaused(p: *Presentation, paused: bool) void {
+        p.lockIt();
+        defer p.unlock();
+        p.paused = paused;
     }
 
     /// The applications' audio levels (Table W-4).
