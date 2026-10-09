@@ -522,13 +522,13 @@ const Ctx = struct {
             } else f.advance(it.glyph, st.fontSize[0]);
         }
         // Kerning (the 'kern' pairs are in visual order).
-        for (items.items[1..], 1..) |it, i| {
+        if (items.items.len > 1) for (items.items[1..], 1..) |it, i| {
             const prev = &items.items[i - 1];
             const f = it.font orelse continue;
             if (prev.font != f or prev.inline_box != null or prev.level != it.level or prev.upright or it.upright) continue;
             const size = it.elem.style.fontSize[0];
             prev.kern = if (it.level & 1 == 0) f.kern(prev.glyph, it.glyph, size) else f.kern(it.glyph, prev.glyph, size);
-        }
+        };
 
         // Fit and stack lines.
         var y = box.y;
@@ -1045,6 +1045,8 @@ test "input values, preserved space, br and spans" {
         \\<div style:position="absolute" style:width="1000px" style:height="500px">
         \\ <input id="i" style:width="1000px" style:height="100px" style:fontSize="100px" state:value="A  A"/>
         \\ <p id="p" style:fontSize="100px">A<br/>A<span id="s" style:fontSize="50px">AA</span></p>
+        \\ <input id="empty" style:width="1000px" style:height="100px" style:fontSize="100px" state:value=""/>
+        \\ <p style:fontSize="100px"></p>
         \\</div></body></root>
     );
     defer p.destroy();

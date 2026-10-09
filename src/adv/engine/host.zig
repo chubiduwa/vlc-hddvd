@@ -17,6 +17,7 @@ const gpa = std.heap.c_allocator;
 extern fn hddvd_now_us() i64;
 extern fn hddvd_mouse_poll(m: ?*anyopaque, x: *c_int, y: *c_int) c_int;
 extern fn hddvd_key_poll(m: ?*anyopaque) u32;
+extern fn hddvd_input_pause(demux: *vlc.demux_t, paused: bool) void;
 
 fn log(obj: *vlc.vlc_object_t, prio: c_int, src: std.builtin.SourceLocation, comptime fmt: [*:0]const u8, args: anytype) void {
     @call(.auto, vlc.vlc_Log, .{ obj, prio, "hddvd", src.file, @as(c_uint, src.line), src.fn_name, fmt } ++ args);
@@ -32,6 +33,7 @@ pub const Options = struct {
 };
 
 pub const Host = struct {
+    /// The demux.
     obj: *vlc.vlc_object_t,
     pres: *present.Presentation,
     /// The demux's mouse handle (nav_glue.c), or null.
@@ -139,7 +141,12 @@ pub const Host = struct {
             h.turn(batch.items);
             batch.clearRetainingCapacity();
             vlc.vlc_mutex_lock(&h.lock);
-            h.commands.appendSlice(gpa, h.eng.outbox.items) catch {};
+            for (h.eng.outbox.items) |cmd| switch (cmd) {
+                // Pause and resume go to VLC from here: while VLC is paused it does not call the demux, which
+                // takes the other commands, so a resume left for it would never be carried out.
+                .pause => |on| hddvd_input_pause(@ptrCast(h.obj), on),
+                else => h.commands.append(gpa, cmd) catch {},
+            };
             h.eng.outbox.clearRetainingCapacity();
         }
         vlc.vlc_mutex_unlock(&h.lock);

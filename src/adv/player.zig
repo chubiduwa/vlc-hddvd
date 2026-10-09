@@ -741,7 +741,7 @@ fn runCommands(demux: *vlc.demux_t) void {
         },
         .hold => |on| p.held = on,
         .default_key => {}, // the engine carries out the Annex V defaults itself
-        .pause => |on| hddvd_input_pause(demux, on),
+        .pause => {}, // carried out by the engine thread (host.zig): a paused VLC does not call the demux
         .stop => {
             log(o, vlc.VLC_MSG_DBG, @src(), "the application stopped the player", .{});
             p.stopped = true;
