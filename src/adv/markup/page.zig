@@ -8,14 +8,16 @@
 //! d. timing overrides (`<set>`, `<animate>`);
 //! e. script overrides (the Animated Property API).
 //!
-//! Later wins; inheritance and `inherit` then work top-down. XPath `select`s read the values computed at the
-//! previous tick (the start of this one). No VLC dependency.
+//! Later wins; inheritance and `inherit` then work top-down. XPath `select`s read the values at the start of
+//! the tick: the styles computed at the previous tick and the states of the last `snapshot` (§7.2.8.2: a
+//! gesture's state change shows in timing and style at the next tick). No VLC dependency.
 
 const std = @import("std");
 const dom = @import("../dom.zig");
 const xpath = @import("../xpath.zig");
 const uri = @import("../uri.zig");
 const style = @import("style.zig");
+const timing_mod = @import("timing.zig");
 
 pub const core_ns = "http://www.dvdforum.org/2005/ihd";
 pub const state_ns = "http://www.dvdforum.org/2005/ihd#state";
@@ -88,6 +90,8 @@ pub const Elem = struct {
     spec: [style.count]?[]const u8 = @splat(null),
     style: style.Style,
     state: State = .{},
+    /// The state at the start of the tick, which XPath reads (its value is owned too).
+    seen: State = .{},
     box: Box = .{},
     /// The navIndex generated for `auto` at the page load (focus.zig); null if it was not auto then.
     nav_auto: ?[2]i32 = null,
@@ -102,7 +106,7 @@ pub const Elem = struct {
 
 const Rule = struct { node: *dom.Node, select: ?xpath.XPath };
 
-/// Property overrides by a source above inline style (timing, script): element and property → value.
+/// Property overrides above timing (script): element and property → value.
 pub const Overrides = std.AutoHashMapUnmanaged(struct { elem: *Elem, prop: style.Prop }, []const u8);
 
 pub const Page = struct {
@@ -114,7 +118,8 @@ pub const Page = struct {
     /// Scratch for one style computation.
     arena: std.heap.ArenaAllocator,
     aperture_h: u32,
-    timing: Overrides = .empty,
+    /// The timesheets (buildTiming).
+    timing: ?*timing_mod.Timing = null,
     script: Overrides = .empty,
     /// Variables, GPRM/SPRM: the host the application sets (property functions are the page's own).
     xpath_host: xpath.Host = .{},
@@ -142,6 +147,7 @@ pub const Page = struct {
         try p.loadRules();
         try p.sync();
         try p.initialState();
+        p.snapshot();
         p.cascade();
         return p;
     }
@@ -151,7 +157,7 @@ pub const Page = struct {
         p.rules.deinit(p.gpa);
         for (p.elems.items) |e| p.freeElem(e);
         p.elems.deinit(p.gpa);
-        p.timing.deinit(p.gpa);
+        if (p.timing) |t| t.destroy();
         p.script.deinit(p.gpa);
         p.arena.deinit();
         p.doc.destroy();
@@ -161,6 +167,7 @@ pub const Page = struct {
     fn freeElem(p: *Page, e: *Elem) void {
         e.node.view = null;
         p.gpa.free(e.state.value);
+        p.gpa.free(e.seen.value);
         p.gpa.destroy(e);
     }
 
@@ -354,24 +361,90 @@ pub const Page = struct {
             if (e.node.attr("style")) |refs| p.applyRefs(e, refs, 0);
             applyAttrs(e, e.node);
         }
-        // d. Timing, e. script.
-        inline for (.{ &p.timing, &p.script }) |m| {
-            var it = m.iterator();
-            while (it.next()) |kv| if (kv.key_ptr.elem.live) setSpec(kv.key_ptr.elem, kv.key_ptr.prop, kv.value_ptr.*);
-        }
+        // d. Timing: per element and property, by priority; e. script.
+        const anims: []const timing_mod.Anim = if (p.timing) |t| t.anims(a) else &.{};
+        var ai: usize = 0;
 
         // Computed values, parents first (document order).
         const root_style: style.Style = .initial(p.aperture_h);
         for (p.elems.items) |e| {
             const parent = if (e.parent) |x| &x.style else &root_style;
-            var s: style.Style = .initial(p.aperture_h);
-            s.inherit(parent);
             const env: style.Env = .{ .parent = parent, .aperture_h = p.aperture_h, .arena = a };
-            for (style.order) |prop| if (e.spec[@intFromEnum(prop)]) |raw| {
-                _ = style.apply(&s, prop, raw, env);
-            };
+            var s = compute(&e.spec, parent, env);
+            const first = ai;
+            while (ai < anims.len and anims[ai].elem == e) ai += 1;
+            const mine = anims[first..ai];
+            const scripted = p.script.count() > 0 and p.hasScript(e);
+            if (mine.len > 0 or scripted) {
+                // The animated values fold over the value below them (the cascade's so far).
+                var spec = e.spec;
+                var k: usize = 0;
+                while (k < mine.len) {
+                    const prop = mine[k].target.style;
+                    var end = k;
+                    while (end < mine.len and mine[end].target.style == prop) end += 1;
+                    var under: []const u8 = blk: {
+                        var w: std.Io.Writer.Allocating = .init(a);
+                        style.format(&w.writer, &s, prop, pctBase(e, prop)) catch break :blk "";
+                        break :blk w.written();
+                    };
+                    for (mine[k..end]) |*x| under = x.value(a, under);
+                    if (prop.longhands().len > 0) setSpecIn(&spec, prop, under) else spec[@intFromEnum(prop)] = under;
+                    k = end;
+                }
+                if (scripted) {
+                    var it = p.script.iterator();
+                    while (it.next()) |kv| if (kv.key_ptr.elem == e) setSpecIn(&spec, kv.key_ptr.prop, kv.value_ptr.*);
+                }
+                s = compute(&spec, parent, env);
+            }
             e.style = s;
         }
+    }
+
+    fn compute(spec: *const [style.count]?[]const u8, parent: *const style.Style, env: style.Env) style.Style {
+        var s: style.Style = .initial(env.aperture_h);
+        s.inherit(parent);
+        for (style.order) |prop| if (spec[@intFromEnum(prop)]) |raw| {
+            _ = style.apply(&s, prop, raw, env);
+        };
+        return s;
+    }
+
+    fn hasScript(p: *Page, e: *Elem) bool {
+        var it = p.script.keyIterator();
+        while (it.next()) |k| if (k.elem == e) return true;
+        return false;
+    }
+
+    /// What percentages of property `prop` of `e` are of (for normalized values).
+    fn pctBase(e: *const Elem, prop: style.Prop) f32 {
+        return switch (prop) {
+            .y, .height, .blockProgressionDimension, .backgroundPositionVertical => e.box.cb_h,
+            else => e.box.cb_w,
+        };
+    }
+
+    /// Takes the state at the start of a tick: what XPath sees until the next snapshot.
+    pub fn snapshot(p: *Page) void {
+        for (p.elems.items) |e| {
+            const v = e.seen.value;
+            e.seen = e.state;
+            e.seen.value = v;
+            if (!std.mem.eql(u8, v, e.state.value)) {
+                const copy = p.gpa.dupe(u8, e.state.value) catch continue;
+                p.gpa.free(v);
+                e.seen.value = copy;
+            }
+        }
+    }
+
+    /// Builds the timesheets (once the page is loaded); seconds are `title_fps` title frames and `tick_rate`
+    /// ticks.
+    pub fn buildTiming(p: *Page, title_fps: f64, tick_rate: f64) !void {
+        if (p.timing) |t| t.destroy();
+        p.timing = null;
+        p.timing = try timing_mod.Timing.build(p.gpa, p, title_fps, tick_rate);
     }
 
     fn applyRefs(p: *Page, e: *Elem, refs: []const u8, depth: u32) void {
@@ -404,15 +477,19 @@ pub const Page = struct {
 
     /// Sets a specified value; shorthands set their longhands.
     pub fn setSpec(e: *Elem, prop: style.Prop, raw: []const u8) void {
+        setSpecIn(&e.spec, prop, raw);
+    }
+
+    fn setSpecIn(spec: *[style.count]?[]const u8, prop: style.Prop, raw: []const u8) void {
         switch (prop) {
             .border => for (prop.longhands()) |l| {
-                e.spec[@intFromEnum(l)] = raw;
+                spec[@intFromEnum(l)] = raw;
             },
             .padding => {
                 // 1–4 widths: before end after start, as parsed in style.zig (the sides are slices of `raw`).
                 const v = style.firstValue(raw);
                 if (std.mem.eql(u8, v, "inherit")) {
-                    for (prop.longhands()) |l| e.spec[@intFromEnum(l)] = v;
+                    for (prop.longhands()) |l| spec[@intFromEnum(l)] = v;
                     return;
                 }
                 var t: [4][]const u8 = undefined;
@@ -430,9 +507,9 @@ pub const Page = struct {
                     4 => t,
                     else => return,
                 };
-                for (prop.longhands(), sides) |l, side| e.spec[@intFromEnum(l)] = side;
+                for (prop.longhands(), sides) |l, side| spec[@intFromEnum(l)] = side;
             },
-            else => e.spec[@intFromEnum(prop)] = raw,
+            else => spec[@intFromEnum(prop)] = raw,
         }
     }
 
@@ -450,7 +527,7 @@ pub const Page = struct {
         _ = ctx;
         const e = elemOf(node) orelse return null;
         if (std.mem.eql(u8, ns, state_ns)) {
-            const st = e.state;
+            const st = e.seen;
             if (std.mem.eql(u8, local, "focused")) return if (e.kind.activatable()) .{ .boolean = st.focused } else null;
             if (std.mem.eql(u8, local, "actioned")) return if (e.kind.activatable()) .{ .boolean = st.actioned } else null;
             if (std.mem.eql(u8, local, "pointer")) return if (e.kind.navigable()) .{ .boolean = st.pointer } else null;
@@ -468,12 +545,8 @@ pub const Page = struct {
                 .whiteSpaceCollapse => return .{ .boolean = e.style.whiteSpaceCollapse },
                 else => {},
             }
-            const vertical = switch (prop) {
-                .y, .height, .blockProgressionDimension, .backgroundPositionVertical => true,
-                else => false,
-            };
             var w: std.Io.Writer.Allocating = .init(a);
-            style.format(&w.writer, &e.style, prop, if (vertical) e.box.cb_h else e.box.cb_w) catch return null;
+            style.format(&w.writer, &e.style, prop, pctBase(e, prop)) catch return null;
             return .{ .string = w.written() };
         }
         return null;
@@ -613,15 +686,18 @@ test "load, includes, cascade" {
     p.setState(el(p, "b1"), .focused, false);
     p.setState(b2, .focused, true);
     try testing.expectEqualStrings("true", b2.node.attrNS(state_ns, "focused").?);
+    p.cascade(); // not seen before the next tick
+    try testing.expectEqual(@as(f32, 0.5), el(p, "b1").style.opacity);
+    p.snapshot();
     p.cascade();
     try testing.expectEqual(@as(f32, 0.5), b2.style.opacity);
     try testing.expectEqual(@as(f32, 1), el(p, "b1").style.opacity);
 
     // Overrides beat inline style; removing them restores it.
-    try p.timing.put(testing.allocator, .{ .elem = d1, .prop = .width }, "50px");
+    try p.script.put(testing.allocator, .{ .elem = d1, .prop = .width }, "50px");
     p.cascade();
     try testing.expectEqual(@as(f32, 50), d1.style.width.?.v);
-    p.timing.clearRetainingCapacity();
+    p.script.clearRetainingCapacity();
     p.cascade();
     try testing.expectEqual(@as(f32, 100), d1.style.width.?.v);
 

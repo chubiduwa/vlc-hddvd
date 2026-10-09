@@ -9,7 +9,10 @@
 //! accessKeys in any of them, navigation, Enter and Esc in the focused one. One element in all applications
 //! has the focus. The pointer state follows the cursor, the element on top under its hot spot.
 //!
-//! Scripts, the application lifecycle and markup changes over time come with the script host and timing.
+//! Each page's timesheets run on the application's clocks (its application clock starts with its first page,
+//! its page clock with each page); their state values, `<link>`s and `<event>`s are applied here.
+//!
+//! Scripts and the application lifecycle come with the script host.
 //! No VLC dependency.
 
 const std = @import("std");
@@ -27,6 +30,7 @@ const paint_mod = @import("paint.zig");
 const focus = @import("focus.zig");
 const style = @import("style.zig");
 const keys = @import("../engine/keys.zig");
+const timing = @import("timing.zig");
 
 const Page = page_mod.Page;
 
@@ -105,7 +109,7 @@ const Resources = struct {
     }
 };
 
-const Want = struct { src: []const u8, id: []const u8, z: u32 };
+const Want = struct { src: []const u8, id: []const u8, z: u32, valid: [2]?i64 };
 
 const App = struct {
     /// The manifest URI (what identifies it across ticks).
@@ -126,6 +130,13 @@ const App = struct {
     rank: []u32 = &.{},
     /// navIndex values have been generated for the page.
     numbered: bool = false,
+    /// The application's valid interval on the Title Timeline (frames).
+    valid: [2]?i64 = .{ 0, null },
+    /// Engine ticks when its first page and its current page started.
+    app_start: ?u64 = null,
+    page_start: u64 = 0,
+    /// A link failed: the application ended (§7.7.5.2).
+    terminated: bool = false,
 
     fn reorder(a: *App, gpa: std.mem.Allocator) void {
         const p = a.page orelse return;
@@ -187,13 +198,13 @@ pub const Apps = struct {
         const pl = s.cfg.pl;
         const title: *const xpl.Title = if (e.title) |i| (if (i < pl.titles.len) &pl.titles[i] else return) else if (pl.first_play) |*fp| fp else return;
         // The Playlist Application runs in every title but the First Play one, at the bottom.
-        if (e.title != null) if (resman.Manager.playlistApp(pl, s.cfg.menu_language)) |pa| out.append(s.gpa, .{ .src = pa.src, .id = pa.id, .z = 0 }) catch {};
+        if (e.title != null) if (resman.Manager.playlistApp(pl, s.cfg.menu_language)) |pa| out.append(s.gpa, .{ .src = pa.src, .id = pa.id, .z = 0, .valid = .{ 0, null } }) catch {};
         var states: [64]resman.App = undefined;
         const n = @min(title.apps.len, states.len);
         resman.defaultApps(title, t, states[0..n]);
         for (title.apps[0..n], states[0..n]) |a, st| {
             if (st.state != .active or a.subtitle) continue;
-            out.append(s.gpa, .{ .src = a.src, .id = a.id, .z = a.z_order + 1 }) catch {};
+            out.append(s.gpa, .{ .src = a.src, .id = a.id, .z = a.z_order + 1, .valid = .{ @intCast(a.title_begin), if (a.title_end) |x| @intCast(x) else null } }) catch {};
         }
     }
 
@@ -208,9 +219,10 @@ pub const Apps = struct {
         for (want.items) |w| {
             const a = for (s.apps.items) |a| {
                 if (std.mem.eql(u8, a.src, w.src)) break a;
-            } else s.start(w.src, w.id, w.z) orelse continue;
+            } else s.start(w.src, w.id, w.z, c.app) orelse continue;
             a.wanted = true;
             a.z = w.z;
+            a.valid = w.valid;
         }
         var i: usize = 0;
         while (i < s.apps.items.len) {
@@ -231,6 +243,7 @@ pub const Apps = struct {
         }.less);
 
         s.endActivations(c.app);
+        for (s.apps.items) |a| s.runTiming(a, c);
         for (s.apps.items, 0..) |a, k| {
             const p = a.page orelse continue;
             // The front-most application is in the foreground (§7.6.3.4.2.1).
@@ -247,7 +260,65 @@ pub const Apps = struct {
             a.look = look;
         }
         s.updatePointer(e);
+        // What the next tick's expressions see.
+        for (s.apps.items) |a| if (a.page) |p| p.snapshot();
         return changed;
+    }
+
+    /// Runs a page's timesheets, then what they set: states, a link to another page, events.
+    fn runTiming(s: *Apps, a: *App, c: engine.Clocks) void {
+        const p = a.page orelse return;
+        const tm = p.timing orelse return;
+        if (tm.empty()) return;
+        tm.tick(p, .{
+            .title = @intCast(c.title),
+            .app = @intCast(c.app -| (a.app_start orelse c.app)),
+            .page = @intCast(c.app -| a.page_start),
+            .valid = a.valid,
+        });
+        for (tm.states.items) |st| switch (st.which) {
+            .focused => if (std.mem.eql(u8, st.value, "true")) {
+                if (focus.focusable(st.elem) or st.elem.kind.activatable()) s.setFocus(p, st.elem);
+            } else p.setState(st.elem, .focused, false),
+            .enabled => p.setState(st.elem, .enabled, !std.mem.eql(u8, st.value, "false")),
+            .value => p.setValue(st.elem, st.value) catch {},
+        };
+        // Events go to the script host (Phase 5).
+        for (tm.events.items) |ev| s.log("event {s} on {s}", .{ ev.name, ev.target.attr("id") orelse ev.target.local });
+        tm.events.clearRetainingCapacity();
+        if (tm.link) |l| {
+            tm.link = null;
+            s.follow(a, p, l, c.app);
+        }
+    }
+
+    /// A `<link>`: its page replaces the current one; a link to anything else ends the application.
+    fn follow(s: *Apps, a: *App, p: *Page, l: *@import("../dom.zig").Node, now: u64) void {
+        const href = l.attr("href") orelse "";
+        const u = p.resolve(l, href) catch return;
+        defer s.gpa.free(u);
+        const next = Page.load(s.gpa, s.cfg.loader, u, s.h) catch |err| {
+            s.log("application {s}: link to {s} failed ({s}); it ends", .{ a.src, u, @errorName(err) });
+            p.destroy();
+            a.page = null;
+            a.terminated = true;
+            return;
+        };
+        s.log("application {s}: link to {s}", .{ a.src, u });
+        p.destroy();
+        a.page = next;
+        s.pageStarted(a, now);
+    }
+
+    /// A page starts: its timesheets, its clock, navIndex numbering after its first layout.
+    fn pageStarted(s: *Apps, a: *App, now: u64) void {
+        const p = a.page orelse return;
+        p.buildTiming(@floatFromInt(s.cfg.pl.time_base.fps()), @floatFromInt(s.cfg.pl.tick_base)) catch |err| s.log("application {s}: timing ({s})", .{ a.src, @errorName(err) });
+        if (a.app_start == null) a.app_start = now;
+        a.page_start = now;
+        a.numbered = false;
+        a.look = 0;
+        if (p.focused()) |el| s.setFocus(p, el);
     }
 
     // ---- input --------------------------------------------------------------------------------------------
@@ -321,7 +392,18 @@ pub const Apps = struct {
         const cur = p.focused();
         if (dir) |d| {
             if (focus.stale(p)) focus.generate(s.gpa, p, a.rank) catch {};
-            switch (focus.navigate(p, cur, d, a.id, a.rank)) {
+            const to = focus.navigate(p, cur, d, a.id, a.rank);
+            s.log("key {s} in {s}: from {s}, to {s}", .{
+                @tagName(d),
+                a.id,
+                if (cur) |x| x.node.attr("id") orelse @tagName(x.kind) else "nothing",
+                switch (to) {
+                    .none => "nowhere",
+                    .elem => |x| x.node.attr("id") orelse @tagName(x.kind),
+                    .other => |o| o.elem,
+                },
+            });
+            switch (to) {
                 .none => return cur != null,
                 .elem => |el| s.setFocus(p, el),
                 .other => |nav| {
@@ -390,10 +472,12 @@ pub const Apps = struct {
     /// Gives `el` the focus: one element in all applications has it.
     fn setFocus(s: *Apps, p: *Page, el: *page_mod.Elem) void {
         for (s.apps.items) |a| if (a.page) |q| for (q.elems.items) |x| if (x != el and x.state.focused) q.setState(x, .focused, false);
+        if (!el.state.focused) s.log("focus: {s} {s}", .{ @tagName(el.kind), el.node.attr("id") orelse "(no id)" });
         p.setState(el, .focused, true);
     }
 
     fn clearFocus(s: *Apps) void {
+        s.log("focus cleared", .{});
         for (s.apps.items) |a| if (a.page) |q| for (q.elems.items) |x| if (x.state.focused) q.setState(x, .focused, false);
     }
 
@@ -418,7 +502,7 @@ pub const Apps = struct {
     }
 
     /// Loads an application's manifest and first page.
-    fn start(s: *Apps, src: []const u8, id: []const u8, z: u32) ?*App {
+    fn start(s: *Apps, src: []const u8, id: []const u8, z: u32, now: u64) ?*App {
         const a = s.gpa.create(App) catch return null;
         const src_copy = s.gpa.dupe(u8, src) catch {
             s.gpa.destroy(a);
@@ -460,7 +544,7 @@ pub const Apps = struct {
         };
         s.log("application {s}: {s}, {d} elements, region {d},{d} {d}x{d}", .{ src, markup, a.page.?.elems.items.len, a.region.x, a.region.y, a.region.w, a.region.h });
         // A page that sets a focus takes it from the other applications (§7.6.3.4.2.3).
-        if (a.page.?.focused()) |el| s.setFocus(a.page.?, el);
+        s.pageStarted(a, now);
         var it = std.mem.tokenizeAny(u8, s.cfg.show, ", ");
         while (it.next()) |shown| {
             const n = a.page.?.doc.getElementById(shown) orelse continue;
@@ -561,16 +645,18 @@ test "the Playlist Application's page is drawn in its region" {
     );
     defer pl.deinit();
     var files: Files = .{ .files = &.{
-        .{ "file:///dvddisc/ADV_OBJ/m.xmf",
-        \\<Application xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Manifest" id="m">
-        \\ <Region x="100" y="200" width="300" height="100"/>
-        \\ <Markup src="m.xmu"/>
-        \\</Application>
+        .{
+            "file:///dvddisc/ADV_OBJ/m.xmf",
+            \\<Application xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Manifest" id="m">
+            \\ <Region x="100" y="200" width="300" height="100"/>
+            \\ <Markup src="m.xmu"/>
+            \\</Application>
         },
-        .{ "file:///dvddisc/ADV_OBJ/m.xmu",
-        \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style" xml:lang="en"><body>
-        \\<div style:position="absolute" style:x="-50px" style:y="0px" style:width="1000px" style:height="10px" style:backgroundColor="red"/>
-        \\</body></root>
+        .{
+            "file:///dvddisc/ADV_OBJ/m.xmu",
+            \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style" xml:lang="en"><body>
+            \\<div style:position="absolute" style:x="-50px" style:y="0px" style:width="1000px" style:height="10px" style:backgroundColor="red"/>
+            \\</body></root>
         },
     } };
     var e = engine.Engine.init(gpa, 1920, 1080, 60);
@@ -605,17 +691,19 @@ test "focus, activation and the pointer from user input" {
     );
     defer pl.deinit();
     var files: Files = .{ .files = &.{
-        .{ "file:///dvddisc/ADV_OBJ/m.xmf",
-        \\<Application xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Manifest" id="m">
-        \\ <Region x="100" y="100" width="400" height="400"/>
-        \\ <Markup src="m.xmu"/>
-        \\</Application>
+        .{
+            "file:///dvddisc/ADV_OBJ/m.xmf",
+            \\<Application xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Manifest" id="m">
+            \\ <Region x="100" y="100" width="400" height="400"/>
+            \\ <Markup src="m.xmu"/>
+            \\</Application>
         },
-        .{ "file:///dvddisc/ADV_OBJ/m.xmu",
-        \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style" xml:lang="en"><body>
-        \\<button id="a" style:position="absolute" style:x="0px" style:y="0px" style:width="50px" style:height="50px"/>
-        \\<button id="b" accessKey="U+0037" style:position="absolute" style:x="100px" style:y="0px" style:width="50px" style:height="50px"/>
-        \\</body></root>
+        .{
+            "file:///dvddisc/ADV_OBJ/m.xmu",
+            \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style" xml:lang="en"><body>
+            \\<button id="a" style:position="absolute" style:x="0px" style:y="0px" style:width="50px" style:height="50px"/>
+            \\<button id="b" accessKey="U+0037" style:position="absolute" style:x="100px" style:y="0px" style:width="50px" style:height="50px"/>
+            \\</body></root>
         },
     } };
     var e = engine.Engine.init(gpa, 1920, 1080, 50);

@@ -43,6 +43,9 @@ typedef struct
     unsigned count;
     int x, y;
     bool down;
+    /* Keys pressed (VLC key codes, with modifiers), for keys VLC has no navigation action for. */
+    uint32_t keys[16];
+    unsigned key_count;
 } hddvd_mouse_t;
 
 static void MousePush(hddvd_mouse_t *m, int type)
@@ -82,6 +85,17 @@ static int EventMouse(vlc_object_t *vout, char const *var, vlc_value_t oldval, v
     }
     vlc_mutex_unlock(&m->lock);
     (void)vout; (void)oldval;
+    return VLC_SUCCESS;
+}
+
+static int EventKey(vlc_object_t *libvlc, char const *var, vlc_value_t oldval, vlc_value_t val, void *data)
+{
+    hddvd_mouse_t *m = data;
+    vlc_mutex_lock(&m->lock);
+    if (m->key_count < sizeof(m->keys) / sizeof(m->keys[0]))
+        m->keys[m->key_count++] = (uint32_t)val.i_int;
+    vlc_mutex_unlock(&m->lock);
+    (void)libvlc; (void)var; (void)oldval;
     return VLC_SUCCESS;
 }
 
@@ -125,6 +139,8 @@ void *hddvd_mouse_new(demux_t *demux)
         return NULL;
     vlc_mutex_init(&m->lock);
     var_AddCallback(demux->p_input, "intf-event", EventIntf, m);
+    /* Every key press, from the video window or the interface (what the hotkeys module listens to). */
+    var_AddCallback(demux->obj.libvlc, "key-pressed", EventKey, m);
     return m;
 }
 
@@ -133,6 +149,7 @@ void hddvd_mouse_delete(demux_t *demux, void *handle)
     hddvd_mouse_t *m = handle;
     if (m == NULL)
         return;
+    var_DelCallback(demux->obj.libvlc, "key-pressed", EventKey, m);
     var_DelCallback(demux->p_input, "intf-event", EventIntf, m);
     MouseDetach(m);
     vlc_mutex_destroy(&m->lock);
@@ -157,6 +174,24 @@ int hddvd_mouse_poll(void *handle, int *x, int *y)
     }
     vlc_mutex_unlock(&m->lock);
     return ret;
+}
+
+/* Takes the next key pressed (a VLC key code, see vlc_actions.h), or 0. */
+uint32_t hddvd_key_poll(void *handle)
+{
+    hddvd_mouse_t *m = handle;
+    if (m == NULL)
+        return 0;
+    uint32_t key = 0;
+    vlc_mutex_lock(&m->lock);
+    if (m->key_count > 0)
+    {
+        key = m->keys[0];
+        m->key_count--;
+        memmove(&m->keys[0], &m->keys[1], m->key_count * sizeof(m->keys[0]));
+    }
+    vlc_mutex_unlock(&m->lock);
+    return key;
 }
 
 /* ---- es_out proxy --------------------------------------------------------------------------------------- */

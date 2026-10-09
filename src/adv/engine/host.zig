@@ -16,6 +16,7 @@ const gpa = std.heap.c_allocator;
 
 extern fn hddvd_now_us() i64;
 extern fn hddvd_mouse_poll(m: ?*anyopaque, x: *c_int, y: *c_int) c_int;
+extern fn hddvd_key_poll(m: ?*anyopaque) u32;
 
 fn log(obj: *vlc.vlc_object_t, prio: c_int, src: std.builtin.SourceLocation, comptime fmt: [*:0]const u8, args: anytype) void {
     @call(.auto, vlc.vlc_Log, .{ obj, prio, "hddvd", src.file, @as(c_uint, src.line), src.fn_name, fmt } ++ args);
@@ -157,6 +158,15 @@ pub const Host = struct {
                 2 => e.post(.{ .mouse_down = .{ .x = x, .y = y } }) catch {},
                 3 => e.post(.{ .mouse_up = .{ .x = x, .y = y } }) catch {},
                 else => break,
+            }
+        }
+        // Keys VLC has no navigation action for: Backspace is the Cancel gesture (VK_ESC), since VLC takes Esc.
+        while (true) {
+            const k = hddvd_key_poll(h.mouse);
+            if (k == 0) break;
+            if (k == 0x08) { // KEY_BACKSPACE (vlc_actions.h), no modifiers
+                e.post(.{ .key_down = engine.keys.esc }) catch {};
+                e.post(.{ .key_up = engine.keys.esc }) catch {};
             }
         }
         const now = hddvd_now_us();
