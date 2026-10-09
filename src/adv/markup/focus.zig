@@ -184,7 +184,7 @@ fn noFont(_: *anyopaque, _: *Page, _: *Elem) ?*@import("../font.zig").Font {
     return null;
 }
 
-fn noImage(_: *anyopaque, _: []const u8) ?*const @import("../raster.zig").Canvas {
+fn noImage(_: *anyopaque, _: []const u8) ?*@import("../image.zig").Image {
     return null;
 }
 

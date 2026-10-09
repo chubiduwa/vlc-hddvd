@@ -3,9 +3,12 @@
 //! - elements are drawn in z-index order, then document order (§7.3.1.3.1); `auto` (and the z-index of a
 //!   non-positioned element) is the parent's level, so children stay with their parent;
 //! - each box: background colour on its padding rectangle, then its background image (the frame
-//!   `backgroundFrame` picks from the `backgroundImage` list; crop, flip, content size and scaling, position,
-//!   repeat), then its intrinsic marks (an image object, a clear rectangle), then its borders, then the text
-//!   of its lines;
+//!   `backgroundFrame` picks from the `backgroundImage` list, or from the frames of a single MNG; crop, flip,
+//!   content size and scaling, position, repeat), then its intrinsic marks (an image object, a clear
+//!   rectangle), then its borders, then the text of its lines;
+//! - a still image object is drawn as if its `src` were its background image (any other is ignored); an MNG
+//!   object draws its background image, then the animation frame apps.zig chose, sized by contentWidth,
+//!   contentHeight and scaling only (§7.8.3.1);
 //! - opacity applies to each element's own marks (the discs fade groups with `opacity="inherit"`);
 //!   `visibility: hidden` hides an element's own marks only; everything is clipped to the region.
 //!
@@ -17,6 +20,7 @@ const planes = @import("../planes.zig");
 const style = @import("style.zig");
 const page_mod = @import("page.zig");
 const layout = @import("layout.zig");
+const image_mod = @import("../image.zig");
 
 const Page = page_mod.Page;
 const Elem = page_mod.Elem;
@@ -86,7 +90,10 @@ const Painter = struct {
         const s = &e.style;
         const cv = p.f.canvas;
         const b = e.box;
-        const bw: [4]f32 = .{ edge(s.borders[0]), edge(s.borders[1]), edge(s.borders[2]), edge(s.borders[3]) };
+        // The borders on the top, right, bottom and left sides (they are writing-mode relative).
+        const sd = layout.sides(s.writingMode);
+        const bd: [4]style.Border = .{ s.borders[sd[0]], s.borders[sd[1]], s.borders[sd[2]], s.borders[sd[3]] };
+        const bw: [4]f32 = .{ edge(bd[0]), edge(bd[1]), edge(bd[2]), edge(bd[3]) };
         const outer = rect(p.ox + b.x, p.oy + b.y, b.w, b.h);
         const pad_x = p.ox + b.x + bw[3];
         const pad_y = p.oy + b.y + bw[0];
@@ -95,8 +102,13 @@ const Painter = struct {
         const padding = rect(pad_x, pad_y, pad_w, pad_h);
         if (s.visible and e.kind != .span and e.kind != .br) {
             if (s.backgroundColor[3] > 0) cv.fill(p.clip, padding, withOpacity(s.backgroundColor, s.opacity));
-            if (s.backgroundImage.len > 0 and hasBackgroundImage(e.kind)) p.image(e, s.backgroundImage[@intCast(std.math.clamp(s.backgroundFrame, 0, @as(i32, @intCast(s.backgroundImage.len - 1))))], padding);
-            if (e.kind == .object) p.object(e, b, bw);
+            if (s.backgroundImage.len > 0 and hasBackgroundImage(e) and s.opacity > 0) {
+                // Several URIs are one frame each; a single one may hold the frames (an MNG).
+                const n: i32 = @intCast(s.backgroundImage.len);
+                const fr = @max(0, s.backgroundFrame);
+                if (n == 1) p.image(e, s.backgroundImage[0], @intCast(fr), padding, .background) else p.image(e, s.backgroundImage[@intCast(@min(fr, n - 1))], 0, padding, .background);
+            }
+            if (e.kind == .object) p.object(e, b);
             // Borders.
             const sides = [4]Rect{
                 .{ .x = outer.x, .y = outer.y, .w = outer.w, .h = @intFromFloat(@round(bw[0])) },
@@ -104,7 +116,7 @@ const Painter = struct {
                 .{ .x = outer.x, .y = outer.bottom() - @as(i32, @intFromFloat(@round(bw[2]))), .w = outer.w, .h = @intFromFloat(@round(bw[2])) },
                 .{ .x = outer.x, .y = outer.y, .w = @intFromFloat(@round(bw[3])), .h = outer.h },
             };
-            for (s.borders, sides) |bd, r| if (bd.style == .solid and bd.width > 0) cv.fill(p.clip, r, withOpacity(bd.color orelse s.color, s.opacity));
+            for (bd, sides) |x, r| if (x.style == .solid and x.width > 0) cv.fill(p.clip, r, withOpacity(x.color orelse s.color, s.opacity));
         }
         // The text of this block's lines (each run in its own element's style).
         for (p.lay.runs.items) |*r| if (r.block == e) p.run(r);
@@ -114,11 +126,18 @@ const Painter = struct {
         return if (b.style == .solid) b.width else 0;
     }
 
-    fn hasBackgroundImage(k: page_mod.Kind) bool {
-        return switch (k) {
-            .area, .body, .div, .button, .input, .object => true,
+    fn hasBackgroundImage(e: *const Elem) bool {
+        return switch (e.kind) {
+            .area, .body, .div, .button, .input => true,
+            // A still image object's background is its src (§7.8.3.1).
+            .object => !isStill(e),
             else => false,
         };
+    }
+
+    fn isStill(e: *const Elem) bool {
+        const ty = e.node.attr("type") orelse return false;
+        return std.mem.startsWith(u8, ty, "image/") and !std.mem.eql(u8, ty, "image/mng");
     }
 
     fn run(p: *Painter, r: *const layout.Run) void {
@@ -128,20 +147,28 @@ const Painter = struct {
         if (r.elem != r.block and s.backgroundColor[3] > 0) p.f.canvas.fill(p.clip, rect(p.ox + r.x, p.oy + r.top, r.w, r.h), withOpacity(s.backgroundColor, s.opacity));
         if (s.color[3] == 0 or s.opacity == 0) return;
         const color = withOpacity(s.color, s.opacity);
-        const baseline: i32 = @intFromFloat(@round(p.oy + r.baseline));
-        for (r.glyphs) |g| r.font.draw(p.f.canvas, p.clip, p.ox + r.x + g.x, baseline, g.id, r.sx, r.sy, r.slant, color);
+        if (!r.vertical) {
+            const baseline: i32 = @intFromFloat(@round(p.oy + r.baseline));
+            for (r.glyphs) |g| r.font.draw(p.f.canvas, p.clip, p.ox + r.x + g.x, baseline, g.id, r.sx, r.sy, r.slant, color);
+            return;
+        }
+        // A column centred on `baseline`: upright glyphs centred on it, turned ones with their ascent to the right.
+        const vm = r.font.vmetrics(r.sy);
+        for (r.glyphs) |g| {
+            const pen = p.oy + r.top + g.x;
+            if (g.upright) {
+                const x = p.ox + r.baseline - r.font.advance(g.id, r.sx) / 2;
+                r.font.draw(p.f.canvas, p.clip, x, @intFromFloat(@round(pen + vm.ascent)), g.id, r.sx, r.sy, r.slant, color);
+            } else r.font.drawTurned(p.f.canvas, p.clip, p.ox + r.baseline - (vm.ascent - vm.descent) / 2, pen, g.id, r.sx, r.sy, r.slant, color);
+        }
     }
 
     /// An object's intrinsic marks in its content rectangle.
-    fn object(p: *Painter, e: *Elem, b: page_mod.Box, bw: [4]f32) void {
+    fn object(p: *Painter, e: *Elem, b: page_mod.Box) void {
         const s = &e.style;
         const ty = e.node.attr("type") orelse return;
-        const pad = s.padding;
-        const cx = p.ox + b.x + bw[3] + pad[3].resolve(b.cb_w);
-        const cy = p.oy + b.y + bw[0] + pad[0].resolve(b.cb_w);
-        const cw = b.w - bw[1] - bw[3] - pad[1].resolve(b.cb_w) - pad[3].resolve(b.cb_w);
-        const ch = b.h - bw[0] - bw[2] - pad[0].resolve(b.cb_w) - pad[2].resolve(b.cb_w);
-        const content = rect(cx, cy, cw, ch);
+        const pe = layout.physEdges(e);
+        const content = rect(p.ox + b.x + pe[3], p.oy + b.y + pe[0], b.w - pe[1] - pe[3], b.h - pe[0] - pe[2]);
         if (std.mem.eql(u8, ty, "application/x-clearrect")) {
             const target: planes.Target = if (std.mem.eql(u8, param(e, "TargetPlane") orelse "main", "sub")) .sub else .main;
             p.f.clearRect(p.clip, content, target) catch {};
@@ -149,20 +176,29 @@ const Painter = struct {
         }
         if (std.mem.startsWith(u8, ty, "image/")) if (e.node.attr("src")) |src| {
             if (!s.visible) return;
+            if (std.mem.eql(u8, ty, "image/mng")) {
+                if (e.mng_frame) |fr| p.image(e, src, fr, content, .mng);
+                return;
+            }
             // The object's image follows the backgroundImage rules (§7.3.1.3.1), clipped to its content box.
-            p.image(e, src, content);
+            p.image(e, src, 0, content, .background);
         };
     }
 
-    /// Draws image `ref` for element `e` in `area` (crop, flip, content size, scaling, position, repeat).
-    fn image(p: *Painter, e: *Elem, ref: []const u8, area: Rect) void {
+    /// Draws frame `fr` of image `ref` for element `e` in `area`: as a background (crop, flip, content size,
+    /// scaling, position, repeat), or as an MNG object (content size and scaling only).
+    fn image(p: *Painter, e: *Elem, ref: []const u8, fr: u32, area: Rect, how: enum { background, mng }) void {
         const s = &e.style;
         if (area.empty() or s.opacity == 0 or !s.visible) return;
         const u = p.page.resolve(e.node, ref) catch return;
         defer p.page.gpa.free(u);
-        const im = p.res.image(p.res.ctx, u) orelse return;
+        const img = p.res.image(p.res.ctx, u) orelse return;
+        const im = img.frame(p.gpa, fr) orelse return;
+        const bg = how == .background;
         var sr: Rect = im.bounds();
-        if (s.crop) |c| sr = (Rect{ .x = @intCast(c[0]), .y = @intCast(c[1]), .w = @intCast(c[2] - c[0]), .h = @intCast(c[3] - c[1]) }).intersect(im.bounds()) orelse return;
+        if (bg) if (s.crop) |c| {
+            sr = (Rect{ .x = @intCast(c[0]), .y = @intCast(c[1]), .w = @intCast(c[2] - c[0]), .h = @intCast(c[3] - c[1]) }).intersect(im.bounds()) orelse return;
+        };
         const iw: f32 = @floatFromInt(sr.w);
         const ih: f32 = @floatFromInt(sr.h);
         const aw: f32 = @floatFromInt(area.w);
@@ -179,17 +215,19 @@ const Painter = struct {
             tw = iw * k;
             th = ih * k;
         }
-        const px = position(s.backgroundPositionHorizontal, aw, tw);
-        const py = position(s.backgroundPositionVertical, ah, th);
-        const flip_x = s.flip == .inlineProgression or s.flip == .both;
-        const flip_y = s.flip == .blockProgression or s.flip == .both;
+        const px = if (bg) position(s.backgroundPositionHorizontal, aw, tw) else 0;
+        const py = if (bg) position(s.backgroundPositionVertical, ah, th) else 0;
+        // Mirrored along the inline or block progression (vertical in tb-rl).
+        const along_x: style.Flip = if (s.writingMode == .@"tb-rl") .blockProgression else .inlineProgression;
+        const flip_x = bg and (s.flip == along_x or s.flip == .both);
+        const flip_y = bg and s.flip != .none and s.flip != along_x;
         const clip = area.intersect(p.clip) orelse return;
         const a = alpha(s.opacity);
         const w: i32 = @intFromFloat(@max(1, @round(tw)));
         const h: i32 = @intFromFloat(@max(1, @round(th)));
         const x0 = area.x + @as(i32, @intFromFloat(@round(px)));
         const y0 = area.y + @as(i32, @intFromFloat(@round(py)));
-        if (!s.backgroundRepeat) {
+        if (!bg or !s.backgroundRepeat) {
             raster.drawImage(p.f.canvas, clip, .{ .x = x0, .y = y0, .w = w, .h = h }, im.*, sr, flip_x, flip_y, a);
             return;
         }
@@ -232,14 +270,14 @@ pub fn param(e: *const Elem, name: []const u8) ?[]const u8 {
 const testing = std.testing;
 
 const TestRes = struct {
-    img: raster.Canvas,
+    img: image_mod.Image,
 
     fn font(_: *anyopaque, _: *Page, _: *Elem) ?*@import("../font.zig").Font {
         return null;
     }
-    fn image(ctx: *anyopaque, u: []const u8) ?*const raster.Canvas {
+    fn image(ctx: *anyopaque, u: []const u8) ?*image_mod.Image {
         const self: *TestRes = @ptrCast(@alignCast(ctx));
-        return if (std.mem.endsWith(u8, u, "a.png")) &self.img else null;
+        return if (std.mem.endsWith(u8, u, "a.png") or std.mem.endsWith(u8, u, "a.mng")) &self.img else null;
     }
     fn res(self: *TestRes) layout.Res {
         return .{ .ctx = self, .font = font, .image = image };
@@ -248,10 +286,11 @@ const TestRes = struct {
 
 test "backgrounds, images, z order, opacity, clear rectangles" {
     const gpa = testing.allocator;
-    var tr: TestRes = .{ .img = try raster.Canvas.init(gpa, 2, 2) };
+    var tr: TestRes = .{ .img = .{ .w = 2, .h = 2, .data = .{ .still = try raster.Canvas.init(gpa, 2, 2) } } };
     defer tr.img.deinit(gpa);
-    @memset(tr.img.px, .{ 0, 0, 255, 255 }); // blue
-    tr.img.px[0] = .{ 0, 255, 0, 255 }; // green top left
+    const px = tr.img.data.still.px;
+    @memset(px, .{ 0, 0, 255, 255 }); // blue
+    px[0] = .{ 0, 255, 0, 255 }; // green top left
 
     const p = try Page.fromBytes(gpa, null,
         \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style" xml:lang="en"><body>
@@ -282,4 +321,43 @@ test "backgrounds, images, z order, opacity, clear rectangles" {
     try testing.expectEqual(raster.Px{ 0, 255, 0, 255 }, c.at(20, 0)); // lime border
     try testing.expectEqual(raster.Px{ 0, 0, 255, 255 }, c.at(21, 1)); // mirrored: blue on the left
     try testing.expectEqual(raster.Px{ 0, 255, 0, 255 }, c.at(22, 1)); // green on the right
+}
+
+test "image objects: a still's background is its src, an MNG draws its frame over its background" {
+    const gpa = testing.allocator;
+    var tr: TestRes = .{ .img = .{ .w = 2, .h = 2, .data = .{ .still = try raster.Canvas.init(gpa, 2, 2) } } };
+    defer tr.img.deinit(gpa);
+    const px = tr.img.data.still.px;
+    @memset(px, .{ 0, 0, 255, 255 }); // blue
+    px[0] = .{ 0, 255, 0, 255 }; // green top left
+    const p = try Page.fromBytes(gpa, null,
+        \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style" xml:lang="en"><body>
+        \\<object id="still" type="image/png" src="a.png" style:position="absolute" style:x="0px" style:y="0px" style:width="2px" style:height="2px"
+        \\     style:backgroundImage="url('b.png')" style:backgroundColor="red"/>
+        \\<object id="anim" type="image/mng" src="a.mng" style:position="absolute" style:x="10px" style:y="0px" style:width="4px" style:height="4px"
+        \\     style:backgroundImage="url('a.png')" style:backgroundRepeat="repeat" style:crop="1 1 2 2" style:flip="both" style:contentWidth="4px"/>
+        \\</body></root>
+    , "file:///dvddisc/p.xmu", 1080);
+    defer p.destroy();
+    var lay = layout.Layout.init(gpa);
+    defer lay.deinit();
+    lay.run(p, tr.res(), 100, 50);
+    Page.elemOf(p.doc.getElementById("anim").?).?.mng_frame = 0;
+    const f = try planes.Frame.create(gpa, 64, 64);
+    defer f.unref();
+    paint(gpa, p, &lay, tr.res(), f, .{ .x = 0, .y = 0, .w = 100, .h = 50 });
+    const c = f.canvas;
+    // The still: its src, not the backgroundImage.
+    try testing.expectEqual(raster.Px{ 0, 255, 0, 255 }, c.at(0, 0));
+    try testing.expectEqual(raster.Px{ 0, 0, 255, 255 }, c.at(1, 1));
+    // The MNG frame, 4 pixels wide, neither cropped nor flipped: green on the left of its first row.
+    try testing.expectEqual(raster.Px{ 0, 255, 0, 255 }, c.at(10, 0));
+    try testing.expectEqual(raster.Px{ 0, 0, 255, 255 }, c.at(13, 0));
+    // Below the 2-pixel-high frame, the background: the cropped (blue) pixel, tiled.
+    try testing.expectEqual(raster.Px{ 0, 0, 255, 255 }, c.at(10, 3));
+    // Not shown: only the background.
+    Page.elemOf(p.doc.getElementById("anim").?).?.mng_frame = null;
+    f.canvas.clear(f.canvas.bounds(), f.canvas.bounds());
+    paint(gpa, p, &lay, tr.res(), f, .{ .x = 0, .y = 0, .w = 100, .h = 50 });
+    try testing.expectEqual(raster.Px{ 0, 0, 255, 255 }, f.canvas.at(10, 0));
 }

@@ -139,6 +139,33 @@ pub const Font = struct {
             mask(cv, clip, gx + shift, gy + @as(i32, @intCast(row)), gl.w, 1, gl.alpha[row * gl.w ..][0..gl.w], color);
         }
     }
+
+    /// Draws glyph `g` turned 90° clockwise (vertical text): its baseline down the line x = `bx`, its pen at
+    /// y = `y`. As `draw` otherwise.
+    pub fn drawTurned(f: *Font, cv: raster.Canvas, clip: raster.Rect, bx: f32, y: f32, g: u32, sx: f32, sy: f32, slant: f32, color: raster.Color) void {
+        const py = @floor(y);
+        const sub: u2 = @intFromFloat(@min(3, @floor((y - py) * 4)));
+        const gl = f.glyph(g, sx, sy, sub) catch return;
+        if (gl.w == 0) return;
+        const area = clip.intersect(cv.bounds()) orelse return;
+        const ox: i32 = @intFromFloat(@round(bx));
+        const oy: i32 = @intFromFloat(py);
+        const p = color.premultiplied();
+        for (0..gl.h) |row| {
+            // Mask point (dx, dy) from the pen goes to (-dy, dx).
+            const dy = gl.y + @as(i32, @intCast(row));
+            const shift: i32 = if (slant == 0) 0 else @intFromFloat(@round(@as(f32, @floatFromInt(-dy)) * slant));
+            const cx = ox - dy;
+            for (0..gl.w) |col| {
+                const m = gl.alpha[row * gl.w + col];
+                if (m == 0) continue;
+                const cy = oy + gl.x + @as(i32, @intCast(col)) + shift;
+                if (!area.contains(cx, cy)) continue;
+                const q = &cv.row(@intCast(cy))[@intCast(cx)];
+                q.* = raster.over(q.*, raster.fade(p, m));
+            }
+        }
+    }
 };
 
 /// Composites `color` through an alpha mask at (x, y).

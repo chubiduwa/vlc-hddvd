@@ -15,13 +15,24 @@
 //! - `input` shows its `state:value` (dots for `password`), `button` and `object` do not show their
 //!   alternative-text `p`.
 //!
-//! The results are each element's `box` and a list of glyph runs. `rl-tb` mirrors the inline direction;
-//! `tb-rl` (vertical text) is laid out like `lr-tb` for now. No VLC dependency.
+//! - writing modes (XSL §7.27.7): each flow is laid out along its inline and block progressions, and a `div`
+//!   with a writing mode of its own starts a new flow on its content rectangle: `rl-tb` lines run right to
+//!   left, `tb-rl` lines are columns from the right, their characters upright or turned by their
+//!   Vertical_Orientation (UAX #50). An orthogonal flow's auto block extent is what its container has left.
+//!   `x`, `y`, `width` and `height` stay region-oriented; `anchor` and the edges are writing-mode relative;
+//! - bidi (UAX #9): a paragraph's base direction is its `direction`, or right to left in `rl-tb`; a `span`
+//!   changing the direction is an embedding; lines are fitted in logical order and drawn in visual order,
+//!   mirrored characters at right-to-left levels.
+//!
+//! The results are each element's `box` and a list of glyph runs. No VLC dependency.
 
 const std = @import("std");
 const dom = @import("../dom.zig");
 const font_mod = @import("../font.zig");
 const raster = @import("../raster.zig");
+const image_mod = @import("../image.zig");
+const bidi = @import("bidi.zig");
+const ucd = @import("ucd.zig");
 const style = @import("style.zig");
 const page_mod = @import("page.zig");
 
@@ -35,10 +46,16 @@ pub const Res = struct {
     /// The font an element's style names (null: none could be loaded; its text is not drawn).
     font: *const fn (ctx: *anyopaque, page: *Page, e: *Elem) ?*Font,
     /// A decoded image by absolute URI.
-    image: *const fn (ctx: *anyopaque, u: []const u8) ?*const raster.Canvas,
+    image: *const fn (ctx: *anyopaque, u: []const u8) ?*image_mod.Image,
 };
 
-pub const Glyph = struct { id: u32, x: f32 };
+pub const Glyph = struct {
+    id: u32,
+    /// Its pen position along the run, from the run's start.
+    x: f32,
+    /// Vertical text: set upright (else turned 90° clockwise, its baseline along the column).
+    upright: bool = false,
+};
 
 /// Glyphs on one line drawn with one element's style.
 pub const Run = struct {
@@ -50,13 +67,22 @@ pub const Run = struct {
     sx: f32,
     sy: f32,
     slant: f32,
+    /// Horizontal text: the baseline's y. Vertical text: the column's centre line's x.
     baseline: f32,
-    /// The line's extent, for inline backgrounds.
+    /// The run's rectangle, for inline backgrounds. Glyphs go right from `x`, or down from `top` when
+    /// `vertical`.
     x: f32,
     w: f32,
     top: f32,
     h: f32,
+    vertical: bool = false,
     glyphs: []Glyph,
+
+    fn move(r: *Run, dx: f32, dy: f32) void {
+        r.x += dx;
+        r.top += dy;
+        r.baseline += if (r.vertical) dx else dy;
+    }
 };
 
 const Rect = struct { x: f32, y: f32, w: f32, h: f32 };
@@ -82,20 +108,101 @@ pub const Layout = struct {
         const b = body orelse return;
         var lc: Ctx = .{ .l = l, .page = page, .res = res, .a = l.arena.allocator() };
         const region: Rect = .{ .x = 0, .y = 0, .w = w, .h = h };
-        _ = lc.block(b, .{ .x = 0, .y = 0, .w = w, .h = h, .ref = region, .rtl = false });
+        _ = lc.block(b, .{ .x = 0, .y = 0, .w = w, .h = h, .cb = h, .ref = region, .fr = .of(region, .@"lr-tb") });
     }
 };
 
-/// Where a block is laid: the containing content box's left and width, the flow position, the height left,
-/// and the reference rectangle for absolutely positioned descendants.
+/// The coordinates of a flow (XSL §7.27.7): `x` along the inline progression and `y` along the block
+/// progression, from the start-before corner of the content rectangle whose writing mode set them.
+const Frame = struct {
+    /// That corner, in region coordinates.
+    ox: f32,
+    oy: f32,
+    mode: style.WritingMode,
+
+    fn vertical(f: Frame) bool {
+        return f.mode == .@"tb-rl";
+    }
+
+    /// The frame of content rectangle `r` (region coordinates) in writing mode `mode`.
+    fn of(r: Rect, mode: style.WritingMode) Frame {
+        return .{ .ox = if (mode == .@"lr-tb") r.x else r.x + r.w, .oy = r.y, .mode = mode };
+    }
+
+    /// Rectangle `r` of the frame in region coordinates.
+    fn box(f: Frame, r: Rect) Rect {
+        return switch (f.mode) {
+            .@"lr-tb" => .{ .x = f.ox + r.x, .y = f.oy + r.y, .w = r.w, .h = r.h },
+            .@"rl-tb" => .{ .x = f.ox - r.x - r.w, .y = f.oy + r.y, .w = r.w, .h = r.h },
+            .@"tb-rl" => .{ .x = f.ox - r.y - r.h, .y = f.oy + r.x, .w = r.h, .h = r.w },
+        };
+    }
+
+    /// Region offset of `d` along the block progression.
+    fn blockStep(f: Frame, d: f32) [2]f32 {
+        return if (f.vertical()) .{ -d, 0 } else .{ 0, d };
+    }
+};
+
+/// Which edge (0 before, 1 end, 2 after, 3 start: the order of the border and padding properties) is on each
+/// side (top, right, bottom, left) in writing mode `mode`.
+pub fn sides(mode: style.WritingMode) [4]usize {
+    return switch (mode) {
+        .@"lr-tb" => .{ 0, 1, 2, 3 },
+        .@"rl-tb" => .{ 0, 3, 2, 1 },
+        .@"tb-rl" => .{ 3, 0, 1, 2 },
+    };
+}
+
+/// Border plus padding on each edge (before, end, after, start); percentages of `base`.
+fn edges(e: *const Elem, base: f32) [4]f32 {
+    var out: [4]f32 = undefined;
+    for (0..4) |i| {
+        const b = e.style.borders[i];
+        const bw: f32 = if (b.style == .solid) b.width else 0;
+        out[i] = bw + e.style.padding[i].resolve(base);
+    }
+    return out;
+}
+
+/// Border plus padding on each side (top, right, bottom, left) of a laid-out element. Padding percentages are
+/// of the containing block's inline progression dimension.
+pub fn physEdges(e: *const Elem) [4]f32 {
+    const sd = sides(e.style.writingMode);
+    const ed = edges(e, if (e.style.writingMode == .@"tb-rl") e.box.cb_h else e.box.cb_w);
+    return .{ ed[sd[0]], ed[sd[1]], ed[sd[2]], ed[sd[3]] };
+}
+
+/// Side widths (top, right, bottom, left) as a frame's (before, end, after, start).
+fn toFrame(p: [4]f32, mode: style.WritingMode) [4]f32 {
+    const sd = sides(mode);
+    var out: [4]f32 = undefined;
+    for (0..4) |j| out[sd[j]] = p[j];
+    return out;
+}
+
+/// The specified width and height (null: auto), percentages of the containing block's `cb_w`×`cb_h`. The
+/// inline and block progression dimensions are the element's own writing mode's.
+fn specSize(e: *const Elem, cb_w: f32, cb_h: f32) [2]?f32 {
+    const s = &e.style;
+    const v = s.writingMode == .@"tb-rl";
+    const w = s.width orelse (if (v) s.blockProgressionDimension else s.inlineProgressionDimension);
+    const h = s.height orelse (if (v) s.inlineProgressionDimension else s.blockProgressionDimension);
+    return .{ if (w) |l| @max(0, l.resolve(cb_w)) else null, if (h) |l| @max(0, l.resolve(cb_h)) else null };
+}
+
+/// Where a block is laid, in frame coordinates: the containing content box's inline start and extent, the
+/// flow position, and the block extent left; the containing block's block extent (percentages); the
+/// reference rectangle for absolutely positioned descendants (region coordinates).
 const Flow = struct {
     x: f32,
     y: f32,
     w: f32,
-    /// Height available below `y` (null: unbounded).
+    /// Block extent available from `y` (null: unbounded).
     h: ?f32,
+    cb: f32,
     ref: Rect,
-    rtl: bool,
+    fr: Frame,
 };
 
 const Ctx = struct {
@@ -104,37 +211,9 @@ const Ctx = struct {
     res: Res,
     a: std.mem.Allocator,
 
-    fn edges(e: *const Elem, cb_w: f32) [4]f32 {
-        // before, end, after, start: border + padding.
-        var out: [4]f32 = undefined;
-        for (0..4) |i| {
-            const b = e.style.borders[i];
-            const bw: f32 = if (b.style == .solid) b.width else 0;
-            out[i] = bw + e.style.padding[i].resolve(cb_w);
-        }
-        return out;
-    }
-
-    fn hide(c: *Ctx, e: *Elem) void {
-        _ = c;
-        e.box.shown = false;
-    }
-
     /// Positioned in the sense of §7.6 "positionable": div, button, object in a block context.
     fn positioned(e: *const Elem) bool {
         return e.style.position != .static and (e.kind == .div or e.kind == .button or e.kind == .object or e.kind == .input or e.kind == .body);
-    }
-
-    /// Specified content width/height, or null for auto.
-    fn specWidth(e: *const Elem, cb_w: f32, vertical: bool) ?f32 {
-        const ipd = e.style.inlineProgressionDimension;
-        const l = (if (vertical) e.style.height else e.style.width) orelse ipd orelse return null;
-        return @max(0, l.resolve(cb_w));
-    }
-
-    fn specHeight(e: *const Elem, cb_h: f32) ?f32 {
-        const l = e.style.height orelse e.style.blockProgressionDimension orelse return null;
-        return @max(0, l.resolve(cb_h));
     }
 
     /// The intrinsic size of an object's image (null if none).
@@ -148,109 +227,165 @@ const Ctx = struct {
         const im = c.res.image(c.res.ctx, u) orelse return null;
         var w: f32 = @floatFromInt(im.w);
         var h: f32 = @floatFromInt(im.h);
-        if (e.style.crop) |cr| {
+        // Crop does not apply to an MNG object (§7.6.3.3.2.19).
+        if (e.style.crop) |cr| if (!std.mem.eql(u8, t, "image/mng")) {
             w = @floatFromInt(@min(cr[2], im.w) -| cr[0]);
             h = @floatFromInt(@min(cr[3], im.h) -| cr[1]);
-        }
+        };
         return .{ w, h };
     }
 
-    /// Lays out block-level element `e` in flow `f`; returns the height it takes in the flow.
+    /// Lays out block-level element `e` in flow `f`; returns the block extent it takes in the flow.
     fn block(c: *Ctx, e: *Elem, f: Flow) f32 {
         if (!e.style.display) return 0;
-        e.box.cb_w = f.w;
-        e.box.cb_h = f.h orelse f.ref.h;
+        const fv = f.fr.vertical();
+        e.box.cb_w = if (fv) f.cb else f.w;
+        e.box.cb_h = if (fv) f.w else f.cb;
         if (e.style.position == .absolute and positioned(e)) {
-            c.absolute(e, f.ref, f.rtl);
+            c.absolute(e, f.ref);
             return 0;
         }
-        const ed = edges(e, f.w);
+        const mode = e.style.writingMode;
+        const ed = toFrame(physEdges(e), f.fr.mode);
         const start_i = e.style.startIndent.resolve(f.w);
         const end_i = e.style.endIndent.resolve(f.w);
-        const auto_w = @max(0, f.w - start_i - end_i - ed[1] - ed[3]);
-        var cw = specWidth(e, f.w, false) orelse auto_w;
-        if (specWidth(e, f.w, false) == null) if (c.intrinsic(e)) |sz| {
-            cw = sz[0];
-        };
-        const outer_w = cw + ed[1] + ed[3];
-        const x = if (f.rtl) f.x + f.w - start_i - outer_w else f.x + start_i;
-        const spec_h = specHeight(e, e.box.cb_h) orelse if (c.intrinsic(e)) |sz| sz[1] else null;
-        e.box.x = x;
-        e.box.y = f.y;
-        e.box.w = outer_w;
+        // Sizes along the frame's inline (lw) and block (lh) progressions.
+        const sz = specSize(e, e.box.cb_w, e.box.cb_h);
+        const intr: ?[2]f32 = if (c.intrinsic(e)) |s| (if (fv) .{ s[1], s[0] } else s) else null;
+        const lw = (if (fv) sz[1] else sz[0]) orelse if (intr) |s| s[0] else @max(0, f.w - start_i - end_i - ed[1] - ed[3]);
+        var spec_lh = (if (fv) sz[0] else sz[1]) orelse if (intr) |s| s[1] else null;
+        const orth = (mode == .@"tb-rl") != fv;
+        // A flow orthogonal to its container's takes the block extent left (XSL leaves it to the processor).
+        if (orth and spec_lh == null) spec_lh = @max(0, (f.h orelse f.cb) - ed[0] - ed[2]);
+        const u = f.x + start_i;
+        const outer_w = lw + ed[1] + ed[3];
         e.box.shown = true;
-        const inner: Rect = .{ .x = x + (if (f.rtl) ed[1] else ed[3]), .y = f.y + ed[0], .w = cw, .h = spec_h orelse 0 };
-        const ref = if (positioned(e)) inner else f.ref;
-        // Text stops at the height the box has, or what is left of its container's (§7.3.2.4).
-        const avail = if (spec_h) |sh| sh else if (f.h) |fh| @max(0, fh - ed[0] - ed[2]) else null;
-        const ch = c.content(e, inner, avail, ref, f.rtl or e.style.writingMode == .@"rl-tb");
-        const h = spec_h orelse ch;
-        e.box.h = h + ed[0] + ed[2];
-        if (spec_h) |sh| c.alignContent(e, sh - ch);
-        if (e.style.position == .relative and positioned(e)) {
-            const dx = (e.style.x orelse style.Len.px(0)).resolve(f.w);
-            const dy = (e.style.y orelse style.Len.px(0)).resolve(e.box.cb_h);
-            c.shift(e, if (f.rtl) -dx else dx, dy);
+        c.place(e, f.fr.box(.{ .x = u, .y = f.y, .w = outer_w, .h = (spec_lh orelse 0) + ed[0] + ed[2] }));
+        const inner: Rect = .{ .x = u + ed[3], .y = f.y + ed[0], .w = lw, .h = spec_lh orelse 0 };
+        const phys_inner = f.fr.box(inner);
+        const ref = if (positioned(e)) phys_inner else f.ref;
+        // Text stops at the extent the box has, or what is left of its container's (§7.3.2.4).
+        const avail = spec_lh orelse if (f.h) |fh| @max(0, fh - ed[0] - ed[2]) else null;
+        var ch: f32 = undefined;
+        var slack: f32 = 0;
+        var content_fr = f.fr;
+        if (mode == f.fr.mode) {
+            ch = c.content(e, inner, avail, ref, f.fr);
+            if (spec_lh) |sh| slack = sh - ch;
+        } else {
+            // A writing mode of its own: a frame on its content rectangle.
+            content_fr = .of(phys_inner, mode);
+            const v2 = mode == .@"tb-rl";
+            const lw2 = if (v2) phys_inner.h else phys_inner.w;
+            const lh2: ?f32 = if (orth) (if (v2) phys_inner.w else phys_inner.h) else avail;
+            const ch2 = c.content(e, .{ .x = 0, .y = 0, .w = lw2, .h = lh2 orelse 0 }, lh2, ref, content_fr);
+            ch = if (orth) spec_lh.? else ch2;
+            if (orth) slack = lh2.? - ch2 else if (spec_lh) |sh| slack = sh - ch2;
         }
-        return e.box.h;
+        const h = (spec_lh orelse ch) + ed[0] + ed[2];
+        c.place(e, f.fr.box(.{ .x = u, .y = f.y, .w = outer_w, .h = h }));
+        c.alignContent(e, slack, content_fr);
+        if (e.style.position == .relative and positioned(e)) {
+            // x and y are region-oriented (left and top, §7.6.3.3.2.61–62).
+            const dx = (e.style.x orelse style.Len.px(0)).resolve(e.box.cb_w);
+            const dy = (e.style.y orelse style.Len.px(0)).resolve(e.box.cb_h);
+            c.shift(e, dx, dy);
+        }
+        return h;
     }
 
-    /// Absolutely positioned `e` in reference rectangle `ref` (§7.6.3.3.2.1 anchor).
-    fn absolute(c: *Ctx, e: *Elem, ref: Rect, rtl: bool) void {
-        const ed = edges(e, ref.w);
-        const x = (e.style.x orelse style.Len.px(0)).resolve(ref.w);
-        const y = (e.style.y orelse style.Len.px(0)).resolve(ref.h);
-        const intr = c.intrinsic(e);
-        const W = specWidth(e, ref.w, false) orelse if (intr) |sz| sz[0] else @max(0, ref.w - x - ed[1] - ed[3]);
-        const spec_h = specHeight(e, ref.h) orelse if (intr) |sz| sz[1] else null;
+    fn place(_: *Ctx, e: *Elem, r: Rect) void {
+        e.box.x = r.x;
+        e.box.y = r.y;
+        e.box.w = r.w;
+        e.box.h = r.h;
+    }
+
+    /// Absolutely positioned `e` in reference rectangle `ref` (§7.6.3.3.2.1): (x, y) is a point of the
+    /// reference rectangle, and `anchor` names the point of the element put there, relative to its
+    /// container's writing mode (start/end along the inline progression, before/after along the block
+    /// progression). Its content is laid out in its own writing mode.
+    fn absolute(c: *Ctx, e: *Elem, ref: Rect) void {
+        const s = &e.style;
+        const mode = s.writingMode;
+        const v = mode == .@"tb-rl";
         e.box.cb_w = ref.w;
         e.box.cb_h = ref.h;
         e.box.shown = true;
-        // Lay the content first when the height is not given (the anchor needs it).
-        var H = spec_h orelse 0;
-        const inner_rtl = rtl or e.style.writingMode == .@"rl-tb";
-        if (spec_h == null) {
-            e.box.x = 0;
-            e.box.y = 0;
+        const pe = physEdges(e);
+        const x = (s.x orelse style.Len.px(0)).resolve(ref.w);
+        const y = (s.y orelse style.Len.px(0)).resolve(ref.h);
+        const sz = specSize(e, ref.w, ref.h);
+        const intr = c.intrinsic(e);
+        var W: ?f32 = sz[0] orelse if (intr) |i| i[0] else null;
+        var H: ?f32 = sz[1] orelse if (intr) |i| i[1] else null;
+        const f = anchorFactors(s.anchor, if (e.parent) |q| q.style.writingMode else .@"lr-tb");
+        // An auto inline extent: the room the reference rectangle has where the anchor makes the box extend.
+        if (!v and W == null) W = @max(0, room(f[0], x, ref.w) - pe[1] - pe[3]);
+        if (v and H == null) H = @max(0, room(f[1], y, ref.h) - pe[0] - pe[2]);
+        const lw = if (v) H.? else W.?;
+        const given_lh = if (v) W else H;
+        // An auto block extent is the content's: laid out once to measure it.
+        const lh = given_lh orelse blk: {
             const before = c.l.runs.items.len;
-            const ch = c.content(e, .{ .x = 0, .y = 0, .w = W, .h = 0 }, null, .{ .x = 0, .y = 0, .w = W, .h = 0 }, inner_rtl);
-            H = ch;
-            // Undo: laid again at the right place below.
+            const zero: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            const ch = c.content(e, .{ .x = 0, .y = 0, .w = lw, .h = 0 }, null, zero, .of(zero, mode));
             c.l.runs.shrinkRetainingCapacity(before);
-        }
-        const a = e.style.anchor;
-        const ix: f32 = switch (a) {
-            .startBefore, .startCenter, .startAfter => x,
-            .centerBefore, .center, .centerAfter => x - (W / 2 + ed[3]),
-            .endBefore, .endCenter, .endAfter => x - (W + ed[1] + ed[3]),
+            break :blk ch;
         };
-        const iy: f32 = switch (a) {
-            .startBefore, .centerBefore, .endBefore => y,
-            .startCenter, .center, .endCenter => y - (H / 2 + ed[0]),
-            .startAfter, .centerAfter, .endAfter => y - (H + ed[0] + ed[2]),
-        };
-        const outer_w = W + ed[1] + ed[3];
-        e.box.x = if (rtl) ref.x + ref.w - ix - outer_w else ref.x + ix;
-        e.box.y = ref.y + iy;
-        e.box.w = outer_w;
-        e.box.h = H + ed[0] + ed[2];
-        const inner: Rect = .{ .x = e.box.x + (if (rtl) ed[1] else ed[3]), .y = e.box.y + ed[0], .w = W, .h = H };
-        const ch = c.content(e, inner, spec_h, inner, inner_rtl);
-        if (spec_h) |sh| c.alignContent(e, sh - ch);
+        if (v) W = lh else H = lh;
+        e.box.x = ref.x + x - offset(f[0], W.?, pe[3], pe[1]);
+        e.box.y = ref.y + y - offset(f[1], H.?, pe[0], pe[2]);
+        e.box.w = W.? + pe[1] + pe[3];
+        e.box.h = H.? + pe[0] + pe[2];
+        const inner: Rect = .{ .x = e.box.x + pe[3], .y = e.box.y + pe[0], .w = W.?, .h = H.? };
+        const fr: Frame = .of(inner, mode);
+        const ch = c.content(e, .{ .x = 0, .y = 0, .w = lw, .h = lh }, given_lh, inner, fr);
+        if (given_lh) |g| c.alignContent(e, g - ch, fr);
     }
 
-    /// Lays out the content of `e` in its content rectangle; returns the content height.
-    fn content(c: *Ctx, e: *Elem, box: Rect, avail_h: ?f32, ref: Rect, rtl: bool) f32 {
+    fn room(f: f32, at: f32, size: f32) f32 {
+        return if (f == 0) size - at else if (f == 1) at else 2 * @min(at, size - at);
+    }
+
+    /// Where along a side the anchor point is: 0 the left/top outer edge, 1 the right/bottom one, ½ the
+    /// content's centre (Table 7.6.3.3.2.1-1).
+    fn offset(f: f32, size: f32, e0: f32, e1: f32) f32 {
+        return if (f == 0) 0 else if (f == 1) size + e0 + e1 else size / 2 + e0;
+    }
+
+    /// The anchor as fractions across (x) and down (y) in writing mode `mode`.
+    fn anchorFactors(a: style.Anchor, mode: style.WritingMode) [2]f32 {
+        const s: f32 = switch (a) {
+            .startBefore, .startCenter, .startAfter => 0,
+            .centerBefore, .center, .centerAfter => 0.5,
+            .endBefore, .endCenter, .endAfter => 1,
+        };
+        const b: f32 = switch (a) {
+            .startBefore, .centerBefore, .endBefore => 0,
+            .startCenter, .center, .endCenter => 0.5,
+            .startAfter, .centerAfter, .endAfter => 1,
+        };
+        return switch (mode) {
+            .@"lr-tb" => .{ s, b },
+            .@"rl-tb" => .{ 1 - s, b },
+            .@"tb-rl" => .{ 1 - b, s },
+        };
+    }
+
+    /// Lays out the content of `e` in its content rectangle `box` (frame coordinates); returns the content's
+    /// block extent. `ref` is for absolutely positioned descendants.
+    fn content(c: *Ctx, e: *Elem, box: Rect, avail_h: ?f32, ref: Rect, fr: Frame) f32 {
         switch (e.kind) {
-            .p, .span => return c.paragraph(e, box, avail_h, rtl, null),
+            .p, .span => return c.paragraph(e, box, avail_h, fr, null),
             .input => {
                 if (std.mem.eql(u8, e.node.attr("mode") orelse "", "password")) {
                     var dots: std.ArrayList(u8) = .empty;
                     const n = std.unicode.utf8CountCodepoints(e.state.value) catch e.state.value.len;
                     for (0..n) |_| dots.appendSlice(c.a, "\u{2022}") catch break;
-                    return c.paragraph(e, box, avail_h, rtl, dots.items);
+                    return c.paragraph(e, box, avail_h, fr, dots.items);
                 }
-                return c.paragraph(e, box, avail_h, rtl, e.state.value);
+                return c.paragraph(e, box, avail_h, fr, e.state.value);
             },
             .button, .br => return 0, // a button's p is alternative text
             .object => {
@@ -268,11 +403,12 @@ const Ctx = struct {
             if (k == null) continue; // text in a div is not allowed; foreign elements are skipped
             const child = Page.elemOf(n) orelse continue;
             if (k == .span or k == .br) {
-                y += c.paragraph(child, .{ .x = box.x, .y = y, .w = box.w, .h = 0 }, null, rtl, null);
+                y += c.paragraph(child, .{ .x = box.x, .y = y, .w = box.w, .h = 0 }, null, fr, null);
                 continue;
             }
             const left = if (avail_h) |h| @max(0, h - (y - box.y)) else null;
-            y += c.block(child, .{ .x = box.x, .y = y, .w = box.w, .h = left, .ref = ref, .rtl = rtl });
+            const cb = left orelse if (fr.vertical()) ref.w else ref.h;
+            y += c.block(child, .{ .x = box.x, .y = y, .w = box.w, .h = left, .cb = cb, .ref = ref, .fr = fr });
         }
         return y - box.y;
     }
@@ -298,31 +434,28 @@ const Ctx = struct {
             elems[i].box.x += dx;
             elems[i].box.y += dy;
         }
-        for (c.l.runs.items) |*r| if (r.block == e or isDescendant(r.block, e)) {
-            r.x += dx;
-            r.baseline += dy;
-            r.top += dy;
-        };
+        for (c.l.runs.items) |*r| if (r.block == e or isDescendant(r.block, e)) r.move(dx, dy);
     }
 
-    /// displayAlign: moves the content of a box with a given height (`slack` left over).
-    fn alignContent(c: *Ctx, e: *Elem, slack: f32) void {
+    /// displayAlign: moves the content of a box with a given block extent (`slack` left over) along the
+    /// block progression of frame `fr`.
+    fn alignContent(c: *Ctx, e: *Elem, slack: f32, fr: Frame) void {
         if (slack <= 0) return;
-        const dy = switch (e.style.displayAlign) {
+        const d = fr.blockStep(switch (e.style.displayAlign) {
             .auto, .before => return,
             .center => slack / 2,
             .after => slack,
-        };
+        });
         const elems = c.page.elems.items;
         var i: usize = e.index + 1;
         while (i < elems.len and isDescendant(elems[i], e)) : (i += 1) {
             // Absolutely positioned descendants keep their place.
-            if (elems[i].style.position != .absolute) elems[i].box.y += dy;
+            if (elems[i].style.position != .absolute) {
+                elems[i].box.x += d[0];
+                elems[i].box.y += d[1];
+            }
         }
-        for (c.l.runs.items) |*r| if (r.block == e or isDescendant(r.block, e)) {
-            r.baseline += dy;
-            r.top += dy;
-        };
+        for (c.l.runs.items) |*r| if (r.block == e or isDescendant(r.block, e)) r.move(d[0], d[1]);
     }
 
     // ---- paragraphs -----------------------------------------------------------------------------------------
@@ -333,15 +466,24 @@ const Ctx = struct {
         elem: *Elem,
         font: ?*Font,
         glyph: u32 = 0,
+        /// Advance along the line, and kerning before the next item when they are side by side.
         adv: f32 = 0,
+        kern: f32 = 0,
+        /// Bidi embedding level.
+        level: u8 = 0,
+        /// Vertical text: set upright.
+        upright: bool = false,
         /// An inline box (button, input, object) instead of a character.
         inline_box: ?*Elem = null,
     };
 
-    /// Lays out inline content as lines: the text of `e` (or `text` instead, for inputs). Returns the height.
-    fn paragraph(c: *Ctx, e: *Elem, box: Rect, avail_h: ?f32, rtl_in: bool, text: ?[]const u8) f32 {
+    /// Lays out inline content as lines: the text of `e` (or `text` instead, for inputs). Returns the block
+    /// extent.
+    fn paragraph(c: *Ctx, e: *Elem, box: Rect, avail_h: ?f32, fr: Frame, text: ?[]const u8) f32 {
         const s = &e.style;
-        const rtl = rtl_in or s.rtl;
+        const vertical = fr.vertical();
+        // The base direction: `direction`, or right to left in rl-tb (XSL §7.27.1, §7.27.7).
+        const para: u1 = if (s.rtl or s.writingMode == .@"rl-tb") 1 else 0;
         var items: std.ArrayList(Item) = .empty;
         if (text) |t| {
             c.addText(&items, e, t, true);
@@ -353,31 +495,47 @@ const Ctx = struct {
         }
         const single = text != null and !std.mem.eql(u8, e.node.attr("mode") orelse "singleline", "multiline");
         const wrap = s.wrap and !single;
+        c.bidiLevels(items.items, para);
 
         // Measure.
         for (items.items) |*it| {
             if (it.inline_box) |b| {
-                const w = specWidth(b, box.w, false) orelse if (c.intrinsic(b)) |sz| sz[0] else 0;
-                const ed = edges(b, box.w);
-                it.adv = w + ed[1] + ed[3];
+                it.adv = if (vertical) b.box.h else b.box.w;
+                continue;
+            }
+            if (bidi.isControl(it.cp)) {
+                it.font = null;
                 continue;
             }
             const f = it.font orelse continue;
-            it.glyph = f.glyphIndex(it.cp);
-            it.adv = f.advance(it.glyph, it.elem.style.fontSize[0]);
+            // Mirrored characters at right-to-left levels (UAX #9 L4), if the font has the mirror.
+            var cp = it.cp;
+            if (it.level & 1 == 1) if (bidi.mirror(cp)) |m| if (f.glyphIndex(m) != 0) {
+                cp = m;
+            };
+            it.glyph = f.glyphIndex(cp);
+            it.upright = vertical and isUpright(it.cp);
+            const st = &it.elem.style;
+            it.adv = if (it.upright) blk: {
+                const vm = f.vmetrics(st.fontSize[1]);
+                break :blk vm.ascent + vm.descent;
+            } else f.advance(it.glyph, st.fontSize[0]);
         }
-        for (items.items, 0..) |*it, i| {
-            if (i == 0 or it.inline_box != null) continue;
-            const prev = items.items[i - 1];
+        // Kerning (the 'kern' pairs are in visual order).
+        for (items.items[1..], 1..) |it, i| {
+            const prev = &items.items[i - 1];
             const f = it.font orelse continue;
-            if (prev.font == f and prev.elem == it.elem) it.adv += 0; // kerning goes on the previous glyph:
-            if (prev.font == f and prev.inline_box == null) items.items[i - 1].adv += f.kern(prev.glyph, it.glyph, it.elem.style.fontSize[0]);
+            if (prev.font != f or prev.inline_box != null or prev.level != it.level or prev.upright or it.upright) continue;
+            const size = it.elem.style.fontSize[0];
+            prev.kern = if (it.level & 1 == 0) f.kern(prev.glyph, it.glyph, size) else f.kern(it.glyph, prev.glyph, size);
         }
 
         // Fit and stack lines.
         var y = box.y;
         var i: usize = 0;
         var first = true;
+        // Lines start on the other side of the frame when the paragraph's direction is the opposite one.
+        const flip = (para == 1) != (fr.mode == .@"rl-tb");
         while (i < items.items.len) {
             // 1. Leading white space is dropped on every line.
             while (i < items.items.len and isSpace(items.items[i].cp) and !isMandatory(items.items[i].cp)) i += 1;
@@ -407,25 +565,25 @@ const Ctx = struct {
                     }
                     break;
                 }
-                w += it.adv;
+                w += it.adv + it.kern;
             }
             // Trailing white space neither shows nor counts for alignment.
             var vis_end = end;
             while (vis_end > i and isSpace(items.items[vis_end - 1].cp)) vis_end -= 1;
             const line = items.items[i..vis_end];
-            const m = c.lineMetrics(e, line);
-            // §7.3.2.4: a line that does not fit in the height left ends the paragraph.
+            const m = c.lineMetrics(e, line, vertical);
+            // §7.3.2.4: a line that does not fit in the extent left ends the paragraph.
             if (avail_h) |ah| if (y - box.y + m.h > ah + 0.01) break;
             var lw: f32 = 0;
-            for (line) |it| lw += it.adv;
+            for (line, 0..) |it, k| lw += it.adv + (if (k + 1 < line.len) it.kern else 0);
             const slack = @max(0, limit - lw);
             const align_off: f32 = switch (s.textAlign) {
                 .start => 0,
                 .center => slack / 2,
                 .end => slack,
             };
-            const x0 = if (rtl) box.x + box.w - indent - align_off - lw else box.x + indent + align_off;
-            c.emitLine(e, line, x0, y, m, rtl);
+            const start_u = if (flip) box.x + box.w - indent - align_off - lw else box.x + indent + align_off;
+            c.emitLine(e, line, fr.box(.{ .x = start_u, .y = y, .w = lw, .h = m.h }), m, vertical, para);
             y += m.h;
             i = next;
             first = false;
@@ -433,9 +591,26 @@ const Ctx = struct {
         return y - box.y;
     }
 
+    /// The bidi levels of a paragraph's items (UAX #9; a U+2029 ends a bidi paragraph).
+    fn bidiLevels(c: *Ctx, items: []Item, para: u1) void {
+        const n = items.len;
+        const cps = c.a.alloc(u21, n) catch return;
+        const lv = c.a.alloc(u8, n) catch return;
+        for (items, cps) |it, *cp| cp.* = it.cp;
+        var start: usize = 0;
+        for (0..n + 1) |i| {
+            if (i < n and cps[i] != 0x2029) continue;
+            const end = if (i < n) i + 1 else n;
+            bidi.resolve(c.a, cps[start..end], para, lv[start..end]) catch @memset(lv[start..end], para);
+            start = end;
+        }
+        for (items, lv) |*it, l| it.level = l;
+    }
+
     const LineMetrics = struct { h: f32, baseline: f32 };
 
-    fn lineMetrics(c: *Ctx, block_elem: *Elem, line: []const Item) LineMetrics {
+    /// A line's extent along the block progression, and its baseline from its before edge (horizontal text).
+    fn lineMetrics(c: *Ctx, block_elem: *Elem, line: []const Item, vertical: bool) LineMetrics {
         _ = c;
         var asc: f32 = 0;
         var desc: f32 = 0;
@@ -458,36 +633,58 @@ const Ctx = struct {
             desc = block_elem.style.fontSize[1] * 0.2;
         }
         for (line) |it| if (it.inline_box) |b| {
-            asc = @max(asc, b.box.h);
+            asc = @max(asc, if (vertical) b.box.w else b.box.h);
         };
         const natural = asc + desc + gap;
         const h = block_elem.style.lineHeight orelse natural;
         return .{ .h = h, .baseline = (h - (asc + desc)) / 2 + asc };
     }
 
-    fn emitLine(c: *Ctx, block_elem: *Elem, line: []const Item, x0: f32, top: f32, m: LineMetrics, rtl: bool) void {
-        _ = rtl;
-        var x = x0;
+    /// Emits a line's runs in visual order (UAX #9 L2) in its rectangle `r` (region coordinates): from the left,
+    /// or from the top in vertical text, where each column is centred on its middle.
+    fn emitLine(c: *Ctx, block_elem: *Elem, line: []const Item, r: Rect, m: LineMetrics, vertical: bool, para: u1) void {
+        const n = line.len;
+        const order = c.a.alloc(usize, n) catch return;
+        const cps = c.a.alloc(u21, n) catch return;
+        const lv = c.a.alloc(u8, n) catch return;
+        for (line, cps, lv) |it, *cp, *l| {
+            cp.* = it.cp;
+            l.* = it.level;
+        }
+        bidi.reorder(c.a, cps, lv, para, 0, n, order) catch for (order, 0..) |*o, k| {
+            o.* = k;
+        };
+        const kernAfter = struct {
+            fn f(ln: []const Item, ord: []const usize, k: usize) f32 {
+                if (k + 1 >= ord.len) return 0;
+                const a = ord[k];
+                const b = ord[k + 1];
+                return if (b == a + 1) ln[a].kern else if (a == b + 1) ln[b].kern else 0;
+            }
+        }.f;
+        var pen: f32 = 0;
         var k: usize = 0;
-        while (k < line.len) {
-            const it = line[k];
+        while (k < n) {
+            const it = line[order[k]];
             if (it.inline_box) |b| {
-                c.inlineBox(b, x, top + m.baseline);
-                x += it.adv;
+                if (vertical) c.inlineBox(b, r.x + (r.w - b.box.w) / 2, r.y + pen) else c.inlineBox(b, r.x + pen, r.y + m.baseline - b.box.h);
+                pen += it.adv + kernAfter(line, order, k);
                 k += 1;
                 continue;
             }
             const f = it.font orelse {
-                x += it.adv;
+                pen += it.adv;
                 k += 1;
                 continue;
             };
-            // A run: consecutive glyphs of the same element and font.
+            // A run: glyphs side by side of the same element and font.
             var glyphs: std.ArrayList(Glyph) = .empty;
-            const start_x = x;
-            while (k < line.len and line[k].inline_box == null and line[k].elem == it.elem and line[k].font == f) : (k += 1) {
-                glyphs.append(c.a, .{ .id = line[k].glyph, .x = x - start_x }) catch {};
-                x += line[k].adv;
+            const start = pen;
+            while (k < n) : (k += 1) {
+                const x = line[order[k]];
+                if (x.inline_box != null or x.elem != it.elem or x.font != f) break;
+                glyphs.append(c.a, .{ .id = x.glyph, .x = pen - start, .upright = x.upright }) catch {};
+                pen += x.adv + kernAfter(line, order, k);
             }
             const st = &it.elem.style;
             const slant: f32 = switch (st.fontStyle) {
@@ -502,25 +699,29 @@ const Ctx = struct {
                 .sx = st.fontSize[0],
                 .sy = st.fontSize[1],
                 .slant = slant,
-                .baseline = top + m.baseline,
-                .x = start_x,
-                .w = x - start_x,
-                .top = top,
-                .h = m.h,
+                .baseline = if (vertical) r.x + r.w / 2 else r.y + m.baseline,
+                .x = if (vertical) r.x else r.x + start,
+                .w = if (vertical) r.w else pen - start,
+                .top = if (vertical) r.y + start else r.y,
+                .h = if (vertical) pen - start else r.h,
+                .vertical = vertical,
                 .glyphs = glyphs.items,
             }) catch {};
         }
     }
 
-    /// A button, input or object in a line: its bottom on the baseline.
-    fn inlineBox(c: *Ctx, b: *Elem, x: f32, baseline: f32) void {
+    /// A button, input or object in a line, its border rectangle's top left at (x, y).
+    fn inlineBox(c: *Ctx, b: *Elem, x: f32, y: f32) void {
         b.box.x = x;
-        b.box.y = baseline - b.box.h;
+        b.box.y = y;
         b.box.shown = true;
-        const ed = edges(b, b.box.cb_w);
-        const content_box: Rect = .{ .x = x + ed[3], .y = b.box.y + ed[0], .w = b.box.w - ed[1] - ed[3], .h = b.box.h - ed[0] - ed[2] };
-        const ch = c.content(b, content_box, content_box.h, content_box, false);
-        c.alignContent(b, content_box.h - ch);
+        const pe = physEdges(b);
+        const inner: Rect = .{ .x = x + pe[3], .y = y + pe[0], .w = b.box.w - pe[1] - pe[3], .h = b.box.h - pe[0] - pe[2] };
+        const fr: Frame = .of(inner, b.style.writingMode);
+        const lw = if (fr.vertical()) inner.h else inner.w;
+        const lh = if (fr.vertical()) inner.w else inner.h;
+        const ch = c.content(b, .{ .x = 0, .y = 0, .w = lw, .h = lh }, lh, inner, fr);
+        c.alignContent(b, lh - ch, fr);
     }
 
     /// Inline items of a node inside paragraph `p`.
@@ -537,20 +738,26 @@ const Ctx = struct {
         switch (e.kind) {
             .br => items.append(c.a, .{ .cp = 0x2028, .elem = e, .font = null }) catch {},
             .span => {
+                // A span changing the direction is an embedding (as XSL's fo:bidi-override with unicode-bidi embed).
+                const embed = if (e.parent) |q| q.style.rtl != e.style.rtl else false;
+                if (embed) items.append(c.a, .{ .cp = if (e.style.rtl) 0x202B else 0x202A, .elem = e, .font = null }) catch {};
                 if (e.style.breakBefore) items.append(c.a, .{ .cp = 0x2028, .elem = e, .font = null }) catch {};
                 var ch = e.node.first;
                 while (ch) |n| : (ch = n.next) c.collectNode(items, n, e);
                 if (e.style.breakAfter) items.append(c.a, .{ .cp = 0x2028, .elem = e, .font = null }) catch {};
+                if (embed) items.append(c.a, .{ .cp = 0x202C, .elem = e, .font = null }) catch {};
             },
             .button, .input, .object => {
                 // Its size first (inline boxes are not positioned).
                 e.box.cb_w = 0;
-                const ed = edges(e, 0);
+                e.box.cb_h = 0;
+                const pe = physEdges(e);
                 const intr = c.intrinsic(e);
-                const w = specWidth(e, 0, false) orelse if (intr) |sz| sz[0] else 0;
-                const h = specHeight(e, 0) orelse if (intr) |sz| sz[1] else e.style.fontSize[1];
-                e.box.w = w + ed[1] + ed[3];
-                e.box.h = h + ed[0] + ed[2];
+                const sz = specSize(e, 0, 0);
+                const w = sz[0] orelse if (intr) |i| i[0] else 0;
+                const h = sz[1] orelse if (intr) |i| i[1] else e.style.fontSize[1];
+                e.box.w = w + pe[1] + pe[3];
+                e.box.h = h + pe[0] + pe[2];
                 items.append(c.a, .{ .cp = 0xFFFC, .elem = e, .font = null, .inline_box = e }) catch {};
             },
             else => {},
@@ -632,6 +839,18 @@ fn isMandatory(cp: u21) bool {
     return cp == 0x2028 or cp == 0x2029;
 }
 
+/// Set upright in vertical text (Vertical_Orientation U or Tu, UAX #50; the XSL `auto` glyph orientation).
+fn isUpright(cp: u21) bool {
+    const t = &ucd.upright;
+    var lo: usize = 0;
+    var hi: usize = t.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (cp < t[mid].lo) hi = mid else if (cp > t[mid].hi) lo = mid + 1 else return true;
+    }
+    return false;
+}
+
 /// Break opportunities (§7.3.2.3.1.2): white space, CJK, object replacement.
 fn isBreak(cp: u21) bool {
     return isSpace(cp) or (cp >= 0x2E80 and cp <= 0xA4CF) or cp == 0xFFFC;
@@ -701,6 +920,8 @@ pub fn inArea(e: *const Elem, px: f32, py: f32) bool {
 // ---- tests --------------------------------------------------------------------------------------------------
 
 const testing = std.testing;
+const planes = @import("../planes.zig");
+const paint_mod = @import("paint.zig");
 
 const TestRes = struct {
     font: *Font,
@@ -709,7 +930,7 @@ const TestRes = struct {
         const self: *TestRes = @ptrCast(@alignCast(ctx));
         return self.font;
     }
-    fn image(_: *anyopaque, _: []const u8) ?*const raster.Canvas {
+    fn image(_: *anyopaque, _: []const u8) ?*image_mod.Image {
         return null;
     }
     fn res(self: *TestRes) Res {
@@ -839,6 +1060,117 @@ test "input values, preserved space, br and spans" {
     try testing.expectEqual(el(p, "s"), runs[3].elem); // the span's run, at its size
     try testing.expectEqual(@as(f32, 50), runs[3].sy);
     try testing.expectEqual(@as(f32, 60), runs[3].x);
+}
+
+test "writing modes: rl-tb flow, anchors and edges" {
+    const p = try testPage(head ++
+        \\<div id="r" style:position="absolute" style:x="100px" style:y="0px" style:width="200px" style:height="100px" style:writingMode="rl-tb">
+        \\ <div id="b" style:height="10px" style:width="50px" style:startIndent="5px" style:borderStart="1px solid red"/>
+        \\ <div id="c" style:position="absolute" style:x="150px" style:y="20px" style:width="40px" style:height="10px"/>
+        \\ <div id="d" style:position="relative" style:x="3px" style:height="10px" style:width="10px"/>
+        \\</div></body></root>
+    );
+    defer p.destroy();
+    var lay = Layout.init(testing.allocator);
+    defer lay.deinit();
+    var tr: TestRes = .{ .font = undefined };
+    lay.run(p, tr.res(), 1920, 1080);
+    // Placed by the body's (lr-tb) anchor; its own content runs right to left.
+    try testing.expectEqual(@as(f32, 100), el(p, "r").box.x);
+    // b: 5px from the right, its start border on the right.
+    try testing.expectEqual(@as(f32, 300 - 5 - 51), el(p, "b").box.x);
+    try testing.expectEqual(@as(f32, 0), physEdges(el(p, "b"))[3]);
+    try testing.expectEqual(@as(f32, 1), physEdges(el(p, "b"))[1]);
+    // c: startBefore in rl-tb is its top right corner, at (150, 20).
+    try testing.expectEqual(@as(f32, 100 + 150 - 40), el(p, "c").box.x);
+    try testing.expectEqual(@as(f32, 20), el(p, "c").box.y);
+    // d: at the start (right), then shifted 3px right (x is region-oriented).
+    try testing.expectEqual(@as(f32, 300 - 10 + 3), el(p, "d").box.x);
+    try testing.expectEqual(@as(f32, 10), el(p, "d").box.y);
+}
+
+test "writing modes: tb-rl columns, upright and turned glyphs" {
+    const gpa = testing.allocator;
+    const bytes = try font_mod.testFont(gpa);
+    defer gpa.free(bytes);
+    const f = try Font.create(gpa, bytes);
+    defer f.destroy();
+    var tr: TestRes = .{ .font = f };
+    const p = try testPage(head ++
+        \\<div id="v" style:position="absolute" style:x="0px" style:y="0px" style:width="300px" style:height="400px" style:writingMode="tb-rl">
+        \\ <p id="p" style:fontSize="100px">AA あ</p>
+        \\ <div id="d" style:width="20px" style:height="30px"/>
+        \\ <div id="e" style:width="20px" style:height="30px" style:displayAlign="after" style:writingMode="lr-tb"/>
+        \\</div></body></root>
+    );
+    defer p.destroy();
+    var lay = Layout.init(gpa);
+    defer lay.deinit();
+    lay.run(p, tr.res(), 1920, 1080);
+    // The paragraph is the first column, on the right: 100px wide (ascent + descent).
+    const pp = el(p, "p");
+    try testing.expectEqual(@as(f32, 200), pp.box.x);
+    try testing.expectEqual(@as(f32, 100), pp.box.w);
+    const runs = lay.runs.items;
+    try testing.expectEqual(1, runs.len);
+    const r = runs[0];
+    try testing.expect(r.vertical);
+    try testing.expectEqual(@as(f32, 250), r.baseline); // the column's centre line
+    try testing.expectEqual(@as(f32, 0), r.top);
+    // A, A turned (60px each), the space (25px), then the hiragana upright (100px).
+    try testing.expectEqual(4, r.glyphs.len);
+    try testing.expect(!r.glyphs[0].upright and r.glyphs[3].upright);
+    try testing.expectEqual(@as(f32, 145), r.glyphs[3].x);
+    try testing.expectEqual(@as(f32, 245), r.h);
+    // The next block is the next column to the left: width is its block extent, height its inline one.
+    const d = el(p, "d");
+    try testing.expectEqual(@as(f32, 180), d.box.x);
+    try testing.expectEqual(@as(f32, 0), d.box.y);
+    try testing.expectEqual(@as(f32, 20), d.box.w);
+    try testing.expectEqual(@as(f32, 30), d.box.h);
+    try testing.expectEqual(@as(f32, 160), el(p, "e").box.x);
+
+    // Painted: the turned A's ink is right of the baseline line (its ascent), below the column's top.
+    const fr = try planes.Frame.create(gpa, 320, 420);
+    defer fr.unref();
+    paint_mod.paint(gpa, p, &lay, tr.res(), fr, .{ .x = 0, .y = 0, .w = 320, .h = 420 });
+    // The baseline is at x = 250 - (80 - 20)/2 = 220; the A's 500×700 box (50×70 px) goes to x = 290, y 0–50.
+    try testing.expect(fr.canvas.at(250, 25)[3] > 0);
+    try testing.expect(fr.canvas.at(215, 25)[3] == 0);
+}
+
+test "bidi: visual order and alignment" {
+    const gpa = testing.allocator;
+    const bytes = try font_mod.testFont(gpa);
+    defer gpa.free(bytes);
+    const f = try Font.create(gpa, bytes);
+    defer f.destroy();
+    var tr: TestRes = .{ .font = f };
+    const p = try testPage(head ++
+        \\<div style:position="absolute" style:width="400px" style:height="400px">
+        \\ <p id="a" style:fontSize="100px" style:direction="rtl">א A</p>
+        \\ <p id="b" style:fontSize="100px">A <span style:direction="rtl">A A</span></p>
+        \\</div>
+        \\<div style:position="absolute" style:y="500px" style:width="400px" style:height="400px" style:writingMode="rl-tb">
+        \\ <p id="c" style:fontSize="100px">AA</p>
+        \\</div></body></root>
+    );
+    defer p.destroy();
+    var lay = Layout.init(gpa);
+    defer lay.deinit();
+    lay.run(p, tr.res(), 1920, 1080);
+    const runs = lay.runs.items;
+    // "א A" right to left: A, space, א on screen, aligned right (start).
+    try testing.expectEqual(@as(f32, 400 - 135), runs[0].x);
+    try testing.expectEqual(3, runs[0].glyphs.len);
+    try testing.expectEqual(@as(u32, 1), runs[0].glyphs[0].id);
+    try testing.expectEqual(@as(u32, 0), runs[0].glyphs[2].id);
+    // The rtl span is an embedding: its Latin keeps its order; the line stays left-aligned.
+    try testing.expectEqual(@as(f32, 0), runs[1].x);
+    // rl-tb: lines start on the right.
+    const last = runs[runs.len - 1];
+    try testing.expectEqual(@as(f32, 400 - 120), last.x);
+    try testing.expectEqual(@as(f32, 580), last.baseline);
 }
 
 test "area shapes" {

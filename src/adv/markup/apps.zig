@@ -50,16 +50,16 @@ pub const Config = struct {
 const Resources = struct {
     gpa: std.mem.Allocator,
     loader: page_mod.Loader,
-    images: std.StringHashMapUnmanaged(?*raster.Canvas) = .empty,
+    images: std.StringHashMapUnmanaged(?*image.Image) = .empty,
     fonts: std.StringHashMapUnmanaged(?*font_mod.Font) = .empty,
 
     fn deinit(r: *Resources) void {
         var it = r.images.iterator();
         while (it.next()) |kv| {
             r.gpa.free(kv.key_ptr.*);
-            if (kv.value_ptr.*) |c| {
-                c.deinit(r.gpa);
-                r.gpa.destroy(c);
+            if (kv.value_ptr.*) |im| {
+                im.deinit(r.gpa);
+                r.gpa.destroy(im);
             }
         }
         r.images.deinit(r.gpa);
@@ -71,14 +71,17 @@ const Resources = struct {
         r.fonts.deinit(r.gpa);
     }
 
-    fn getImage(ctx: *anyopaque, u: []const u8) ?*const raster.Canvas {
+    fn getImage(ctx: *anyopaque, u: []const u8) ?*image.Image {
         const r: *Resources = @ptrCast(@alignCast(ctx));
         if (r.images.get(u)) |hit| return hit;
-        const c: ?*raster.Canvas = blk: {
+        const c: ?*image.Image = blk: {
             const bytes = r.loader.read(r.loader.ctx, u) catch break :blk null;
             defer r.gpa.free(bytes);
-            const decoded = image.decode(r.gpa, bytes) catch break :blk null;
-            const box = r.gpa.create(raster.Canvas) catch break :blk null;
+            var decoded = image.Image.load(r.gpa, bytes) catch break :blk null;
+            const box = r.gpa.create(image.Image) catch {
+                decoded.deinit(r.gpa);
+                break :blk null;
+            };
             box.* = decoded;
             break :blk box;
         };
@@ -149,6 +152,35 @@ const App = struct {
         gpa.free(a.rank);
         a.order = o;
         a.rank = r;
+    }
+
+    /// MNG objects: each plays from its first frame whenever it becomes displayed (§7.8.3.1), unsynchronised,
+    /// on the graphics ticks (Vol. 1 §4.3.19.10.5).
+    fn animate(a: *App, now: u64, rate: u32) void {
+        const p = a.page orelse return;
+        for (p.elems.items) |e| {
+            if (e.kind != .object or !std.mem.eql(u8, e.node.attr("type") orelse "", "image/mng")) continue;
+            if (!displayed(e)) {
+                e.mng_start = null;
+                e.mng_frame = null;
+                continue;
+            }
+            const start = e.mng_start orelse now;
+            e.mng_start = start;
+            e.mng_frame = blk: {
+                const u = p.resolve(e.node, e.node.attr("src") orelse break :blk null) catch break :blk null;
+                defer p.gpa.free(u);
+                const im = Resources.getImage(&a.res, u) orelse break :blk null;
+                const m = im.animation() orelse break :blk 0;
+                break :blk m.frameAt(now -| start, rate);
+            };
+        }
+    }
+
+    fn displayed(e: *const page_mod.Elem) bool {
+        var x: ?*const page_mod.Elem = e;
+        while (x) |y| : (x = y.parent) if (!y.box.shown) return false;
+        return true;
     }
 
     fn destroy(a: *App, gpa: std.mem.Allocator) void {
@@ -251,6 +283,7 @@ pub const Apps = struct {
             p.cascade();
             a.lay.run(p, a.res.res(), @floatFromInt(a.region.w), @floatFromInt(a.region.h));
             a.reorder(s.gpa);
+            a.animate(c.app, s.cfg.pl.tick_base);
             if (!a.numbered) {
                 focus.generate(s.gpa, p, a.rank) catch {};
                 a.numbered = true;
@@ -577,11 +610,13 @@ fn hashLook(p: *Page, lay: *const layout.Layout) u64 {
     for (p.elems.items) |e| {
         hashValue(&h, e.box);
         hashValue(&h, e.style);
+        hashValue(&h, e.mng_frame);
         h.update(e.state.value);
     }
     for (lay.runs.items) |r| {
         hashValue(&h, r.baseline);
         hashValue(&h, r.x);
+        hashValue(&h, r.top);
         hashValue(&h, r.glyphs);
     }
     return h.final();
@@ -768,4 +803,70 @@ test "focus, activation and the pointer from user input" {
     try e.post(.{ .mouse_move = .{ .x = 400, .y = 400 } });
     next(&e, &now);
     try testing.expect(!a.state.pointer);
+}
+
+test "an MNG object plays from its first frame whenever it is displayed" {
+    const gpa = testing.allocator;
+    var pl = try xpl.parse(gpa,
+        \\<Playlist xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Playlist" majorVersion="1" minorVersion="0">
+        \\ <Configuration><StreamingBuffer size="0"/><Aperture size="1920x1080"/><MainVideoDefaultColor color="108080"/></Configuration>
+        \\ <MediaAttributeList/>
+        \\ <TitleSet timeBase="60fps">
+        \\  <Title id="t1" titleNumber="1" titleDuration="00:01:00:00"/>
+        \\  <PlaylistApplication id="pa" src="file:///dvddisc/ADV_OBJ/m.xmf"/>
+        \\ </TitleSet>
+        \\</Playlist>
+    );
+    defer pl.deinit();
+    const red: [4]u8 = .{ 255, 0, 0, 255 };
+    const blue: [4]u8 = .{ 0, 0, 255, 255 };
+    // 30 frames a second on 60 ticks a second: frame 1 from the third tick, then it stays.
+    const mng = try image.testMng(gpa, 30, &.{ .{ red, red }, .{ blue, blue } }, null, null);
+    defer gpa.free(mng);
+    var files: Files = .{ .files = &.{
+        .{
+            "file:///dvddisc/ADV_OBJ/m.xmf",
+            \\<Application xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Manifest" id="m">
+            \\ <Region x="0" y="0" width="100" height="100"/>
+            \\ <Markup src="m.xmu"/>
+            \\</Application>
+        },
+        .{
+            "file:///dvddisc/ADV_OBJ/m.xmu",
+            \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style" xml:lang="en"><body>
+            \\<object id="o" type="image/mng" src="a.mng" style:position="absolute" style:x="0px" style:y="0px" style:width="2px" style:height="1px"/>
+            \\</body></root>
+        },
+        .{ "file:///dvddisc/ADV_OBJ/a.mng", mng },
+    } };
+    var e = engine.Engine.init(gpa, 1920, 1080, 60);
+    defer e.deinit();
+    e.setScene(try Apps.create(gpa, .{ .pl = &pl, .loader = .{ .ctx = &files, .read = Files.read }, .menu_language = "en" }, 1920, 1080), 0);
+    try e.post(.{ .title_begin = .{ .title = 0, .duration = 3600 } });
+    var now: i64 = 0;
+    _ = e.step(now, 0);
+    const s: *Apps = @ptrCast(@alignCast(e.scene.?.ctx));
+    const p = s.apps.items[0].page.?;
+    const o = Page.elemOf(p.doc.getElementById("o").?).?;
+    try testing.expectEqual(@as(?u32, 0), o.mng_frame);
+    const f = try planes.Frame.create(gpa, 1920, 1080);
+    defer f.unref();
+    e.render(f);
+    try testing.expectEqual(raster.Px{ 255, 0, 0, 255 }, f.canvas.at(1, 0));
+    var redraw = false;
+    for (0..4) |_| {
+        now += 16_700;
+        redraw = e.step(now, 0).redraw or redraw;
+    }
+    try testing.expectEqual(@as(?u32, 1), o.mng_frame);
+    try testing.expect(redraw);
+    // Hidden, then displayed again: from the start.
+    try p.script.put(gpa, .{ .elem = o, .prop = .display }, "none");
+    now += 16_700;
+    _ = e.step(now, 0);
+    try testing.expectEqual(@as(?u32, null), o.mng_frame);
+    p.script.clearRetainingCapacity();
+    now += 16_700;
+    _ = e.step(now, 0);
+    try testing.expectEqual(@as(?u32, 0), o.mng_frame);
 }

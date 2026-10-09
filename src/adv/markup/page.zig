@@ -100,6 +100,10 @@ pub const Elem = struct {
     key_actioned: ?u64 = null,
     pressed: bool = false,
     focus_after: bool = false,
+    /// An `image/mng` object (apps.zig): the tick its display became auto (its animation starts then), and the
+    /// frame it shows (null: none).
+    mng_start: ?u64 = null,
+    mng_frame: ?u32 = null,
     /// Kept across syncs: false once the node left the page.
     live: bool = true,
 };
@@ -419,9 +423,13 @@ pub const Page = struct {
 
     /// What percentages of property `prop` of `e` are of (for normalized values).
     fn pctBase(e: *const Elem, prop: style.Prop) f32 {
+        const v = e.style.writingMode == .@"tb-rl";
         return switch (prop) {
-            .y, .height, .blockProgressionDimension, .backgroundPositionVertical => e.box.cb_h,
-            else => e.box.cb_w,
+            .y, .height, .backgroundPositionVertical => e.box.cb_h,
+            .x, .width, .backgroundPositionHorizontal => e.box.cb_w,
+            .blockProgressionDimension => if (v) e.box.cb_w else e.box.cb_h,
+            // The rest (indents, padding, the inline progression dimension) are of the inline progression.
+            else => if (v) e.box.cb_h else e.box.cb_w,
         };
     }
 
@@ -634,13 +642,15 @@ const page_src =
 test "load, includes, cascade" {
     var files: MemLoader = .{ .files = &.{
         .{ "file:///dvddisc/ADV_OBJ/m/page.xmu", page_src },
-        .{ "file:///dvddisc/ADV_OBJ/m/styles.xmu",
-        \\<styling xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style">
-        \\ <style select="class('big')" style:padding="1px 2px"/>
-        \\</styling>
+        .{
+            "file:///dvddisc/ADV_OBJ/m/styles.xmu",
+            \\<styling xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style">
+            \\ <style select="class('big')" style:padding="1px 2px"/>
+            \\</styling>
         },
-        .{ "file:///dvddisc/ADV_OBJ/m/part.xmu",
-        \\<div xmlns="http://www.dvdforum.org/2005/ihd" id="inc" xml:base="sub/"><span id="s"/></div>
+        .{
+            "file:///dvddisc/ADV_OBJ/m/part.xmu",
+            \\<div xmlns="http://www.dvdforum.org/2005/ihd" id="inc" xml:base="sub/"><span id="s"/></div>
         },
     } };
     const p = try Page.load(testing.allocator, files.loader(), "file:///dvddisc/ADV_OBJ/m/page.xmu", 1080);
@@ -712,8 +722,9 @@ test "load, includes, cascade" {
 
 test "a malformed include makes the page invalid" {
     var files: MemLoader = .{ .files = &.{
-        .{ "file:///a/p.xmu",
-        \\<root xmlns="http://www.dvdforum.org/2005/ihd" xml:lang="en"><body><include href="bad.xmu"/></body></root>
+        .{
+            "file:///a/p.xmu",
+            \\<root xmlns="http://www.dvdforum.org/2005/ihd" xml:lang="en"><body><include href="bad.xmu"/></body></root>
         },
         .{ "file:///a/bad.xmu", "<div" },
     } };
