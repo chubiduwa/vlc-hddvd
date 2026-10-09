@@ -192,8 +192,11 @@ pub const Player = struct {
     held: bool = false,
     /// VLC is paused (DEMUX_SET_PAUSE_STATE).
     paused: bool = false,
-    /// The subtitle track chosen, and whether subtitles are shown.
+    /// The audio and subtitle tracks chosen, and whether subtitles are shown. Applied again whenever ESes are
+    /// added: a selection made at a title's start comes before VLC creates its ESes.
+    audio_track: ?u8 = null,
     sub_track: ?u8 = null,
+    reselect: bool = false,
     subtitle_visible: bool = true,
     /// The sub video's area and crop as last set, and a change in progress (changeLayout with a duration).
     sub_rect: ?compose.Rect = null,
@@ -333,6 +336,7 @@ fn startHost(demux: *vlc.demux_t, pr: *present.Presentation) void {
             .playlist_uri = p.playlist_uri,
             .content_id = p.content_id[0..p.content_id_len],
             .has_standard_content = p.has_standard_content,
+            .script_trace = hddvd_inherit_bool(o, "hddvd-script-trace"),
         },
     }) catch |err| blk: {
         log(o, vlc.VLC_MSG_ERR, @src(), "cannot start the application engine (%s)", .{@errorName(err).ptr});
@@ -654,6 +658,10 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
     const p = playerOf(demux);
     p.menu_requested = false;
     runCommands(demux);
+    if (p.reselect) {
+        p.reselect = false;
+        selectTracks(demux, p.audio_track);
+    }
     p.access.disc_busy.store(!p.stopped and !p.paused and !p.held, .monotonic);
     if (p.stopped) return 0;
     keepOverlay(demux);
@@ -739,10 +747,15 @@ fn runCommands(demux: *vlc.demux_t) void {
             p.stopped = true;
         },
         .tracks => |t| {
+            log(o, vlc.VLC_MSG_DBG, @src(), "tracks: video %d, audio %d, subtitle %d", .{
+                if (t.video) |v| @as(c_int, v) else -1, if (t.audio) |v| @as(c_int, v) else -1, if (t.subtitle) |v| @as(c_int, v) else -1,
+            });
             if (t.subtitle) |n| p.sub_track = n;
+            if (t.audio) |n| p.audio_track = n;
             selectTracks(demux, t.audio);
         },
         .subtitle_visible => |v| {
+            log(o, vlc.VLC_MSG_DBG, @src(), "subtitles %s", .{if (v) "shown".ptr else "hidden".ptr});
             p.subtitle_visible = v;
             selectTracks(demux, null);
         },
@@ -797,7 +810,10 @@ fn selectTracks(demux: *vlc.demux_t, audio: ?u8) void {
         for (p.tracks.items) |t| {
             if ((t.id & 0xff00) != 0xbd00) continue;
             const sub: u8 = @intCast(t.id & 0xff);
-            if (isMainAudio(sub) and (sub & 7) == a.stream -| 1) hddvd_es_select(demux, t.es, true);
+            if (isMainAudio(sub) and (sub & 7) == a.stream -| 1) {
+                log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "audio track %u: ES 0x%x", .{ @as(c_uint, n), @as(c_uint, @bitCast(t.id)) });
+                hddvd_es_select(demux, t.es, true);
+            }
         }
         break;
     };
@@ -809,6 +825,9 @@ fn selectTracks(demux: *vlc.demux_t, audio: ?u8) void {
         if (attr) |a| want = a.hdSubpStream(st.stream -| 1);
         break;
     };
+    log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "subtitle track %d: stream %d", .{
+        if (p.sub_track) |n| @as(c_int, n) else -1, if (want) |w| @as(c_int, w) else -1,
+    });
     for (p.spus.items) |t| {
         const on = if (want) |w| (t.id & 0x1f) == w else false;
         if (on != hddvd_es_selected(demux, t.es)) hddvd_es_select(demux, t.es, on);
@@ -909,6 +928,7 @@ fn loadPlaylist(demux: *vlc.demux_t, u: []const u8) !void {
     p.playlist_uri = new_uri;
     p.access.configure(&p.pl);
     p.held = false;
+    p.audio_track = null;
     p.sub_track = null;
     p.subtitle_visible = true;
     p.sub_rect = null;
@@ -1293,6 +1313,7 @@ pub fn esAdded(demux: *vlc.demux_t, id: c_int, es: *vlc.es_out_id_t) void {
     const p = playerOf(demux);
     log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "ES added: id 0x%x", .{@as(c_uint, @bitCast(id))});
     p.tracks.append(gpa, .{ .es = es, .id = id }) catch {};
+    if ((id & 0xff00) == 0xbd00) p.reselect = true;
     if ((id & 0xffe0) == 0xbd20) p.spus.append(gpa, .{ .es = es, .id = id }) catch {};
     if (id == p.sub_video.id) {
         p.sub_video.es = es;

@@ -64,6 +64,8 @@ pub const Config = struct {
     playlist_uri: []const u8 = "",
     content_id: []const u8 = "",
     has_standard_content: bool = false,
+    /// Log every exception scripts throw, caught or not (debugging).
+    script_trace: bool = false,
 };
 
 /// Decoded images and fonts of one application, by absolute URI (null: could not be loaded).
@@ -280,6 +282,7 @@ pub const Apps = struct {
         world.playlist_uri = cfg.playlist_uri;
         world.content_id = cfg.content_id;
         world.has_standard_content = cfg.has_standard_content;
+        if (cfg.script_trace) world.rt.traceThrows();
         world.streaming_buffer_kb = cfg.pl.streaming_buffer_kb;
         const pc = cfg.pl.default_color;
         world.model.outer = .{ @intCast(pc >> 16), @intCast((pc >> 8) & 0xff), @intCast(pc & 0xff) };
@@ -1513,7 +1516,8 @@ test "scripts: lifecycle, events, input and the Animated Property API" {
             \\<timing clock="page"><par><cue select="id('a')" begin="2f" dur="1s"><event name="hello"><param name="a" value="1"/></event></cue></par></timing>
             \\</head><body>
             \\<button id="a" style:position="absolute" style:x="0px" style:y="0px" style:width="50px" style:height="50px"/>
-            \\<button id="b" style:position="absolute" style:x="0px" style:y="100px" style:width="50px" style:height="50px"/>
+            \\<button id="b" style:position="absolute" style:x="0px" style:y="100px" style:width="50px" style:height="50px"
+            \\        style:backgroundImage="url('img/b.png')"/>
             \\</body></root>
         },
         .{
@@ -1575,6 +1579,8 @@ test "scripts: lifecycle, events, input and the Animated Property API" {
         \\assertThrows(function () { b.style.setProperty("x", "nonsense"); }, "HDDVD_E_ARGUMENT");
         \\assertThrows(function () { b.style.setProperty("position", "static"); }, "HDDVD_E_ARGUMENT");
         \\assertThrows(function () { b.style.getProperty("bogus"); }, "HDDVD_E_ARGUMENT");
+        \\// Resolved image URIs, which discs cut at the last "/" to swap file names.
+        \\assertEq(b.style.backgroundImage, "url('file:///dvddisc/ADV_OBJ/img/b.png')");
         \\b.style.animateProperty("opacity", "0;1", 1);
         \\assertEq(b.state.focused, "false"); b.state.focused = "true"; assertEq(b.state.focused, "true");
         \\assertEq(b.core.id, "b"); assertEq(document.getProperties(b, "http://www.dvdforum.org/2005/ihd#style").namespace, "http://www.dvdforum.org/2005/ihd#style");

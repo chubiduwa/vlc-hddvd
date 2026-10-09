@@ -200,6 +200,18 @@ pub const Prop = struct {
                 if (s.overrides.valueOf(a, p.node, .style, name, s.appTicks())) |v| return cx.string(v);
                 const el = page_mod.Page.elemOf(p.node) orelse return cx.string("");
                 const pg = s.page() orelse return cx.string("");
+                // backgroundImage with absolute URIs: §7.5.2.4.3.2 says the specified URI, but discs
+                // rebuild image names by cutting the value at its last "/", which only works with resolved
+                // URIs (what the players it was made for must have returned) [disc].
+                if (prop == .backgroundImage) {
+                    var w: std.Io.Writer.Allocating = .init(a);
+                    for (el.style.backgroundImage, 0..) |u, i| {
+                        const abs = pg.resolve(p.node, u) catch null;
+                        defer if (abs) |x| pg.gpa.free(x);
+                        w.writer.print("{s}url('{s}')", .{ if (i > 0) " " else "", abs orelse u }) catch return error.OutOfMemory;
+                    }
+                    return cx.string(w.written());
+                }
                 return cx.string(pg.propertyString(a, el, prop) catch "");
             },
             .state => {
@@ -295,7 +307,10 @@ pub const Prop = struct {
                 defer arena.deinit();
                 var scratch: style.Style = .initial(1080);
                 const parent: style.Style = .initial(1080);
-                if (!style.apply(&scratch, prop, v, .{ .parent = &parent, .aperture_h = 1080, .arena = arena.allocator() })) return error.Argument;
+                if (!style.apply(&scratch, prop, v, .{ .parent = &parent, .aperture_h = 1080, .arena = arena.allocator() })) {
+                    if (s.world.rt.trace_throws) s.world.print("script {s}: style {s}: bad value \"{s}\"", .{ s.name(), name, v });
+                    return error.Argument;
+                }
             },
             .state => {
                 if (std.mem.eql(u8, name, "value")) return;

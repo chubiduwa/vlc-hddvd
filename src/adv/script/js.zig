@@ -18,6 +18,9 @@
 const std = @import("std");
 pub const c = @import("quickjs");
 
+/// quickjs.c's throw hook (added by qjs_patch.zig).
+extern var js_throw_hook: ?*const fn (?*c.JSContext) callconv(.c) void;
+
 pub const Value = c.JSValue;
 pub const @"undefined" = mk(c.JS_TAG_UNDEFINED);
 pub const @"null" = mk(c.JS_TAG_NULL);
@@ -200,6 +203,71 @@ pub const Runtime = struct {
     exotic_class: c.JSClassID = 0,
     /// Set from another thread to abort the running script (the engine is shutting down, §8.5).
     stop: std.atomic.Value(bool) = .init(false),
+    /// Log every exception thrown, even those a script catches (debugging; see `traceThrows`).
+    trace_throws: bool = false,
+
+    /// Logs every exception thrown in this runtime's contexts, caught or not, with its stack, through each
+    /// context's `log`. Debugging only: discs often wrap whole functions in `try { … } catch (e) {}`.
+    pub fn traceThrows(r: *Runtime) void {
+        r.trace_throws = true;
+        js_throw_hook = throwHook;
+    }
+
+    threadlocal var in_hook = false;
+
+    fn throwHook(ctx: ?*c.JSContext) callconv(.c) void {
+        if (in_hook) return;
+        const r: *Runtime = @ptrCast(@alignCast(c.JS_GetRuntimeOpaque(c.JS_GetRuntime(ctx)) orelse return));
+        if (!r.trace_throws) return;
+        const opaque_cx = c.JS_GetContextOpaque(ctx) orelse return;
+        const cx: *Context = @ptrCast(@alignCast(opaque_cx));
+        const f = cx.log orelse return;
+        in_hook = true;
+        defer in_hook = false;
+        // Inspect the exception without disturbing it: take it, look, put it back.
+        const ex = c.JS_GetException(ctx);
+        defer _ = c.JS_Throw(ctx, ex);
+        if (c.JS_IsUninitialized(ex)) return;
+        var buf: [2048]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.writeAll("thrown: ") catch {};
+        const parts = [_][*:0]const u8{ "message", "stack" };
+        if (c.JS_IsError(ex)) {
+            const name = c.JS_GetPropertyStr(ctx, ex, "name");
+            defer c.JS_FreeValue(ctx, name);
+            writeStr(ctx, &w, name);
+            w.writeAll(": ") catch {};
+            for (parts) |p| {
+                const v = c.JS_GetPropertyStr(ctx, ex, p);
+                defer c.JS_FreeValue(ctx, v);
+                writeStr(ctx, &w, v);
+                w.writeAll(" ") catch {};
+            }
+        } else writeStr(ctx, &w, ex);
+        // Where it was thrown: a backtrace is only added to the exception while unwinding, so take a new
+        // Error's (built here, at the throw).
+        const global = c.JS_GetGlobalObject(ctx);
+        defer c.JS_FreeValue(ctx, global);
+        const ctor = c.JS_GetPropertyStr(ctx, global, "Error");
+        defer c.JS_FreeValue(ctx, ctor);
+        const here = c.JS_CallConstructor(ctx, ctor, 0, null);
+        defer c.JS_FreeValue(ctx, here);
+        if (c.JS_IsObject(here)) {
+            const st = c.JS_GetPropertyStr(ctx, here, "stack");
+            defer c.JS_FreeValue(ctx, st);
+            w.writeAll("at: ") catch {};
+            writeStr(ctx, &w, st);
+        }
+        c.JS_FreeValue(ctx, c.JS_GetException(ctx)); // anything the inspection threw
+        f(cx.owner, w.buffered());
+    }
+
+    fn writeStr(ctx: ?*c.JSContext, w: *std.Io.Writer, v: Value) void {
+        if (c.JS_IsObject(v) and !c.JS_IsError(v)) return w.writeAll("[object]") catch {};
+        const s = c.JS_ToCString(ctx, v) orelse return;
+        defer c.JS_FreeCString(ctx, s);
+        w.writeAll(std.mem.span(s)) catch {};
+    }
 
     /// QuickJS allocates with the C heap of this module (never VLC's); `memory_limit` bounds it.
     pub fn create(gpa: std.mem.Allocator, memory_limit: usize) Error!*Runtime {
@@ -967,6 +1035,14 @@ test "the HD DVD script profile" {
         \\assertThrows(function () { (function () {}).constructor("return 1;"); }, EvalError, "constructor");
         \\var f = function () { };
         \\f();
+        \\// f.arguments and f.caller of a running function (SpiderMonkey and JScript had them; discs use them).
+        \\function Cmd(s) { this.n = Cmd.arguments.length; this.second = Cmd.arguments[1]; this.by = Cmd.caller; }
+        \\function make() { return new Cmd("a", 7); }
+        \\var c = make(); assertEq(c.n, 2); assertEq(c.second, 7); assertEq(c.by, make);
+        \\assertEq(Cmd.arguments, null, "not running"); assertEq(Cmd.caller, null);
+        \\function outer(x) { return inner(); } function inner() { return outer.arguments[0]; }
+        \\assertEq(outer(5), 5, "an outer call's arguments");
+        \\assertThrows(function () { (function () { "use strict"; }).arguments; }, TypeError, "strict");
     , "profile.js");
     // §8.2.6–7: syntax errors.
     for ([_][]const u8{ "var a = 1\nvar b = 2;", "var o = {}; with (o) { }", "function f() { return 1 }", "do { } while (false) var x;" }) |src| {
