@@ -267,7 +267,7 @@ pub const Mng = struct {
 const testing = std.testing;
 
 /// A PNG of `w`×`h` RGBA pixels (stored, uncompressed deflate), for tests.
-fn testPng(gpa: std.mem.Allocator, w: u32, h: u32, px: []const [4]u8) ![]u8 {
+pub fn testPng(gpa: std.mem.Allocator, w: u32, h: u32, px: []const [4]u8) ![]u8 {
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(gpa);
     for (0..h) |y| {

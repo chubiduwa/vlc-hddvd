@@ -42,4 +42,17 @@ test {
     _ = @import("adv/markup/bidi.zig");
     _ = @import("adv/engine/keys.zig");
     _ = @import("adv/script/js.zig");
+    _ = @import("adv/script/events.zig");
+    _ = @import("adv/script/sched.zig");
+    _ = @import("adv/script/files.zig");
+    _ = @import("adv/script/host.zig");
+    _ = @import("adv/script/dom_api.zig");
+    _ = @import("adv/script/anim_api.zig");
+    _ = @import("adv/script/controller_api.zig");
+    _ = @import("adv/script/net_api.zig");
+    _ = @import("adv/script/draw_api.zig");
+    _ = @import("adv/script/player_api.zig");
+    _ = @import("adv/script/storage_api.zig");
+    _ = @import("adv/script/diag_api.zig");
+    _ = @import("adv/script/fileio_api.zig");
 }

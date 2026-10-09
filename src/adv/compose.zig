@@ -28,6 +28,22 @@ pub const Yuv = struct {
     pub fn height(p: Yuv) usize {
         return p.y.h;
     }
+
+    /// The part of the picture at `c` (x, y, w, h) in a `aw`×`ah` space the whole picture fills (an empty or
+    /// out-of-range crop gives the whole picture). Luma coordinates are rounded to even.
+    pub fn crop(p: Yuv, c: [4]u32, aw: u32, ah: u32) Yuv {
+        if (c[2] == 0 or c[3] == 0 or aw == 0 or ah == 0) return p;
+        const sx = @min(@as(usize, c[0]) * p.y.w / aw, p.y.w) & ~@as(usize, 1);
+        const sy = @min(@as(usize, c[1]) * p.y.h / ah, p.y.h) & ~@as(usize, 1);
+        const sw = @min(@as(usize, c[2]) * p.y.w / aw, p.y.w - sx) & ~@as(usize, 1);
+        const sh = @min(@as(usize, c[3]) * p.y.h / ah, p.y.h - sy) & ~@as(usize, 1);
+        if (sw == 0 or sh == 0) return p;
+        return .{
+            .y = .{ .px = p.y.px + sy * p.y.pitch + sx, .pitch = p.y.pitch, .w = sw, .h = sh },
+            .u = .{ .px = p.u.px + sy / 2 * p.u.pitch + sx / 2, .pitch = p.u.pitch, .w = sw / 2, .h = sh / 2 },
+            .v = .{ .px = p.v.px + sy / 2 * p.v.pitch + sx / 2, .pitch = p.v.pitch, .w = sw / 2, .h = sh / 2 },
+        };
+    }
 };
 
 pub const Rect = struct {
@@ -176,4 +192,23 @@ test "scaling and luma key" {
     toRgba(&big, 32, 8, 8, src.pic, 255, .{ 0, 100 }, .bt601);
     try testing.expectEqual(0, big[3]); // upscaled 2×: the dark corner is keyed out
     try testing.expectEqual(255, big[4 * 7 + 3]);
+}
+
+test "cropping" {
+    var y: [8 * 4]u8 = undefined;
+    for (&y, 0..) |*v, i| v.* = @intCast(i);
+    var u: [4 * 2]u8 = @splat(1);
+    var v: [4 * 2]u8 = @splat(2);
+    const p: Yuv = .{
+        .y = .{ .px = &y, .pitch = 8, .w = 8, .h = 4 },
+        .u = .{ .px = &u, .pitch = 4, .w = 4, .h = 2 },
+        .v = .{ .px = &v, .pitch = 4, .w = 4, .h = 2 },
+    };
+    // The right half, bottom half, in a 16×8 space.
+    const c = p.crop(.{ 8, 4, 8, 4 }, 16, 8);
+    try std.testing.expectEqual(4, c.width());
+    try std.testing.expectEqual(2, c.height());
+    try std.testing.expectEqual(@as(u8, 2 * 8 + 4), c.y.px[0]);
+    try std.testing.expectEqual(2, c.u.w);
+    try std.testing.expectEqual(p.width(), p.crop(.{ 0, 0, 0, 0 }, 16, 8).width());
 }

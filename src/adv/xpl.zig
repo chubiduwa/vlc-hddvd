@@ -221,7 +221,18 @@ pub const Title = struct {
     }
 };
 
-pub const MediaAttr = struct { index: u8, codec: []const u8 = "", channels: u8 = 0 };
+pub const MediaAttr = struct {
+    index: u8,
+    codec: []const u8 = "",
+    channels: u8 = 0,
+    /// Every attribute of the element, by name (getMediaAttribute, Annex Z.10.15.3).
+    attrs: []const [2][]const u8 = &.{},
+
+    pub fn get(m: *const MediaAttr, name: []const u8) ?[]const u8 {
+        for (m.attrs) |kv| if (std.mem.eql(u8, kv[0], name)) return kv[1];
+        return null;
+    }
+};
 
 pub const Playlist = struct {
     arena: std.heap.ArenaAllocator,
@@ -296,7 +307,9 @@ pub fn fromDom(gpa: std.mem.Allocator, root: *const dom.Node) Error!Playlist {
         var sp: std.ArrayList(MediaAttr) = .empty;
         var c = list.firstElement();
         while (c) |e| : (c = e.nextElement()) {
-            const m: MediaAttr = .{ .index = int(u8, e.attr("index")) orelse 1, .codec = try b.str(e.attr("codec")), .channels = int(u8, e.attr("channels")) orelse 0 };
+            var kvs: std.ArrayList([2][]const u8) = .empty;
+            for (e.attrs.items) |at| if (at.ns.len == 0) try kvs.append(a, .{ try b.str(at.local), try b.str(at.value) });
+            const m: MediaAttr = .{ .index = int(u8, e.attr("index")) orelse 1, .codec = try b.str(e.attr("codec")), .channels = int(u8, e.attr("channels")) orelse 0, .attrs = kvs.items };
             if (e.is(ns, "AudioAttributeItem")) try audio.append(a, m);
             if (e.is(ns, "VideoAttributeItem")) try video.append(a, m);
             if (e.is(ns, "SubpictureAttributeItem")) try sp.append(a, m);

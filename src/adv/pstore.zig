@@ -190,6 +190,11 @@ pub const Store = struct {
     pub fn makeDir(s: *Store, u: []const u8) Error!void {
         const t = try s.resolve(u);
         defer s.gpa.free(t.path);
+        // Directly under the provider area, only Content ID (GUID) directories (§10.3.1).
+        if (!std.mem.startsWith(u8, t.path, "HD_DVD/common") and t.path.len > 7 + 36 + 1) {
+            const rest = t.path[7 + 36 + 1 ..];
+            if (std.mem.indexOfScalar(u8, rest, '/') == null and !isGuid(rest)) return error.NotPermitted;
+        }
         t.dev.fs.makeDir(t.path, s.now) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.BadPath,
@@ -258,6 +263,24 @@ pub const Store = struct {
             try kv.keys.append(s.gpa, key);
             try kv.values.append(s.gpa, value);
         }
+        const text = try kv.serialize(s.gpa);
+        defer s.gpa.free(text);
+        d.fs.write(path, text, s.now, true) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.BadPath,
+        };
+    }
+
+    /// Removes a key from an Information File (setting a value to undefined, Annex Z.11.2.3).
+    pub fn infoRemove(s: *Store, d: *Device, path: []const u8, key: []const u8) Error!void {
+        const bytes = d.fs.read(path) catch return;
+        var kv = try parseInfo(s.gpa, bytes);
+        defer kv.deinit(s.gpa);
+        for (kv.keys.items, 0..) |k, i| if (std.mem.eql(u8, k, key)) {
+            _ = kv.keys.orderedRemove(i);
+            _ = kv.values.orderedRemove(i);
+            break;
+        };
         const text = try kv.serialize(s.gpa);
         defer s.gpa.free(text);
         d.fs.write(path, text, s.now, true) catch |err| return switch (err) {

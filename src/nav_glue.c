@@ -321,6 +321,14 @@ bool hddvd_es_out_empty(demux_t *demux)
     return empty;
 }
 
+/* Pauses or resumes the input, as VLC's pause key does: through its "state" variable, which queues an
+ * INPUT_CONTROL_SET_STATE (the demux then gets DEMUX_SET_PAUSE_STATE). */
+void hddvd_input_pause(demux_t *demux, bool paused)
+{
+    if (demux->p_input != NULL)
+        var_SetInteger(demux->p_input, "state", paused ? PAUSE_S : PLAYING_S);
+}
+
 void hddvd_sleep_ms(int ms)
 {
     msleep((mtime_t)ms * 1000);

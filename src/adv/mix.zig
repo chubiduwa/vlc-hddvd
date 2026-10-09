@@ -230,6 +230,124 @@ pub const Fifo = struct {
     }
 };
 
+/// HD DVD's output channels (Annex W, Table W-4): L, R, C, Ls, Rs, Lb, Rb, LFE.
+pub const hd_channels = 8;
+
+/// The HD DVD output channel a VLC channel of `dst` plays: surround is VLC's middle pair in a 7.1 layout and its
+/// rear pair otherwise; VLC's rear centre plays both backs.
+fn hdOf(dst: Layout, c: u32) []const usize {
+    const seven = dst.mask & (chan.middle_left | chan.middle_right) != 0;
+    return switch (c) {
+        chan.left => &.{0},
+        chan.right => &.{1},
+        chan.center => &.{2},
+        chan.middle_left => &.{3},
+        chan.middle_right => &.{4},
+        chan.rear_left => if (seven) &.{5} else &.{3},
+        chan.rear_right => if (seven) &.{6} else &.{4},
+        chan.rear_center => &.{ 5, 6 },
+        chan.lfe => &.{7},
+        else => &.{},
+    };
+}
+
+/// Per-channel gains for `dst` (in its order) from HD DVD volumes (0–255 each).
+pub fn hdGains(dst: Layout, vol: [hd_channels]u8) [max_channels]f32 {
+    var g: [max_channels]f32 = @splat(1);
+    for (dst.ch[0..dst.n], 0..) |c, i| {
+        const hd = hdOf(dst, c);
+        if (hd.len == 0) continue;
+        var sum: f32 = 0;
+        for (hd) |k| sum += @floatFromInt(vol[k]);
+        g[i] = sum / @as(f32, @floatFromInt(hd.len)) / 255;
+    }
+    return g;
+}
+
+/// A mix-down of a mono or stereo source into `dst` from HD DVD gains (`rows[0]` from the left input, `rows[1]`
+/// from the right, 0–255 per output channel). A mono source feeds both rows at -3 dB; other source channels fold
+/// into left and right first.
+pub fn hdMatrix(src: Layout, dst: Layout, rows: [2][hd_channels]u8) Matrix {
+    var m: Matrix = .{};
+    // Source channels into the two HD DVD inputs.
+    var into: [max_channels][2]f32 = @splat(.{ 0, 0 });
+    if (src.n == 1) {
+        into[0] = .{ std.math.sqrt1_2, std.math.sqrt1_2 };
+    } else {
+        const stereo = Layout.of(chan.left | chan.right);
+        const fold = Matrix.default(src, stereo);
+        for (0..src.n) |si| into[si] = .{ fold.g[0][si], fold.g[1][si] };
+    }
+    for (dst.ch[0..dst.n], 0..) |c, di| {
+        const hd = hdOf(dst, c);
+        for (0..src.n) |si| {
+            var acc: f32 = 0;
+            for (hd) |k| acc += (into[si][0] * @as(f32, @floatFromInt(rows[0][k])) + into[si][1] * @as(f32, @floatFromInt(rows[1][k]))) / 255;
+            m.g[di][si] = if (hd.len > 0) acc / @as(f32, @floatFromInt(hd.len)) else 0;
+        }
+    }
+    return m;
+}
+
+pub const Wav = struct {
+    /// Interleaved samples, the whole sound `repeat` times (owned).
+    samples: []f32,
+    channels: usize,
+    rate: u32,
+};
+
+/// Decodes a linear PCM WAV file (8, 16, 24 or 32-bit integer, or 32-bit float; mono or stereo), repeated.
+pub fn decodeWav(gpa: std.mem.Allocator, data: []const u8, repeat: u32) !Wav {
+    if (data.len < 12 or !std.mem.eql(u8, data[0..4], "RIFF") or !std.mem.eql(u8, data[8..12], "WAVE")) return error.BadWav;
+    var fmt: ?struct { tag: u16, channels: u16, rate: u32, bits: u16 } = null;
+    var pcm: ?[]const u8 = null;
+    var i: usize = 12;
+    while (i + 8 <= data.len) {
+        const id = data[i..][0..4];
+        const len = std.mem.readInt(u32, data[i + 4 ..][0..4], .little);
+        const body = data[i + 8 ..][0..@min(len, data.len - i - 8)];
+        if (std.mem.eql(u8, id, "fmt ") and body.len >= 16) {
+            fmt = .{
+                .tag = std.mem.readInt(u16, body[0..2], .little),
+                .channels = std.mem.readInt(u16, body[2..4], .little),
+                .rate = std.mem.readInt(u32, body[4..8], .little),
+                .bits = std.mem.readInt(u16, body[14..16], .little),
+            };
+            if (fmt.?.tag == 0xfffe and body.len >= 26) fmt.?.tag = std.mem.readInt(u16, body[24..26], .little);
+        } else if (std.mem.eql(u8, id, "data")) pcm = body;
+        i += 8 + len + (len & 1);
+    }
+    const f = fmt orelse return error.BadWav;
+    const d = pcm orelse return error.BadWav;
+    if (f.channels < 1 or f.channels > 2 or f.rate == 0) return error.UnsupportedWav;
+    const sf: SampleFormat = switch (f.tag) {
+        1 => switch (f.bits) {
+            8 => .u8,
+            16 => .s16,
+            24 => .s32, // widened below
+            32 => .s32,
+            else => return error.UnsupportedWav,
+        },
+        3 => if (f.bits == 32) .f32 else return error.UnsupportedWav,
+        else => return error.UnsupportedWav,
+    };
+    const bytes: usize = f.bits / 8;
+    const n = d.len / bytes / f.channels * f.channels;
+    const one = try gpa.alloc(f32, n);
+    defer gpa.free(one);
+    if (f.bits == 24) {
+        for (one, 0..) |*o, k| {
+            const b = d[k * 3 ..][0..3];
+            const v: i32 = @as(i32, @bitCast(@as(u32, b[0]) << 8 | @as(u32, b[1]) << 16 | @as(u32, b[2]) << 24));
+            o.* = @as(f32, @floatFromInt(v)) / 2147483648.0;
+        }
+    } else toFloat(sf, d[0 .. n * bytes], one);
+    const times = @max(repeat, 1);
+    const out = try gpa.alloc(f32, n * times);
+    for (0..times) |r| @memcpy(out[r * n ..][0..n], one);
+    return .{ .samples = out, .channels = f.channels, .rate = f.rate };
+}
+
 /// Effect sounds being played (one at a time per the spec, Annex Z EffectAudio; a new one replaces the old).
 pub const Effects = struct {
     /// Samples in the output layout and rate, and how far they have been played.
@@ -351,4 +469,53 @@ test "effect sounds" {
     try testing.expect(e.playing());
     e.mixInto(&out, 1);
     try testing.expect(!e.playing());
+}
+
+test "HD DVD volumes and mix-downs" {
+    const l51 = Layout.of(chan.left | chan.right | chan.center | chan.lfe | chan.rear_left | chan.rear_right);
+    var vol: [hd_channels]u8 = @splat(255);
+    vol[2] = 0; // centre
+    vol[3] = 51; // Ls: VLC's rear left in 5.1
+    const g = hdGains(l51, vol);
+    try testing.expectEqual(@as(f32, 0), g[l51.index(chan.center).?]);
+    try testing.expectApproxEqAbs(@as(f32, 0.2), g[l51.index(chan.rear_left).?], 1e-6);
+    try testing.expectEqual(@as(f32, 1), g[l51.index(chan.left).?]);
+
+    // Stereo sub audio: left into the centre only, right into the right only.
+    const st = Layout.of(chan.left | chan.right);
+    var rows: [2][hd_channels]u8 = @splat(@splat(0));
+    rows[0][2] = 255;
+    rows[1][1] = 255;
+    const m = hdMatrix(st, l51, rows);
+    try testing.expectEqual(@as(f32, 1), m.g[l51.index(chan.center).?][0]);
+    try testing.expectEqual(@as(f32, 0), m.g[l51.index(chan.left).?][0]);
+    try testing.expectEqual(@as(f32, 1), m.g[l51.index(chan.right).?][1]);
+    // Mono: both rows at -3 dB.
+    const mono = hdMatrix(Layout.of(chan.center), l51, rows);
+    try testing.expectApproxEqAbs(std.math.sqrt1_2, mono.g[l51.index(chan.center).?][0], 1e-6);
+    try testing.expectApproxEqAbs(std.math.sqrt1_2, mono.g[l51.index(chan.right).?][0], 1e-6);
+}
+
+test "WAV decoding" {
+    const gpa = testing.allocator;
+    var wav: [44 + 8]u8 = @splat(0);
+    @memcpy(wav[0..4], "RIFF");
+    @memcpy(wav[8..16], "WAVEfmt ");
+    std.mem.writeInt(u32, wav[16..20], 16, .little);
+    std.mem.writeInt(u16, wav[20..22], 1, .little);
+    std.mem.writeInt(u16, wav[22..24], 2, .little);
+    std.mem.writeInt(u32, wav[24..28], 48000, .little);
+    std.mem.writeInt(u16, wav[34..36], 16, .little);
+    @memcpy(wav[36..40], "data");
+    std.mem.writeInt(u32, wav[40..44], 8, .little);
+    std.mem.writeInt(i16, wav[44..46], 0x4000, .little);
+    std.mem.writeInt(i16, wav[46..48], -0x4000, .little);
+    const w = try decodeWav(gpa, &wav, 3);
+    defer gpa.free(w.samples);
+    try testing.expectEqual(2, w.channels);
+    try testing.expectEqual(48000, w.rate);
+    try testing.expectEqual(12, w.samples.len);
+    try testing.expectEqual(@as(f32, 0.5), w.samples[0]);
+    try testing.expectEqual(@as(f32, -0.5), w.samples[5]);
+    try testing.expectError(error.BadWav, decodeWav(gpa, wav[0..10], 1));
 }

@@ -70,14 +70,21 @@ pub const Presentation = struct {
     /// Sub video area (null: its native size, centred) and opacity (0 = hidden, the default, §4.3.13.3.4).
     sub_rect: ?compose.Rect = null,
     sub_alpha: u8 = 0,
+    /// The part of the sub video shown, in aperture coordinates (null: all of it).
+    sub_crop: ?[4]u32 = null,
     /// Sub video luma key range (from the EVOB attributes), or null.
     luma_key: ?[2]u8 = null,
-    /// Gains: main audio per output channel, sub audio and effect audio overall.
-    main_gains: [mix.max_channels]f32 = @splat(1),
+    /// The applications' audio levels (Annex W, Table W-4; null: not set, the usual mix): main volumes, and the
+    /// sub and effect audio mix-downs.
+    main_volume: ?[mix.hd_channels]u8 = null,
+    sub_mix: ?[2][mix.hd_channels]u8 = null,
+    effect_mix: ?[2][mix.hd_channels]u8 = null,
+    /// Overall gains on top: sub audio (--hddvd-sub-mix) and effect audio.
     sub_gain: f32 = 1,
     effect_gain: f32 = 1,
-    /// An effect sound to start, taken by the mixer.
+    /// An effect sound to start, taken by the mixer, or the one playing to stop.
     effect: ?Effect = null,
+    stop_effect: bool = false,
     /// Bumped by the mixer when an effect sound finishes (for the engine's callbacks).
     effects_done: u32 = 0,
 
@@ -143,6 +150,22 @@ pub const Presentation = struct {
         _ = p.layout_gen.fetchAdd(1, .release);
     }
 
+    /// The sub video's area and crop (an application's changeLayout), keeping its opacity.
+    pub fn setSubArea(p: *Presentation, rect: ?compose.Rect, crop: ?[4]u32) void {
+        p.lockIt();
+        p.sub_rect = rect;
+        p.sub_crop = crop;
+        p.unlock();
+        _ = p.layout_gen.fetchAdd(1, .release);
+    }
+
+    pub fn setSubAlpha(p: *Presentation, alpha: u8) void {
+        p.lockIt();
+        p.sub_alpha = alpha;
+        p.unlock();
+        _ = p.layout_gen.fetchAdd(1, .release);
+    }
+
     pub fn lockIt(p: *Presentation) void {
         vlc.vlc_mutex_lock(&p.lock);
     }
@@ -181,6 +204,25 @@ pub const Presentation = struct {
         defer p.unlock();
         if (p.effect) |old| gpa.free(old.samples);
         p.effect = e;
+        p.stop_effect = false;
+    }
+
+    /// Stops the effect sound playing (or about to).
+    pub fn stopEffect(p: *Presentation) void {
+        p.lockIt();
+        defer p.unlock();
+        if (p.effect) |old| gpa.free(old.samples);
+        p.effect = null;
+        p.stop_effect = true;
+    }
+
+    /// The applications' audio levels (Table W-4).
+    pub fn setMixing(p: *Presentation, main: [mix.hd_channels]u8, sub: [2][mix.hd_channels]u8, effect: [2][mix.hd_channels]u8) void {
+        p.lockIt();
+        defer p.unlock();
+        p.main_volume = main;
+        p.sub_mix = sub;
+        p.effect_mix = effect;
     }
 
     // ---- the planes ---------------------------------------------------------------------------------------

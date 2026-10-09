@@ -18,6 +18,7 @@ const xpath = @import("../xpath.zig");
 const uri = @import("../uri.zig");
 const style = @import("style.zig");
 const timing_mod = @import("timing.zig");
+const raster = @import("../raster.zig");
 
 pub const core_ns = "http://www.dvdforum.org/2005/ihd";
 pub const state_ns = "http://www.dvdforum.org/2005/ihd#state";
@@ -106,6 +107,9 @@ pub const Elem = struct {
     mng_frame: ?u32 = null,
     /// Kept across syncs: false once the node left the page.
     live: bool = true,
+    /// A graphic object's Drawing Area (script/draw_api.zig), and its change count.
+    graphic: ?*const raster.Canvas = null,
+    graphic_gen: u32 = 0,
 };
 
 const Rule = struct { node: *dom.Node, select: ?xpath.XPath };
@@ -173,6 +177,35 @@ pub const Page = struct {
         p.gpa.free(e.state.value);
         p.gpa.free(e.seen.value);
         p.gpa.destroy(e);
+    }
+
+    /// document.load() (Annex Z.13.1.1.3, §7.2.4.2): the page again from its DOM as scripts left it, without
+    /// script overrides; error.BadPage if it is no longer a page.
+    pub fn reload(p: *Page) Error!void {
+        const root = p.doc.root() orelse return error.BadPage;
+        if (!root.is(core_ns, "root")) return error.BadPage;
+        for (p.rules.items) |*r| if (r.select) |*x| x.deinit();
+        p.rules.clearRetainingCapacity();
+        p.body = root.child(core_ns, "body");
+        try p.loadRules();
+        try p.sync();
+        for (p.elems.items) |e| {
+            p.gpa.free(e.state.value);
+            e.state = .{};
+        }
+        try p.initialState();
+        p.script.clearRetainingCapacity();
+        p.snapshot();
+        p.cascade();
+    }
+
+    /// The current value of style property `prop` of `e`, as getProperty and the property functions write it
+    /// (§7.5.2.4.3.2), allocated from `a`.
+    pub fn propertyString(p: *Page, a: std.mem.Allocator, e: *Elem, prop: style.Prop) ![]const u8 {
+        _ = p;
+        var w: std.Io.Writer.Allocating = .init(a);
+        try style.format(&w.writer, &e.style, prop, pctBase(e, prop));
+        return w.written();
     }
 
     pub fn elemOf(n: *const dom.Node) ?*Elem {

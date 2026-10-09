@@ -117,7 +117,8 @@ pub fn build(b: *std.Build) void {
     });
     addStb(b, test_mod, stb_dir);
     qjs.addTo(test_mod, b.graph.host, true);
-    const tests = b.addTest(.{ .root_module = test_mod });
+    const filter = b.option([]const u8, "test-filter", "Run only the tests whose name contains this");
+    const tests = b.addTest(.{ .root_module = test_mod, .filters = if (filter) |f| b.dupeStrings(&.{f}) else &.{} });
     b.step("test", "Run the unit tests").dependOn(&b.addRunArtifact(tests).step);
 }
 

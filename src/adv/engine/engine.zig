@@ -44,6 +44,33 @@ pub const Command = union(enum) {
     play_title: u16,
     /// Jumps within the current title to a title time (frames).
     jump: u64,
+    /// Holds the Title Timeline (an application is shutting down, §8.4.7) or releases it.
+    hold: bool,
+    /// A key no application consumed: its default input handler (Annex V).
+    default_key: u8,
+    /// Plays a title from a title time (Title.jump, Chapter.jump, Bookmark.jump).
+    jump_title: struct { title: u16, time: u64 },
+    /// Pauses or resumes the Title Timeline (Playlist.pause/play).
+    pause: bool,
+    /// Stops the player (Playlist.stop).
+    stop,
+    /// The current tracks (Algorithm A1 and track selection): video, audio and subtitle track numbers.
+    tracks: struct { video: ?u8, audio: ?u8, subtitle: ?u8 },
+    subtitle_visible: bool,
+    /// A main or sub video layout change over `ticks` application ticks (changeLayout).
+    layout: struct { main: bool, x: i32, y: i32, scale: ?[2]u8, crop: [4]u32, ticks: u32 },
+    /// The Outer Frame Color (Y, Cr, Cb).
+    outer_color: [3]u8,
+    sub_alpha: u8,
+    /// Audio levels (Table W-4): main volumes, sub and effect mix-downs.
+    mixing: struct { main: [8]u8, sub: [2][8]u8, effect: [2][8]u8 },
+    /// Plays a WAV file (owned by the command; the demux frees it) `repeat` times.
+    effect_play: struct { data: []u8, repeat: u32 },
+    effect_stop,
+    /// Soft reset with another playlist (Playlist.load); the URI is owned.
+    load_playlist: []u8,
+    /// StandardContentPlayer.play: to Standard Content.
+    standard_content: struct { vtsn: u16, menu: bool },
 };
 
 pub const Clocks = struct {
@@ -65,6 +92,10 @@ pub const TickRate = struct {
             24 => .{ .num = 24000, .den = 1001 },
             else => .{ .num = 60000, .den = 1001 },
         };
+    }
+
+    pub fn perSecond(r: TickRate) f64 {
+        return @as(f64, @floatFromInt(r.num)) / @as(f64, @floatFromInt(r.den));
     }
 
     /// Ticks elapsed in `t_us` microseconds (rounded down).
@@ -116,9 +147,12 @@ pub const Engine = struct {
     /// The last tick processed (counted from `start`).
     last_tick: ?u64 = null,
 
-    /// The current title (null: the First Play title), once one has begun.
+    /// The current title (null: the First Play title), once one has begun, and how many titles have begun.
     title: ?u16 = null,
     in_title: bool = false,
+    title_serial: u32 = 0,
+    /// How many jumps within the title (the Title Timeline moved).
+    jump_serial: u32 = 0,
     title_duration: u64 = 0,
     title_time: u64 = 0,
     play_state: PlayState = .playing,
@@ -223,6 +257,7 @@ pub const Engine = struct {
             .title_begin => |t| {
                 e.title = t.title;
                 e.in_title = true;
+                e.title_serial += 1;
                 e.title_duration = t.duration;
                 e.title_time = 0;
                 if (t.tick_divisor != e.divisor) {
@@ -232,7 +267,10 @@ pub const Engine = struct {
                 e.dirty = true;
             },
             .title_end => {},
-            .jump => |t| e.title_time = t,
+            .jump => |t| {
+                e.title_time = t;
+                e.jump_serial += 1;
+            },
             .play_state => |p| e.play_state = p,
             .mouse_move, .mouse_down, .mouse_up, .key_down, .key_up => {},
         }

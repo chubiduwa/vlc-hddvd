@@ -14,6 +14,8 @@ const advpck = @import("advpck.zig");
 const resman = @import("resman.zig");
 const pstore = @import("pstore.zig");
 const manifest = @import("manifest.zig");
+const filecache = @import("filecache.zig");
+const files_mod = @import("script/files.zig");
 
 const gpa = std.heap.c_allocator;
 
@@ -48,6 +50,10 @@ pub const Access = struct {
     checked_playlist: bool = false,
     /// The demux thread updates the File Cache while the engine thread reads it.
     lock: vlc.vlc_mutex_t = undefined,
+    /// Files as the applications' scripts see them (Annex Z.3), over the File Cache, the store and the disc.
+    files: files_mod.Files = undefined,
+    /// The Primary Video Set is being read from the disc: scripts cannot read disc files (Z.3).
+    disc_busy: std.atomic.Value(bool) = .init(false),
 
     pub fn create(obj: *vlc.vlc_object_t, fs: *vfs.Fs, disc: aca.DiscId) !*Access {
         const a = try gpa.create(Access);
@@ -66,7 +72,98 @@ pub const Access = struct {
             .menu_language = lang,
         };
         vlc.vlc_mutex_init(&a.lock);
+        a.files = .{
+            .gpa = gpa,
+            .temp = &a.res.cache.temp,
+            .store = &a.store,
+            .backend = .{
+                .ctx = a,
+                .resource = filesResource,
+                .disc_read = filesDiscRead,
+                .disc_list = filesDiscList,
+                .disc_stat = filesDiscStat,
+                .lock = filesLock,
+                .unlock = filesUnlock,
+                .disc_busy = filesDiscBusy,
+                .now_ms = filesNow,
+                .cache_available = filesCacheAvailable,
+            },
+        };
         return a;
+    }
+
+    // ---- the script API's files (files.zig's Backend; called with the lock held) -------------------------
+
+    fn of(ctx: *anyopaque) *Access {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn filesResource(ctx: *anyopaque, u: []const u8) ?[]const u8 {
+        return of(ctx).res.lookup(u);
+    }
+
+    fn filesDiscRead(ctx: *anyopaque, g: std.mem.Allocator, path: []const u8) anyerror!?[]u8 {
+        return of(ctx).fs.readFile(g, path);
+    }
+
+    /// The files (or the folders) of a disc folder: an entry that opens as a file is a file.
+    fn filesDiscList(ctx: *anyopaque, g: std.mem.Allocator, path: []const u8, dirs: bool) anyerror![][]u8 {
+        const a = of(ctx);
+        const names = try a.fs.listDir(g, path);
+        defer g.free(names);
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |n| g.free(n);
+            out.deinit(g);
+        }
+        for (names, 0..) |n, i| {
+            const keep = blk: {
+                const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ path, n }) catch break :blk false;
+                defer gpa.free(full);
+                var f = a.fs.openFile(full) catch break :blk dirs;
+                f.close();
+                break :blk !dirs;
+            };
+            if (keep) {
+                out.append(g, n) catch |err| {
+                    for (names[i..]) |m| g.free(m);
+                    return err;
+                };
+            } else g.free(n);
+        }
+        return out.toOwnedSlice(g);
+    }
+
+    fn filesDiscStat(ctx: *anyopaque, path: []const u8) ?files_mod.Stat {
+        const a = of(ctx);
+        if (a.fs.openFile(path)) |f| {
+            var x = f;
+            defer x.close();
+            return .{ .dir = false, .size = x.size, .modified = 0 };
+        } else |_| {}
+        const names = a.fs.listDir(gpa, path) catch return null;
+        vfs.freeNames(gpa, names);
+        return .{ .dir = true, .size = 0, .modified = 0 };
+    }
+
+    fn filesLock(ctx: *anyopaque) void {
+        vlc.vlc_mutex_lock(&of(ctx).lock);
+    }
+
+    fn filesUnlock(ctx: *anyopaque) void {
+        vlc.vlc_mutex_unlock(&of(ctx).lock);
+    }
+
+    fn filesDiscBusy(ctx: *anyopaque) bool {
+        return of(ctx).disc_busy.load(.monotonic);
+    }
+
+    fn filesNow(_: *anyopaque) i64 {
+        return @divTrunc(hddvd_now_us(), 1000);
+    }
+
+    fn filesCacheAvailable(ctx: *anyopaque) u64 {
+        return of(ctx).res.cache.freeBlocks() * filecache.block_size;
     }
 
     pub fn destroy(a: *Access) void {

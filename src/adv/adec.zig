@@ -259,19 +259,26 @@ fn release(s: *Sys, all: bool) void {
 fn output(s: *Sys, h: *Held, now: i64) void {
     if (s.out.n == 0) return;
     const pres = s.pres;
-    var gains: [mix.max_channels]f32 = undefined;
     pres.lockIt();
-    gains = pres.main_gains;
+    const volume = pres.main_volume;
+    const sub_mix = pres.sub_mix;
+    const effect_mix = pres.effect_mix;
     const sub_gain = pres.sub_gain;
     const effect_gain = pres.effect_gain;
     const new_effect = pres.effect;
     pres.effect = null;
+    const stop = pres.stop_effect;
+    pres.stop_effect = false;
     pres.unlock();
 
-    if (new_effect) |e| startEffect(s, e, now);
-    mix.applyGains(h.samples, s.out, &gains);
+    if (stop) s.effects.deinit(gpa);
+    if (new_effect) |e| startEffect(s, e, now, effect_mix);
+    if (volume) |v| {
+        const gains = mix.hdGains(s.out, v);
+        mix.applyGains(h.samples, s.out, &gains);
+    }
     if (sub_gain > 0 and s.sub_in.layout.n > 0) {
-        var m = mix.Matrix.default(s.sub_in.layout, s.out);
+        var m = if (sub_mix) |rows| mix.hdMatrix(s.sub_in.layout, s.out, rows) else mix.Matrix.default(s.sub_in.layout, s.out);
         m.scale(sub_gain);
         s.sub_fifo.mixInto(h.samples, s.out, h.pts, h.frames, &m, s.sub_in.layout);
     } else s.sub_fifo.mixInto(&.{}, s.out, h.pts, 0, &mix.Matrix{}, s.sub_in.layout); // keep the queue aligned
@@ -285,7 +292,7 @@ fn output(s: *Sys, h: *Held, now: i64) void {
 }
 
 /// Converts an effect sound to the output layout and rate and starts it (replacing any playing one).
-fn startEffect(s: *Sys, e: present.Effect, now: i64) void {
+fn startEffect(s: *Sys, e: present.Effect, now: i64, rows: ?[2][mix.hd_channels]u8) void {
     defer gpa.free(e.samples);
     // Requested while paused (nothing was being output): stale by now.
     if (now - e.at > effect_stale) return;
@@ -297,7 +304,7 @@ fn startEffect(s: *Sys, e: present.Effect, now: i64) void {
     const frames = resampled.items.len / src.n;
     const out = gpa.alloc(f32, frames * s.out.n) catch return;
     @memset(out, 0);
-    const m = mix.Matrix.default(src, s.out);
+    const m = if (rows) |hd| mix.hdMatrix(src, s.out, hd) else mix.Matrix.default(src, s.out);
     mix.mixFrames(out, s.out, resampled.items, src, frames, &m);
     s.effects.start(gpa, out, s.out.n);
 }

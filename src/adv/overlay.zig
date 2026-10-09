@@ -214,6 +214,7 @@ fn subVideo(view: *View, ts: i64, clears: []const planes.ClearRect, tail: **?*vl
     pres.lockIt();
     const alpha = pres.sub_alpha;
     const rect = pres.sub_rect;
+    const crop = pres.sub_crop;
     const key = pres.luma_key;
     pres.unlock();
 
@@ -221,7 +222,8 @@ fn subVideo(view: *View, ts: i64, clears: []const planes.ClearRect, tail: **?*vl
     defer pip.unlock();
     const f = pip.take(ts) orelse return;
     if (alpha == 0) return; // hidden
-    const src = vdec.yuvOf(f.pic) orelse return;
+    const full = vdec.yuvOf(f.pic) orelse return;
+    const src = if (crop) |c| full.crop(c, pres.aperture_w, pres.aperture_h) else full;
     const r = rect orelse compose.Rect{
         .x = @divTrunc(@as(i32, pres.aperture_w) - @as(i32, @intCast(src.width())), 2),
         .y = @divTrunc(@as(i32, pres.aperture_h) - @as(i32, @intCast(src.height())), 2),
@@ -235,7 +237,7 @@ fn subVideo(view: *View, ts: i64, clears: []const planes.ClearRect, tail: **?*vl
     const w: usize = @intCast(r.w);
     const h: usize = @intCast(r.h);
     const px = plane.p_pixels[0 .. pitch * h];
-    const matrix: compose.Matrix = if (src.height() > 576) .bt709 else .bt601;
+    const matrix: compose.Matrix = if (full.height() > 576) .bt709 else .bt601;
     compose.toRgba(px, pitch, w, h, src, alpha, key, matrix);
     planes.punch(px, pitch, 4, 3, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h }, clears, true);
     append(tail, region, r.x, r.y);

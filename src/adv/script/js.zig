@@ -9,9 +9,9 @@
 //! - arguments are converted by their Annex Z type (Tables Z-1 to Z-5), and API errors are Error objects whose
 //!   message names the exception (Z.1.3).
 //!
-//! API objects are Zig values behind one QuickJS class: each wrapper points to a Box naming the Zig type's
-//! description (`Info`) and the native value. A type describes itself with `pub const js_class: js.Class`, whose
-//! members are Zig functions; bindings convert their arguments and results at comptime.
+//! API objects are Zig values behind one QuickJS class: each wrapper points to a Box naming its `js.Class`, its
+//! native type and the native value. A type describes itself with `pub const js_class: js.Class`, whose members
+//! are Zig functions; bindings convert their arguments and results at comptime.
 //!
 //! One Runtime per engine thread; one Context per application (its own global object). No VLC dependency.
 
@@ -88,10 +88,13 @@ pub const Args = struct { v: []const Value };
 
 // ---- classes -----------------------------------------------------------------------------------------------------
 
-/// How a Zig type appears in script.
+/// How a Zig type appears in script. Several classes may share a native type (Element and Text are both
+/// dom.Node): wrappers record the native type, and `unwrap` checks that.
 pub const Class = struct {
     name: [:0]const u8,
     members: []const Member = &.{},
+    /// The class whose prototype this one's inherits from (Element from Node).
+    parent: ?*const Class = null,
     /// Called when the wrapper is collected (the Box owns the native value), or never (the native value is
     /// owned elsewhere and outlives its wrappers).
     finalize: ?*const fn (ptr: *anyopaque, rt: *Runtime) void = null,
@@ -99,6 +102,19 @@ pub const Class = struct {
     mark: ?*const fn (ptr: *anyopaque, rt: *c.JSRuntime, mark: ?*const c.JS_MarkFunc) void = null,
     /// Script may add properties to its objects (only Application Events, §8.2.4).
     extensible: bool = false,
+    /// The prototype inherits from Error.prototype (DOMException, EventException: plain objects, not wrappers).
+    error_proto: bool = false,
+    /// Properties computed when read (NodeList items, document.<id>).
+    exotic: ?*const Exotic = null,
+};
+
+/// Own properties an object computes: `obj[i]` for i < length (the ECMAScript bindings of NodeList and
+/// NamedNodeMap), and named ones that the prototype chain does not have.
+pub const Exotic = struct {
+    length: ?*const fn (cx: *Context, ptr: *anyopaque) u32 = null,
+    item: ?*const fn (cx: *Context, ptr: *anyopaque, i: u32) Error!Value = null,
+    /// The value of property `name`, or null if there is none.
+    named: ?*const fn (cx: *Context, ptr: *anyopaque, name: []const u8) Error!?Value = null,
 };
 
 pub const Member = struct {
@@ -114,7 +130,7 @@ pub const Member = struct {
 
 /// A function property bound to Zig function `f` (see `binding`).
 pub fn method(comptime name: [:0]const u8, comptime f: anytype) Member {
-    return .{ .name = name, .kind = .{ .method = .{ .f = binding(f), .length = scriptArity(@TypeOf(f)) } } };
+    return .{ .name = name, .kind = .{ .method = .{ .f = binding(f), .length = comptime scriptArity(@TypeOf(f)) } } };
 }
 
 /// A property with a getter (`get`, no script arguments) and, unless null, a setter (`set`, one argument).
@@ -135,29 +151,53 @@ pub fn constant(comptime name: [:0]const u8, comptime v: anytype) Member {
     } };
 }
 
-/// What a wrapper's Box points at.
-pub const Info = struct {
-    class: *const Class,
-};
+/// Identifies a native type (a mutable global, so never merged with another).
+pub const Token = struct { name: [*:0]const u8 };
 
-pub fn infoOf(comptime T: type) *const Info {
+pub fn tokenOf(comptime T: type) *Token {
     return &struct {
-        const info: Info = .{ .class = &T.js_class };
-    }.info;
+        var t: Token = .{ .name = @typeName(T) };
+    }.t;
 }
 
 const Box = struct {
-    info: *const Info,
-    ptr: *anyopaque,
+    class: *const Class,
+    token: *const Token,
+    /// null once the native value is gone (`kill`).
+    ptr: ?*anyopaque,
 };
+
+/// Detaches the wrapper object `obj` (a pointer kept with `objectPointer`) from its native value, which is going
+/// away: the object stays, but it is no longer an API object of its type (methods throw TypeError) and its
+/// finalizer is not called.
+pub fn kill(rt: *Runtime, obj: *anyopaque) void {
+    const v: Value = .{ .u = .{ .ptr = obj }, .tag = c.JS_TAG_OBJECT };
+    const box: *Box = @ptrCast(@alignCast(c.JS_GetOpaque(v, rt.class) orelse c.JS_GetOpaque(v, rt.exotic_class) orelse return));
+    box.ptr = null;
+}
+
+/// The object behind `v` (to find it again with `fromPointer`, without holding a reference).
+pub fn objectPointer(v: Value) *anyopaque {
+    return v.u.ptr.?;
+}
+
+/// A new reference to the object at `obj` (it must still be alive).
+pub fn fromPointer(cx: *Context, obj: *anyopaque) Value {
+    return cx.dup(.{ .u = .{ .ptr = obj }, .tag = c.JS_TAG_OBJECT });
+}
+
+fn boxOf(rt: *Runtime, v: Value) ?*Box {
+    return @ptrCast(@alignCast(c.JS_GetOpaque(v, rt.class) orelse c.JS_GetOpaque(v, rt.exotic_class) orelse return null));
+}
 
 // ---- the runtime -------------------------------------------------------------------------------------------------
 
 pub const Runtime = struct {
     rt: *c.JSRuntime,
     gpa: std.mem.Allocator,
-    /// The one class of API objects.
+    /// The class of API objects, and of those with computed properties.
     class: c.JSClassID = 0,
+    exotic_class: c.JSClassID = 0,
     /// Set from another thread to abort the running script (the engine is shutting down, §8.5).
     stop: std.atomic.Value(bool) = .init(false),
 
@@ -170,12 +210,75 @@ pub const Runtime = struct {
         c.JS_SetMemoryLimit(r.rt, memory_limit);
         c.JS_SetInterruptHandler(r.rt, interrupt, r);
         _ = c.JS_NewClassID(r.rt, &r.class);
+        _ = c.JS_NewClassID(r.rt, &r.exotic_class);
         const def: c.JSClassDef = .{ .class_name = "Object", .finalizer = finalizeBox, .gc_mark = markBox };
-        if (c.JS_NewClass(r.rt, r.class, &def) != 0) {
+        const def2: c.JSClassDef = .{ .class_name = "Object", .finalizer = finalizeBox, .gc_mark = markBox, .exotic = &exotic_methods };
+        if (c.JS_NewClass(r.rt, r.class, &def) != 0 or c.JS_NewClass(r.rt, r.exotic_class, &def2) != 0) {
             c.JS_FreeRuntime(r.rt);
             return error.OutOfMemory;
         }
         return r;
+    }
+
+    var exotic_methods: c.JSClassExoticMethods = .{ .get_own_property = exoticOwn, .get_own_property_names = exoticNames };
+
+    fn exoticOwn(ctx: ?*c.JSContext, desc: [*c]c.JSPropertyDescriptor, obj: Value, atom: c.JSAtom) callconv(.c) c_int {
+        const cx = Context.of(ctx);
+        const box = boxOf(cx.rt, obj) orelse return 0;
+        const ptr = box.ptr orelse return 0;
+        const ex = box.class.exotic orelse return 0;
+        var n: usize = 0;
+        const name_c = c.JS_AtomToCStringLen(ctx, &n, atom) orelse return -1;
+        defer c.JS_FreeCString(ctx, name_c);
+        const name = name_c[0..n];
+        const v: Value = blk: {
+            if (ex.length) |len| if (indexOf(name)) |i| {
+                if (i >= len(cx, ptr)) return 0;
+                break :blk ex.item.?(cx, ptr, i) catch |e| {
+                    _ = cx.throw(e);
+                    return -1;
+                };
+            };
+            const named = ex.named orelse return 0;
+            // What the prototype chain has is not shadowed.
+            const p = c.JS_GetPrototype(ctx, obj);
+            defer cx.free(p);
+            const has = c.JS_HasProperty(ctx, p, atom);
+            if (has != 0) return if (has < 0) -1 else 0;
+            const r = named(cx, ptr, name) catch |e| {
+                _ = cx.throw(e);
+                return -1;
+            };
+            break :blk r orelse return 0;
+        };
+        if (desc != null) {
+            desc.* = .{ .flags = c.JS_PROP_ENUMERABLE, .value = v, .getter = @"undefined", .setter = @"undefined" };
+        } else cx.free(v);
+        return 1;
+    }
+
+    fn exoticNames(ctx: ?*c.JSContext, ptab: [*c][*c]c.JSPropertyEnum, plen: [*c]u32, obj: Value) callconv(.c) c_int {
+        const cx = Context.of(ctx);
+        ptab.* = null;
+        plen.* = 0;
+        const box = boxOf(cx.rt, obj) orelse return 0;
+        const ptr = box.ptr orelse return 0;
+        const ex = box.class.exotic orelse return 0;
+        const len_f = ex.length orelse return 0;
+        const n = len_f(cx, ptr);
+        if (n == 0) return 0;
+        const tab: [*]c.JSPropertyEnum = @ptrCast(@alignCast(c.js_mallocz(ctx, n * @sizeOf(c.JSPropertyEnum)) orelse return -1));
+        for (0..n) |i| tab[i] = .{ .is_enumerable = true, .atom = c.JS_NewAtomUInt32(ctx, @intCast(i)) };
+        ptab.* = tab;
+        plen.* = n;
+        return 0;
+    }
+
+    /// A canonical array index ("0", "12"; not "01" or "-1").
+    fn indexOf(name: []const u8) ?u32 {
+        if (name.len == 0 or name.len > 10) return null;
+        if (name.len > 1 and name[0] == '0') return null;
+        return std.fmt.parseInt(u32, name, 10) catch null;
     }
 
     /// All contexts must be destroyed first.
@@ -195,15 +298,15 @@ pub const Runtime = struct {
 
     fn finalizeBox(rt: ?*c.JSRuntime, v: Value) callconv(.c) void {
         const r = of(rt);
-        const box: *Box = @ptrCast(@alignCast(c.JS_GetOpaque(v, r.class) orelse return));
-        if (box.info.class.finalize) |f| f(box.ptr, r);
+        const box = boxOf(r, v) orelse return;
+        if (box.ptr) |p| if (box.class.finalize) |f| f(p, r);
         r.gpa.destroy(box);
     }
 
     fn markBox(rt: ?*c.JSRuntime, v: Value, mark: ?*const c.JS_MarkFunc) callconv(.c) void {
         const r = of(rt);
-        const box: *Box = @ptrCast(@alignCast(c.JS_GetOpaque(v, r.class) orelse return));
-        if (box.info.class.mark) |f| f(box.ptr, rt.?, mark);
+        const box = boxOf(r, v) orelse return;
+        if (box.ptr) |p| if (box.class.mark) |f| f(p, rt.?, mark);
     }
 };
 
@@ -213,10 +316,12 @@ pub const Context = struct {
     rt: *Runtime,
     ctx: *c.JSContext,
     gpa: std.mem.Allocator,
-    /// Each API type's prototype in this context.
-    protos: std.AutoHashMapUnmanaged(*const Info, Value) = .empty,
+    /// Each API class's prototype in this context.
+    protos: std.AutoHashMapUnmanaged(*const Class, Value) = .empty,
     /// What the API objects of this context belong to (the application's script host).
     owner: ?*anyopaque = null,
+    /// Where uncaught exceptions are reported (`report`).
+    log: ?*const fn (owner: ?*anyopaque, msg: []const u8) void = null,
 
     pub fn create(rt: *Runtime, owner: ?*anyopaque) Error!*Context {
         const cx = try rt.gpa.create(Context);
@@ -291,6 +396,24 @@ pub const Context = struct {
         return out.toOwnedSlice(gpa);
     }
 
+    /// Reports and clears the pending exception (an uncaught one: the work item ends, §8.5).
+    pub fn report(cx: *Context, what: []const u8) void {
+        const msg = cx.takeException(cx.gpa) catch return;
+        defer cx.gpa.free(msg);
+        const f = cx.log orelse return;
+        var buf: [1024]u8 = undefined;
+        f(cx.owner, std.fmt.bufPrint(&buf, "{s}: {s}", .{ what, msg }) catch msg);
+    }
+
+    /// Calls `f` with `this` and `args`; an exception is reported, not returned. The result is freed.
+    pub fn callReport(cx: *Context, f: Value, this: Value, args: []const Value, what: []const u8) void {
+        const r = cx.call(f, this, args) catch {
+            cx.report(what);
+            return;
+        };
+        cx.free(r);
+    }
+
     /// Calls `f` (owned by the caller) with `this` and `args`; the result is the caller's.
     pub fn call(cx: *Context, f: Value, this: Value, args: []const Value) Error!Value {
         const r = c.JS_Call(cx.ctx, f, this, @intCast(args.len), @constCast(args.ptr));
@@ -336,6 +459,11 @@ pub const Context = struct {
 
     pub fn array(cx: *Context) Error!Value {
         return cx.check(c.JS_NewArray(cx.ctx));
+    }
+
+    /// `a === b`.
+    pub fn same(cx: *Context, a: Value, b: Value) bool {
+        return c.JS_IsStrictEqual(cx.ctx, a, b);
     }
 
     pub fn isFunction(cx: *Context, v: Value) bool {
@@ -407,15 +535,26 @@ pub const Context = struct {
 
     /// The prototype of API type T in this context (borrowed).
     pub fn proto(cx: *Context, comptime T: type) Error!Value {
-        return cx.protoOf(infoOf(T));
+        return cx.protoOf(&T.js_class);
     }
 
-    fn protoOf(cx: *Context, info: *const Info) Error!Value {
-        if (cx.protos.get(info)) |p| return p;
-        const p = try cx.object();
+    /// The prototype of `class` in this context (borrowed), made on first use.
+    pub fn protoOf(cx: *Context, class: *const Class) Error!Value {
+        if (cx.protos.get(class)) |p| return p;
+        const p = if (class.parent) |up|
+            try cx.check(c.JS_NewObjectProto(cx.ctx, try cx.protoOf(up)))
+        else if (class.error_proto) blk: {
+            const g = cx.global();
+            defer cx.free(g);
+            const ctor = try cx.get(g, "Error");
+            defer cx.free(ctor);
+            const ep = try cx.get(ctor, "prototype");
+            defer cx.free(ep);
+            break :blk try cx.check(c.JS_NewObjectProto(cx.ctx, ep));
+        } else try cx.object();
         errdefer cx.free(p);
-        try cx.defineMembers(p, info.class.members);
-        try cx.protos.put(cx.gpa, info, p);
+        try cx.defineMembers(p, class.members);
+        try cx.protos.put(cx.gpa, class, p);
         return p;
     }
 
@@ -440,43 +579,52 @@ pub const Context = struct {
         };
     }
 
-    /// A new script object for `ptr`, of API type T. The wrapper owns `ptr` if T has a finalizer.
+    /// A new script object for `ptr`, of API type T (class T.js_class). The wrapper owns `ptr` if the class
+    /// has a finalizer.
     pub fn wrap(cx: *Context, comptime T: type, ptr: *T) Error!Value {
-        return cx.wrapInfo(infoOf(T), ptr);
+        return cx.wrapAs(T, &T.js_class, ptr);
     }
 
-    fn wrapInfo(cx: *Context, info: *const Info, ptr: *anyopaque) Error!Value {
-        const p = try cx.protoOf(info);
+    /// A new script object of `class` for native value `ptr` of type T.
+    pub fn wrapAs(cx: *Context, comptime T: type, class: *const Class, ptr: *T) Error!Value {
+        const p = try cx.protoOf(class);
         const box = try cx.gpa.create(Box);
-        box.* = .{ .info = info, .ptr = ptr };
-        const obj = c.JS_NewObjectProtoClass(cx.ctx, p, cx.rt.class);
+        box.* = .{ .class = class, .token = tokenOf(T), .ptr = ptr };
+        const obj = c.JS_NewObjectProtoClass(cx.ctx, p, if (class.exotic != null) cx.rt.exotic_class else cx.rt.class);
         if (c.JS_IsException(obj)) {
             cx.gpa.destroy(box);
             return error.Thrown;
         }
         _ = c.JS_SetOpaque(obj, box);
-        if (!info.class.extensible) _ = c.JS_PreventExtensions(cx.ctx, obj);
+        if (!class.extensible) _ = c.JS_PreventExtensions(cx.ctx, obj);
         return obj;
     }
 
-    /// The native value behind `v` if it is an API object of type T.
+    /// The native value behind `v` if it is an API object of native type T.
     pub fn unwrap(cx: *Context, comptime T: type, v: Value) ?*T {
-        const box: *Box = @ptrCast(@alignCast(c.JS_GetOpaque(v, cx.rt.class) orelse return null));
-        if (box.info != infoOf(T)) return null;
-        return @ptrCast(@alignCast(box.ptr));
+        const box = boxOf(cx.rt, v) orelse return null;
+        if (box.token != tokenOf(T)) return null;
+        return @ptrCast(@alignCast(box.ptr orelse return null));
+    }
+
+    /// The class of API object `v`, or null.
+    pub fn classOf(cx: *Context, v: Value) ?*const Class {
+        const box = boxOf(cx.rt, v) orelse return null;
+        if (box.ptr == null) return null;
+        return box.class;
     }
 
     /// Binds `name` on the Global object to a constructor function for API type T that throws `err` when
     /// called or constructed (Annex Z: TypeError; the XML API's: EvalError), with T's prototype and T's
     /// constants (`statics`) on it.
-    pub fn exposeConstructor(cx: *Context, comptime T: type, comptime name: [:0]const u8, comptime err: Error, statics: []const Member) Error!void {
+    pub fn exposeConstructor(cx: *Context, class: *const Class, comptime name: [:0]const u8, comptime err: Error, statics: []const Member) Error!void {
         const f = try cx.check(c.JS_NewCFunction2(cx.ctx, struct {
             fn call(ctx: ?*c.JSContext, _: Value, _: c_int, _: [*c]Value) callconv(.c) Value {
                 return Context.of(ctx).throw(err);
             }
         }.call, name, 0, c.JS_CFUNC_constructor_or_func, 0));
         errdefer cx.free(f);
-        const p = try cx.proto(T);
+        const p = try cx.protoOf(class);
         if (c.JS_SetConstructor(cx.ctx, f, p) < 0) return error.Thrown;
         try cx.defineMembers(f, statics);
         const g = cx.global();
@@ -599,7 +747,8 @@ fn consumesArg(comptime T: type) bool {
 }
 
 /// A C function for Zig function `f`. Its first parameter is the object: `*T` for API type T (TypeError if
-/// `this` is not one), or `*Context` for functions of the context (the Global/Application object). Further
+/// `this` is not one), `*O` for a type with `pub const js_owner = true` (the context's owner, whatever `this`
+/// is: the Global/Application object's members), or `*Context`. Further
 /// parameters take the script arguments in order, converted by type:
 ///   i32 int, u32 unsigned int, f64 double, Number, bool Boolean, []const u8 String (ToString; valid during the
 ///   call), NullStr, Value (borrowed, as is), ?X (X, or null when the argument is absent or undefined);
@@ -621,7 +770,11 @@ pub fn binding(comptime f: anytype) *const c.JSCFunction {
                 const P = p.?;
                 if (i == 0 and P != *Context) {
                     const Self = @typeInfo(P).pointer.child;
-                    args[0] = cx.unwrap(Self, this) orelse return c.JS_ThrowTypeError(ctx, "not a " ++ Self.js_class.name);
+                    if (@hasDecl(Self, "js_owner")) {
+                        args[0] = @ptrCast(@alignCast(cx.owner.?));
+                    } else {
+                        args[0] = cx.unwrap(Self, this) orelse return c.JS_ThrowTypeError(ctx, "not a " ++ comptime shortName(Self));
+                    }
                 } else if (P == *Context) {
                     args[i] = cx;
                 } else if (P == This) {
@@ -638,6 +791,14 @@ pub fn binding(comptime f: anytype) *const c.JSCFunction {
             return result(cx, r);
         }
     }.call;
+}
+
+/// The name of an API type in messages: its class's, else the last part of the Zig type name.
+fn shortName(comptime T: type) [:0]const u8 {
+    if (@hasDecl(T, "js_class")) return T.js_class.name;
+    const n = @typeName(T);
+    const dot = std.mem.lastIndexOfScalar(u8, n, '.') orelse return n;
+    return n[dot + 1 ..];
 }
 
 fn convertArg(cx: *Context, comptime P: type, v: Value, str: *?[*c]const u8) Error!P {
@@ -836,7 +997,7 @@ test "Annex Z argument types, exceptions and API objects" {
     const g = cx.global();
     defer cx.free(g);
     try cx.defineValue(g, "probe", try cx.wrap(Probe, &probe), 0);
-    try cx.exposeConstructor(Probe, "Probe", error.TypeError, &.{constant("ANSWER", 42)});
+    try cx.exposeConstructor(&Probe.js_class, "Probe", error.TypeError, &.{constant("ANSWER", 42)});
     try testing.run(cx,
         \\// int (Table Z-1)
         \\assertEq(probe.int(3.9), 3); assertEq(probe.int(-3.9), -3); assertEq(probe.int("12"), 12);

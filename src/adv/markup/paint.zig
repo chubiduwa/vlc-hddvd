@@ -169,6 +169,13 @@ const Painter = struct {
         const ty = e.node.attr("type") orelse return;
         const pe = layout.physEdges(e);
         const content = rect(p.ox + b.x + pe[3], p.oy + b.y + pe[0], b.w - pe[1] - pe[3], b.h - pe[0] - pe[2]);
+        // A graphic object: its Drawing Area (scripts draw in it), scaled to the content box.
+        if (e.graphic) |g| {
+            if (!s.visible or s.opacity == 0) return;
+            const clip = content.intersect(p.clip) orelse return;
+            p.f.canvas.blitScaled(clip, content, g.*, alpha(s.opacity));
+            return;
+        }
         if (std.mem.eql(u8, ty, "application/x-clearrect")) {
             const target: planes.Target = if (std.mem.eql(u8, param(e, "TargetPlane") orelse "main", "sub")) .sub else .main;
             p.f.clearRect(p.clip, content, target) catch {};
@@ -360,4 +367,30 @@ test "image objects: a still's background is its src, an MNG draws its frame ove
     f.canvas.clear(f.canvas.bounds(), f.canvas.bounds());
     paint(gpa, p, &lay, tr.res(), f, .{ .x = 0, .y = 0, .w = 100, .h = 50 });
     try testing.expectEqual(raster.Px{ 0, 0, 255, 255 }, f.canvas.at(10, 0));
+}
+
+test "graphic objects: the Drawing Area scaled to the content box" {
+    const gpa = testing.allocator;
+    var tr: TestRes = .{ .img = .{ .w = 1, .h = 1, .data = .{ .still = try raster.Canvas.init(gpa, 1, 1) } } };
+    defer tr.img.deinit(gpa);
+    var area = try raster.Canvas.init(gpa, 2, 1);
+    defer area.deinit(gpa);
+    area.px[0] = .{ 255, 0, 0, 255 };
+    const p = try Page.fromBytes(gpa, null,
+        \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style" xml:lang="en"><body>
+        \\<object id="g" type="application/x-graphic" style:position="absolute" style:x="4px" style:y="0px" style:width="8px" style:height="4px"/>
+        \\</body></root>
+    , "file:///dvddisc/p.xmu", 1080);
+    defer p.destroy();
+    Page.elemOf(p.doc.getElementById("g").?).?.graphic = &area;
+    var lay = layout.Layout.init(gpa);
+    defer lay.deinit();
+    lay.run(p, tr.res(), 100, 50);
+    const f = try planes.Frame.create(gpa, 64, 64);
+    defer f.unref();
+    paint(gpa, p, &lay, tr.res(), f, .{ .x = 0, .y = 0, .w = 100, .h = 50 });
+    // The red left half of the area covers the left half of the 8×4 box; the right half is transparent.
+    try testing.expectEqual(raster.Px{ 255, 0, 0, 255 }, f.canvas.at(4, 0));
+    try testing.expectEqual(raster.Px{ 255, 0, 0, 255 }, f.canvas.at(5, 3));
+    try testing.expectEqual(raster.Px{ 0, 0, 0, 0 }, f.canvas.at(11, 2));
 }

@@ -26,6 +26,8 @@ const overlay = @import("overlay.zig");
 const access_mod = @import("access.zig");
 const engine = @import("engine/engine.zig");
 const host_mod = @import("engine/host.zig");
+const compose = @import("compose.zig");
+const mix = @import("mix.zig");
 const keys = engine.keys;
 
 const gpa = std.heap.c_allocator;
@@ -57,6 +59,7 @@ extern fn hddvd_mouse_new(demux: *vlc.demux_t) ?*anyopaque;
 extern fn hddvd_mouse_delete(demux: *vlc.demux_t, m: ?*anyopaque) void;
 extern fn hddvd_es_add_spu(demux: *vlc.demux_t, codec: u32, extra: [*]const u8, len: usize, desc: [*:0]const u8) ?*vlc.es_out_id_t;
 extern fn hddvd_es_del(demux: *vlc.demux_t, es: *vlc.es_out_id_t) void;
+extern fn hddvd_input_pause(demux: *vlc.demux_t, paused: bool) void;
 
 fn log(obj: *vlc.vlc_object_t, prio: c_int, src: std.builtin.SourceLocation, comptime fmt: [*:0]const u8, args: anytype) void {
     @call(.auto, vlc.vlc_Log, .{ obj, prio, "hddvd", src.file, @as(c_uint, src.line), src.fn_name, fmt } ++ args);
@@ -95,6 +98,16 @@ const EsTrack = struct { es: *vlc.es_out_id_t, id: c_int };
 
 /// A stream forwarded into a main ES (sub video into the main video, sub audio into the main audio).
 const SubStream = struct { es: ?*vlc.es_out_id_t = null, id: c_int = -1, codec: u32 = 0 };
+
+/// A sub video layout change over time: from one area and crop to another, linearly.
+const LayoutAnim = struct {
+    from: compose.Rect,
+    to: compose.Rect,
+    from_crop: [4]u32,
+    to_crop: [4]u32,
+    start: i64,
+    duration: i64,
+};
 
 /// What happens once the current clip has been presented.
 const Next = union(enum) {
@@ -167,6 +180,25 @@ pub const Player = struct {
     last_pts: i64 = 0,
     /// --hddvd-markup-show (owned).
     markup_show: []u8 = &.{},
+    /// The playlist's URI (owned), the disc's Content ID as a GUID ("" if unused), and whether the disc also
+    /// has Standard Content: for the applications' Player API.
+    playlist_uri: []u8 = &.{},
+    content_id: [36]u8 = undefined,
+    content_id_len: u8 = 0,
+    has_standard_content: bool = false,
+
+    // What the applications asked for (the Player API).
+    /// The Title Timeline is held (an application is shutting down, §8.4.7): nothing more is read.
+    held: bool = false,
+    /// VLC is paused (DEMUX_SET_PAUSE_STATE).
+    paused: bool = false,
+    /// The subtitle track chosen, and whether subtitles are shown.
+    sub_track: ?u8 = null,
+    subtitle_visible: bool = true,
+    /// The sub video's area and crop as last set, and a change in progress (changeLayout with a duration).
+    sub_rect: ?compose.Rect = null,
+    sub_crop: ?[4]u32 = null,
+    sub_anim: ?LayoutAnim = null,
 
     fn tb(p: *const Player) xpl.TimeBase {
         return p.pl.time_base;
@@ -196,6 +228,7 @@ pub const Player = struct {
         p.tracks.deinit(gpa);
         p.commands.deinit(gpa);
         gpa.free(p.markup_show);
+        gpa.free(p.playlist_uri);
         p.vti.deinit();
         p.pl.deinit();
         p.access.destroy();
@@ -273,31 +306,48 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
             defer hddvd_free(str);
             p.markup_show = gpa.dupe(u8, std.mem.span(str)) catch &.{};
         }
-        p.host = host_mod.Host.create(o, pr, p.mouse, .{
-            .tick_base = p.pl.tick_base,
-            .fps = @intCast(p.pl.time_base.fps()),
-            .test_page = hddvd_inherit_bool(o, "hddvd-test-page"),
-            .apps = .{
-                .pl = &p.pl,
-                .loader = .{ .ctx = p.access, .read = readForApps },
-                .menu_language = if (p.access.menu_language.len > 0) p.access.menu_language else p.pl.default_language,
-                .show = p.markup_show,
-            },
-        }) catch |err| blk: {
-            log(o, vlc.VLC_MSG_ERR, @src(), "cannot start the application engine (%s)", .{@errorName(err).ptr});
-            break :blk null;
-        };
+        startHost(demux, pr);
     }
-    if (p.pl.first_play != null) {
-        startTitle(demux, null, 0);
-    } else if (timeline.nextTitle(&p.pl, null)) |t| {
-        startTitle(demux, t, 0);
-    } else p.stopped = true;
+    startPlaylist(demux);
     if (p.ps == null and !p.stopped) {
         close(demux);
         return vlc.VLC_EGENERIC;
     }
     return vlc.VLC_SUCCESS;
+}
+
+/// Starts the application engine for the current playlist.
+fn startHost(demux: *vlc.demux_t, pr: *present.Presentation) void {
+    const p = playerOf(demux);
+    const o = asObj(demux);
+    p.host = host_mod.Host.create(o, pr, p.mouse, .{
+        .tick_base = p.pl.tick_base,
+        .fps = @intCast(p.pl.time_base.fps()),
+        .test_page = hddvd_inherit_bool(o, "hddvd-test-page"),
+        .apps = .{
+            .pl = &p.pl,
+            .loader = .{ .ctx = p.access, .read = readForApps },
+            .menu_language = if (p.access.menu_language.len > 0) p.access.menu_language else p.pl.default_language,
+            .show = p.markup_show,
+            .files = &p.access.files,
+            .playlist_uri = p.playlist_uri,
+            .content_id = p.content_id[0..p.content_id_len],
+            .has_standard_content = p.has_standard_content,
+        },
+    }) catch |err| blk: {
+        log(o, vlc.VLC_MSG_ERR, @src(), "cannot start the application engine (%s)", .{@errorName(err).ptr});
+        break :blk null;
+    };
+}
+
+/// Plays the FirstPlayTitle, else title 1.
+fn startPlaylist(demux: *vlc.demux_t) void {
+    const p = playerOf(demux);
+    if (p.pl.first_play != null) {
+        startTitle(demux, null, 0);
+    } else if (timeline.nextTitle(&p.pl, null)) |t| {
+        startTitle(demux, t, 0);
+    } else p.stopped = true;
 }
 
 /// --hddvd-pip=x,y,w,h[,alpha] and --hddvd-sub-mix=level: show the sub video and mix the sub audio without the
@@ -334,6 +384,8 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
     const content = aca.DiscId.guid(disc_id.content_id);
     var pl_bytes: ?[]u8 = null;
     defer if (pl_bytes) |b| gpa.free(b);
+    var pl_uri: ?[]u8 = null;
+    errdefer if (pl_uri) |u| gpa.free(u);
     var zb: [256]u8 = undefined;
     for ([_][]const u8{ "VPLST", "APLST" }) |kind| {
         var best: ?[]const u8 = null;
@@ -348,15 +400,20 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
         }
         if (disc_id.search_flag & 1 == 0) if (content) |cid| if (acc.store.findPlaylist(&cid, kind)) |f| if (f.number > best_n) {
             const u = try std.fmt.allocPrint(gpa, "file:///required/{s}/{s}{d:0>3}.XPL", .{ &cid, kind, f.number });
-            defer gpa.free(u);
             pl_bytes = acc.read(u) catch null;
-            if (pl_bytes != null) log(o, vlc.VLC_MSG_DBG, @src(), "playlist %s", .{z(&zb, u)});
+            if (pl_bytes != null) {
+                log(o, vlc.VLC_MSG_DBG, @src(), "playlist %s", .{z(&zb, u)});
+                pl_uri = u;
+            } else gpa.free(u);
         };
         if (pl_bytes == null) if (best) |n| {
             const path = try std.fmt.allocPrint(gpa, "ADV_OBJ/{s}", .{n});
             defer gpa.free(path);
             pl_bytes = try fs.readFile(gpa, path);
-            if (pl_bytes != null) log(o, vlc.VLC_MSG_DBG, @src(), "playlist %s", .{z(&zb, path)});
+            if (pl_bytes != null) {
+                log(o, vlc.VLC_MSG_DBG, @src(), "playlist %s", .{z(&zb, path)});
+                pl_uri = try std.fmt.allocPrint(gpa, "file:///dvddisc/{s}", .{path});
+            }
         };
         if (pl_bytes != null) break;
     }
@@ -366,7 +423,22 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
     const vti_bytes = (try fs.readFile(gpa, "HVDVD_TS/HVA00001.VTI")) orelse return error.NoVti;
     defer gpa.free(vti_bytes);
     const v = try vti_mod.parse(gpa, vti_bytes);
-    p.* = .{ .obj = o, .fs = fs, .pl = pl, .vti = v, .disc_id = disc_id, .access = acc };
+    var sc = fs.openFile("HVDVD_TS/HV000I01.IFO") catch null;
+    if (sc) |*f| f.close();
+    p.* = .{
+        .obj = o,
+        .fs = fs,
+        .pl = pl,
+        .vti = v,
+        .disc_id = disc_id,
+        .access = acc,
+        .playlist_uri = pl_uri.?,
+        .has_standard_content = sc != null,
+    };
+    if (content) |cid| {
+        p.content_id = cid;
+        p.content_id_len = cid.len;
+    }
     acc.configure(&p.pl);
 }
 
@@ -582,8 +654,14 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
     const p = playerOf(demux);
     p.menu_requested = false;
     runCommands(demux);
+    p.access.disc_busy.store(!p.stopped and !p.paused and !p.held, .monotonic);
     if (p.stopped) return 0;
     keepOverlay(demux);
+    animateLayout(demux);
+    if (p.held) {
+        hddvd_sleep_ms(10);
+        return 1;
+    }
     switch (p.next) {
         .none => {},
         else => {
@@ -642,15 +720,215 @@ fn runCommands(demux: *vlc.demux_t) void {
     const h = p.host orelse return;
     h.takeCommands(&p.commands);
     defer p.commands.clearRetainingCapacity();
-    for (p.commands.items) |c| switch (c) {
+    const o = asObj(demux);
+    var zb: [256]u8 = undefined;
+    for (p.commands.items, 0..) |c, ci| switch (c) {
         .play_title => |i| if (i < p.pl.titles.len) startTitle(demux, i, 0),
         .jump => |t| _ = jump(demux, t),
+        .jump_title => |j| {
+            if (j.title >= p.pl.titles.len) continue;
+            if (p.title == j.title and !p.stopped) {
+                _ = jump(demux, j.time);
+            } else startTitle(demux, j.title, j.time);
+        },
+        .hold => |on| p.held = on,
+        .default_key => {}, // the engine carries out the Annex V defaults itself
+        .pause => |on| hddvd_input_pause(demux, on),
+        .stop => {
+            log(o, vlc.VLC_MSG_DBG, @src(), "the application stopped the player", .{});
+            p.stopped = true;
+        },
+        .tracks => |t| {
+            if (t.subtitle) |n| p.sub_track = n;
+            selectTracks(demux, t.audio);
+        },
+        .subtitle_visible => |v| {
+            p.subtitle_visible = v;
+            selectTracks(demux, null);
+        },
+        .layout => |l| setLayout(demux, l),
+        .outer_color => |col| if (p.pres) |pr| {
+            pr.lockIt();
+            pr.outer = col;
+            pr.unlock();
+        },
+        .sub_alpha => |a| if (p.pres) |pr| pr.setSubAlpha(a),
+        .mixing => |m| if (p.pres) |pr| pr.setMixing(m.main, m.sub, m.effect),
+        .effect_play => |e| {
+            defer gpa.free(e.data);
+            const pr = p.pres orelse continue;
+            const w = mix.decodeWav(gpa, e.data, e.repeat) catch |err| {
+                log(o, vlc.VLC_MSG_WARN, @src(), "effect sound: %s", .{@errorName(err).ptr});
+                continue;
+            };
+            pr.playEffect(.{ .samples = w.samples, .channels = w.channels, .rate = w.rate, .at = hddvd_now_us() });
+        },
+        .effect_stop => if (p.pres) |pr| pr.stopEffect(),
+        .load_playlist => |u| {
+            defer gpa.free(u);
+            // The engine is restarted: the commands after this one were for the old playlist.
+            for (p.commands.items[ci + 1 ..]) |rest| freeCommand(rest);
+            p.commands.clearRetainingCapacity();
+            loadPlaylist(demux, u) catch |err| log(o, vlc.VLC_MSG_ERR, @src(), "cannot load the playlist %s (%s)", .{ z(&zb, u), @errorName(err).ptr });
+            return;
+        },
+        .standard_content => |sc| log(o, vlc.VLC_MSG_WARN, @src(), "StandardContentPlayer.play(%u, %s): playing Standard Content from Advanced Content is not supported", .{
+            @as(c_uint, sc.vtsn), if (sc.menu) "menu".ptr else "title".ptr,
+        }),
     };
+}
+
+fn freeCommand(c: engine.Command) void {
+    switch (c) {
+        .effect_play => |e| gpa.free(e.data),
+        .load_playlist => |u| gpa.free(u),
+        else => {},
+    }
+}
+
+/// Selects the main audio track `audio` (if not null) and the chosen subtitle track (or none while subtitles
+/// are hidden), by their stream numbers in the current clip.
+fn selectTracks(demux: *vlc.demux_t, audio: ?u8) void {
+    const p = playerOf(demux);
+    const span = p.span orelse return;
+    const clip = span.clip;
+    if (audio) |n| for (clip.audio) |a| {
+        if (a.track != n) continue;
+        for (p.tracks.items) |t| {
+            if ((t.id & 0xff00) != 0xbd00) continue;
+            const sub: u8 = @intCast(t.id & 0xff);
+            if (isMainAudio(sub) and (sub & 7) == a.stream -| 1) hddvd_es_select(demux, t.es, true);
+        }
+        break;
+    };
+    // The subtitle's decoding stream number.
+    var want: ?u5 = null;
+    if (p.subtitle_visible) if (p.sub_track) |n| for (clip.subtitle) |st| {
+        if (st.track != n) continue;
+        const attr = if (p.evob) |e| p.vti.attrOf(e) else null;
+        if (attr) |a| want = a.hdSubpStream(st.stream -| 1);
+        break;
+    };
+    for (p.spus.items) |t| {
+        const on = if (want) |w| (t.id & 0x1f) == w else false;
+        if (on != hddvd_es_selected(demux, t.es)) hddvd_es_select(demux, t.es, on);
+    }
+}
+
+/// Main or sub video layout (changeLayout). The main video is VLC's own video plane and keeps its place; the
+/// sub video moves, at once or over the duration.
+fn setLayout(demux: *vlc.demux_t, l: @FieldType(engine.Command, "layout")) void {
+    const p = playerOf(demux);
+    const pr = p.pres orelse return;
+    const aw: i32 = pr.aperture_w;
+    const ah: i32 = pr.aperture_h;
+    const rect: compose.Rect = if (l.scale) |sc| .{
+        .x = l.x,
+        .y = l.y,
+        .w = @intCast(@as(u64, l.crop[2]) * sc[0] / @max(sc[1], 1)),
+        .h = @intCast(@as(u64, l.crop[3]) * sc[0] / @max(sc[1], 1)),
+    } else .{ .x = 0, .y = 0, .w = aw, .h = ah };
+    const full = l.crop[0] == 0 and l.crop[1] == 0 and l.crop[2] == aw and l.crop[3] == ah;
+    if (l.main) {
+        pr.lockIt();
+        pr.main_rect = if (l.scale == null) null else rect;
+        pr.unlock();
+        log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "main video layout %d,%d %dx%d (not applied: VLC places the main video)", .{
+            rect.x, rect.y, rect.w, rect.h,
+        });
+        return;
+    }
+    const crop: ?[4]u32 = if (full) null else l.crop;
+    const from = p.sub_rect;
+    p.sub_anim = null;
+    if (l.ticks > 0) if (from) |f| {
+        const fc = p.sub_crop orelse [4]u32{ 0, 0, @intCast(aw), @intCast(ah) };
+        p.sub_anim = .{
+            .from = f,
+            .to = rect,
+            .from_crop = fc,
+            .to_crop = l.crop,
+            .start = hddvd_now_us(),
+            .duration = engine.TickRate.of(p.pl.tick_base).us(l.ticks),
+        };
+    };
+    p.sub_rect = rect;
+    p.sub_crop = crop;
+    if (p.sub_anim == null) pr.setSubArea(rect, crop);
+}
+
+/// Moves a sub video layout change on.
+fn animateLayout(demux: *vlc.demux_t) void {
+    const p = playerOf(demux);
+    const a = p.sub_anim orelse return;
+    const pr = p.pres orelse return;
+    // The change follows the title timeline: it waits while paused.
+    if (p.paused) {
+        p.sub_anim.?.start += 10_000;
+        return;
+    }
+    const el = hddvd_now_us() - a.start;
+    if (el >= a.duration) {
+        p.sub_anim = null;
+        pr.setSubArea(p.sub_rect, p.sub_crop);
+        return;
+    }
+    const k: f64 = @as(f64, @floatFromInt(el)) / @as(f64, @floatFromInt(a.duration));
+    const lerp = struct {
+        fn i(x: i32, y: i32, t: f64) i32 {
+            return @intFromFloat(@round(@as(f64, @floatFromInt(x)) + (@as(f64, @floatFromInt(y)) - @as(f64, @floatFromInt(x))) * t));
+        }
+        fn u(x: u32, y: u32, t: f64) u32 {
+            return @intCast(@max(i(@intCast(x), @intCast(y), t), 0));
+        }
+    };
+    pr.setSubArea(.{
+        .x = lerp.i(a.from.x, a.to.x, k),
+        .y = lerp.i(a.from.y, a.to.y, k),
+        .w = lerp.i(a.from.w, a.to.w, k),
+        .h = lerp.i(a.from.h, a.to.h, k),
+    }, .{
+        lerp.u(a.from_crop[0], a.to_crop[0], k), lerp.u(a.from_crop[1], a.to_crop[1], k),
+        lerp.u(a.from_crop[2], a.to_crop[2], k), lerp.u(a.from_crop[3], a.to_crop[3], k),
+    });
+}
+
+/// Playlist.load: a soft reset with another playlist (§4.3.22.3). The applications are restarted.
+fn loadPlaylist(demux: *vlc.demux_t, u: []const u8) !void {
+    const p = playerOf(demux);
+    const bytes = try p.access.read(u);
+    defer gpa.free(bytes);
+    var pl = try xpl.parse(gpa, aca.unwrap(bytes));
+    errdefer pl.deinit();
+    const new_uri = try gpa.dupe(u8, u);
+    if (p.host) |h| h.destroy();
+    p.host = null;
+    p.pl.deinit();
+    p.pl = pl;
+    gpa.free(p.playlist_uri);
+    p.playlist_uri = new_uri;
+    p.access.configure(&p.pl);
+    p.held = false;
+    p.sub_track = null;
+    p.subtitle_visible = true;
+    p.sub_rect = null;
+    p.sub_crop = null;
+    p.sub_anim = null;
+    if (p.pres) |pr| {
+        pr.setAperture(p.pl.aperture_w, p.pl.aperture_h);
+        pr.time_base = p.pl.time_base;
+        pr.setSubLayout(null, 0);
+        startHost(demux, pr);
+    }
+    p.cur_title = -1;
+    hddvd_set_update(demux, vlc.INPUT_UPDATE_TITLE_LIST, 0, 0);
+    startPlaylist(demux);
 }
 
 /// DEMUX_SET_PAUSE_STATE: the applications' title clock stops (their other clocks go on).
 pub fn setPause(demux: *vlc.demux_t, paused: bool) void {
     const p = playerOf(demux);
+    p.paused = paused;
     if (p.host) |h| h.post(.{ .play_state = if (paused) .paused else .playing });
 }
 
