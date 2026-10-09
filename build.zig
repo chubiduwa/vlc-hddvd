@@ -54,6 +54,9 @@ pub fn build(b: *std.Build) void {
     });
     stb_c.addIncludePath(stb_dir);
 
+    // QuickJS-ng (build.zig.zon) for HDi scripts, patched for the HD DVD script profile: @import("quickjs").
+    const qjs = QuickJs.init(b);
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/hddvd.zig"),
         .target = target,
@@ -64,9 +67,11 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "vlc", .module = vlc_c.createModule() },
             .{ .name = "stb", .module = stb_c.createModule() },
+            .{ .name = "quickjs", .module = qjs.translate(target, optimize) },
         },
     });
     addStb(b, mod, stb_dir);
+    qjs.addTo(mod, target, false);
 
     mod.addIncludePath(b.path("src"));
     mod.addIncludePath(vlc_include);
@@ -105,9 +110,13 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
         .link_libc = true, // spu.zig allocates with std.heap.c_allocator, like the plugin
-        .imports = &.{.{ .name = "stb", .module = stb_host.createModule() }},
+        .imports = &.{
+            .{ .name = "stb", .module = stb_host.createModule() },
+            .{ .name = "quickjs", .module = qjs.translate(b.graph.host, optimize) },
+        },
     });
     addStb(b, test_mod, stb_dir);
+    qjs.addTo(test_mod, b.graph.host, true);
     const tests = b.addTest(.{ .root_module = test_mod });
     b.step("test", "Run the unit tests").dependOn(&b.addRunArtifact(tests).step);
 }
@@ -117,3 +126,43 @@ fn addStb(b: *std.Build, m: *std.Build.Module, stb_dir: std.Build.LazyPath) void
     m.addCSourceFiles(.{ .files = &.{"src/stb.c"}, .flags = &.{ "-std=gnu11", "-fno-sanitize=undefined" } });
     _ = b;
 }
+
+const QuickJs = struct {
+    b: *std.Build,
+    dir: std.Build.LazyPath,
+    /// quickjs.c with the HD DVD profile (src/qjs_patch.zig).
+    patched: std.Build.LazyPath,
+
+    fn init(b: *std.Build) QuickJs {
+        const dep = b.dependency("quickjs", .{});
+        const tool = b.addExecutable(.{
+            .name = "qjs_patch",
+            .root_module = b.createModule(.{ .root_source_file = b.path("src/qjs_patch.zig"), .target = b.graph.host }),
+        });
+        const run = b.addRunArtifact(tool);
+        run.addFileArg(dep.path("quickjs.c"));
+        return .{ .b = b, .dir = dep.path(""), .patched = run.addOutputFileArg("quickjs.c") };
+    }
+
+    fn translate(q: QuickJs, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+        const t = q.b.addTranslateC(.{
+            .root_source_file = q.dir.path(q.b, "quickjs.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        return t.createModule();
+    }
+
+    /// Compiles QuickJS-ng into `m`. Its asserts stay on in the tests (they catch leaked values when a runtime
+    /// is freed) and are off in the plugin.
+    fn addTo(q: QuickJs, m: *std.Build.Module, target: std.Build.ResolvedTarget, asserts: bool) void {
+        const b = q.b;
+        var flags: std.ArrayList([]const u8) = .empty;
+        flags.appendSlice(b.allocator, &.{ "-std=gnu11", "-funsigned-char", "-fno-sanitize=undefined", "-w", "-D_GNU_SOURCE" }) catch @panic("OOM");
+        if (!asserts) flags.append(b.allocator, "-DNDEBUG") catch @panic("OOM");
+        if (target.result.os.tag == .windows) flags.appendSlice(b.allocator, &.{ "-DWIN32_LEAN_AND_MEAN", "-D_WIN32_WINNT=0x0601" }) catch @panic("OOM");
+        m.addIncludePath(q.dir);
+        m.addCSourceFile(.{ .file = q.patched, .flags = flags.items });
+        m.addCSourceFiles(.{ .root = q.dir, .files = &.{ "dtoa.c", "libregexp.c", "libunicode.c" }, .flags = flags.items });
+    }
+};

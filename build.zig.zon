@@ -8,6 +8,10 @@
             .url = "https://github.com/nothings/stb/archive/2c980bb59875b0d32144a71867fbdebb2f77cd20.tar.gz",
             .hash = "N-V-__8AAPJDTgBMvhz_RoGlqYS1cMahRQ6Q5GVqYKny36gQ",
         },
+        .quickjs = .{
+            .url = "https://github.com/quickjs-ng/quickjs/archive/refs/tags/v0.17.0.tar.gz",
+            .hash = "N-V-__8AAHXdRAAredjqGKa2uZcnUUzmDSajEa9AQDETVRYW",
+        },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "README.md", "LICENSE" },
 }

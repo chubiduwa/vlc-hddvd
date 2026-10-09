@@ -41,4 +41,5 @@ test {
     _ = @import("adv/markup/timing.zig");
     _ = @import("adv/markup/bidi.zig");
     _ = @import("adv/engine/keys.zig");
+    _ = @import("adv/script/js.zig");
 }
