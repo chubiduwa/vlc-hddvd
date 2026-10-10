@@ -104,6 +104,9 @@ pub const Presentation = struct {
     ref_time: u64 = 0,
     ref_ts: i64 = 0,
     duration: u64 = 0,
+    /// After a jump, its target: the frames before it are decoded but not shown, so the title time is never
+    /// earlier (the clock can still read a frame early while the decoders refill).
+    floor: u64 = 0,
     /// The last title time worked out, kept while the clock cannot tell (paused, buffering).
     last_time: ?u64 = null,
     /// Display date minus stream timestamp, as last seen, and the timestamp it was seen at.
@@ -352,8 +355,16 @@ pub const Presentation = struct {
         p.ref_time = ref_time;
         p.ref_ts = ref_ts;
         p.duration = duration;
+        p.floor = 0;
         p.last_time = null;
         p.offset = null;
+    }
+
+    /// The demux jumped to title time `t` (after `setTimeline`).
+    pub fn setJumpTarget(p: *Presentation, t: u64) void {
+        p.lockIt();
+        defer p.unlock();
+        p.floor = t;
     }
 
     /// The title time on screen at `now` (mdate()), or the last one known while the clock cannot tell
@@ -363,6 +374,7 @@ pub const Presentation = struct {
         const ref_time = p.ref_time;
         const ref_ts = p.ref_ts;
         const duration = p.duration;
+        const floor = p.floor;
         p.unlock();
         const date = (p.clock.displayDate(ref_ts) catch null) orelse {
             p.lockIt();
@@ -371,7 +383,7 @@ pub const Presentation = struct {
         };
         // The reference may still be ahead of the screen (negative elapsed time) after a seamless join.
         const tb = p.time_base;
-        const t = @min(tb.frames(tb.us(ref_time) + (now - date)), duration);
+        const t = @min(@max(tb.frames(tb.us(ref_time) + (now - date)), floor), duration);
         p.lockIt();
         defer p.unlock();
         if (p.ref_ts == ref_ts) p.last_time = t;

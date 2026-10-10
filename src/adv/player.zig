@@ -601,6 +601,7 @@ fn jumpTo(demux: *vlc.demux_t, t: u64, notify: bool) bool {
     const span = timeline.spanFrom(title, t) orelse return false;
     const at = @max(t, span.begin);
     if (!positionSpan(demux, span, at)) return false;
+    if (p.pres) |pr| pr.setJumpTarget(at);
     p.access.jumped(&p.pl, title, p.title == null, at);
     p.next = .none;
     _ = hddvd_es_out_control(demux.out, vlc.ES_OUT_RESET_PCR);

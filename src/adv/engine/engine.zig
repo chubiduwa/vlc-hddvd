@@ -232,12 +232,15 @@ pub const Engine = struct {
         r.ticked = true;
 
         // 1. Events, in order (the script handler queue from Phase 5).
+        var moved = false;
         for (e.inbox.items) |ev| {
             e.handle(ev);
+            if (ev == .jump or ev == .title_begin) moved = true;
             if (e.scene) |sc| if (sc.vtable.input) |f| f(sc.ctx, e, ev);
         }
         e.inbox.clearRetainingCapacity();
-        if (e.play_state == .playing) e.title_time = title_time;
+        // `title_time` was read before a jump or a new title in this tick: keep the new position.
+        if (e.play_state == .playing and !moved) e.title_time = title_time;
         const clocks: Clocks = .{ .app = n, .page = e.rate.ticks(now - e.page_start), .title = e.title_time };
         // 2.–5. Animations and layout; redraw on change.
         if (e.scene) |sc| if (sc.vtable.tick(sc.ctx, e, clocks)) {
@@ -348,13 +351,20 @@ test "ticks, clocks and pause" {
     try e.post(.{ .jump = 500 });
     _ = e.step(221000, 9);
     try testing.expectEqual(@as(u64, 500), c.last.title);
+    // While playing, the time the host read before the jump is stale: the jump's target holds for that tick.
+    try e.post(.{ .play_state = .playing });
+    try e.post(.{ .jump = 800 });
+    _ = e.step(241000, 9);
+    try testing.expectEqual(@as(u64, 800), c.last.title);
+    _ = e.step(261000, 801);
+    try testing.expectEqual(@as(u64, 801), c.last.title);
 
     // The page clock restarts with a new scene.
     var c2: Counter = .{};
-    e.setScene(.{ .ctx = &c2, .vtable = &Counter.vtable }, 221000);
-    _ = e.step(261000, 0);
+    e.setScene(.{ .ctx = &c2, .vtable = &Counter.vtable }, 261000);
+    _ = e.step(301000, 0);
     try testing.expectEqual(@as(u64, 2), c2.last.page);
-    try testing.expectEqual(@as(u64, 13), c2.last.app);
+    try testing.expectEqual(@as(u64, 15), c2.last.app);
 }
 
 test "tick divisor" {

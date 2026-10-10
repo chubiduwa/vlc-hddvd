@@ -20,10 +20,10 @@ pub const TimeBase = enum(u8) {
         return @backingInt(t);
     }
 
-    /// Frames to microseconds.
+    /// Frames to microseconds, rounded up so that `frames(us(f)) == f`.
     pub fn us(t: TimeBase, f: u64) i64 {
         return @intCast(switch (t) {
-            .fps60 => f * 50050 / 3, // 1001/60 ms per frame
+            .fps60 => (f * 50050 + 2) / 3, // 1001/60 ms per frame
             .fps50 => f * 20000,
         });
     }
@@ -601,6 +601,8 @@ test "timecodes and time bases" {
     try testing.expectEqual(@as(i64, 1_001_000), TimeBase.fps60.us(60));
     try testing.expectEqual(@as(u64, 90090), TimeBase.fps60.ticks90k(60));
     try testing.expectEqual(@as(u64, 60), TimeBase.fps60.frames(1_001_000));
+    // The round trip is exact (a chapter starting at a frame is found at that frame).
+    for ([_]u64{ 1, 2, 17062, 66167 }) |f| try testing.expectEqual(f, TimeBase.fps60.frames(TimeBase.fps60.us(f)));
     try testing.expectEqual(@as(i64, 1_000_000), TimeBase.fps50.us(50));
 }
 
