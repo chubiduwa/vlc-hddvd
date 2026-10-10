@@ -147,6 +147,7 @@ fn addRtAudio(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTar
     m.addCSourceFiles(.{ .files = &.{"src/fx_glue.cpp"}, .flags = flags });
     switch (target.result.os.tag) {
         .macos => {
+            addMacosFrameworkPath(b, m, target);
             m.linkFramework("CoreAudio", .{});
             m.linkFramework("CoreFoundation", .{});
         },
@@ -155,6 +156,29 @@ fn addRtAudio(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTar
             if (alsa_include) |d| m.addSystemIncludePath(.{ .cwd_relative = d });
             m.linkSystemLibrary("asound", .{});
         },
+    }
+}
+
+/// macOS framework search path from the system SDK, needed for RtAudio's CoreAudio/CoreFoundation
+/// `-framework` link inputs (and `<CoreAudio/AudioHardware.h>` includes, which are not in Zig's
+/// bundled macOS headers). Zig only resolves this itself through its native-target detection
+/// (`NativePaths`, via `xcrun`); with an explicit -Dtarget it has no framework search paths at
+/// all, so even a native-arch build like -Dtarget=aarch64-macos on a Mac fails to find frameworks.
+fn addMacosFrameworkPath(b: *std.Build, m: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    if (b.graph.host.result.os.tag != .macos) return;
+    const sdk: ?[]const u8 = sdk: {
+        if (b.graph.environ_map.get("SDKROOT")) |p| if (p.len > 0) break :sdk p;
+        if (!std.zig.system.darwin.isSdkInstalled(b.graph.arena, b.graph.io)) break :sdk null;
+        break :sdk std.zig.system.darwin.getSdk(b.graph.arena, b.graph.io, &target.result);
+    };
+    if (sdk) |s| {
+        // The SDK path becomes include/link flags, resolved from state the configuration cache
+        // cannot track (xcrun, env), so the resolved configuration must not be reused.
+        b.graph.poisonCache();
+        m.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{s}) });
+        // Framework stubs re-export libraries like libobjc.A.dylib, resolved in the SDK's usr/lib
+        // (what NativePaths does for native builds; SIP no longer pastes dylibs into /usr/lib).
+        m.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{s}) });
     }
 }
 
