@@ -32,11 +32,11 @@ It needs VLC 3.0, 64-bit.
 
 | VLC | Zip |
 |---|---|
-| macOS, Apple Silicon (M chips) | [`hddvd-macos-aarch64.zip`](/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-macos-aarch64.zip) |
-| macOS, Intel | [`hddvd-macos-x86_64.zip`](/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-macos-x86_64.zip) |
-| Windows, 64-bit | [`hddvd-windows-x86_64.zip`](/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-windows-x86_64.zip) |
-| Linux, x86_64 | [`hddvd-linux-x86_64.zip`](/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-linux-x86_64.zip) |
-| Linux, arm64 | [`hddvd-linux-aarch64.zip`](/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-linux-aarch64.zip) |
+| macOS, Apple Silicon (M chips) | [`hddvd-macos-aarch64.zip`](https://github.com/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-macos-aarch64.zip) |
+| macOS, Intel | [`hddvd-macos-x86_64.zip`](https://github.com/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-macos-x86_64.zip) |
+| Windows, 64-bit | [`hddvd-windows-x86_64.zip`](https://github.com/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-windows-x86_64.zip) |
+| Linux, x86_64 | [`hddvd-linux-x86_64.zip`](https://github.com/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-linux-x86_64.zip) |
+| Linux, arm64 | [`hddvd-linux-aarch64.zip`](https://github.com/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-linux-aarch64.zip) |
 
 Each zip holds one file, the plugin.
 
