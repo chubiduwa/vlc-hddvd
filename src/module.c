@@ -102,6 +102,16 @@ vlc_module_begin()
     set_callbacks(HddvdAdecOpen, HddvdAdecClose)
 vlc_module_end()
 
+#ifdef __linux__
+/* Debian/Ubuntu build VLC with the 64-bit time_t (time64) plugin ABI: their loader looks the module entry up
+ * under vlc_entry__3_0_0ft64, upstream 3.0.x under vlc_entry__3_0_0f. Carry both names for the same function:
+ * on this plugin's Linux targets (x86_64, aarch64) the C time_t is already 64 bits in either ABI, so the two
+ * tags mean the same layouts here. The distro's name would otherwise fail with "undefined symbol
+ * vlc_entry__3_0_0ft64", which is how the mismatch happens (seen with their build).
+ */
+DLL_SYMBOL int vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque) __attribute__((alias("vlc_entry__3_0_0f")));
+#endif
+
 /* pf_control of the demux_t; installed by HddvdOpen (Zig). */
 int HddvdDemuxControl(demux_t *demux, int query, va_list args)
 {
