@@ -32,11 +32,11 @@ It needs VLC 3.0, 64-bit.
 
 | VLC | Zip |
 |---|---|
-| macOS, Apple silicon (the arm64 or universal VLC) | `hddvd-macos-aarch64.zip` |
-| macOS, Intel | `hddvd-macos-x86_64.zip` |
-| Windows, 64-bit | `hddvd-windows-x86_64.zip` |
-| Linux, x86_64 | `hddvd-linux-x86_64.zip` |
-| Linux, arm64 | `hddvd-linux-aarch64.zip` |
+| macOS, Apple Silicon (M chips) | [`hddvd-macos-aarch64.zip`](/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-macos-aarch64.zip) |
+| macOS, Intel | [`hddvd-macos-x86_64.zip`](/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-macos-x86_64.zip) |
+| Windows, 64-bit | [`hddvd-windows-x86_64.zip`](/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-windows-x86_64.zip) |
+| Linux, x86_64 | [`hddvd-linux-x86_64.zip`](/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-linux-x86_64.zip) |
+| Linux, arm64 | [`hddvd-linux-aarch64.zip`](/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-linux-aarch64.zip) |
 
 Each zip holds one file, the plugin.
 
@@ -98,15 +98,17 @@ From the GUI, you can also use Media > Open Network Stream with the same `hddvd:
 
 Append `#title[:chapter]` to start at a title, e.g. `hddvd:///path/to/Disc.iso#21`.
 
+Note: mouse interaction can be enabled/disabled by discs themselves and might not work consistently like DVDs
+
 | Action | macOS | Windows / Linux |
 |---|---|---|
 | Move between buttons | Arrow keys | Arrow keys |
-| Press a button | Enter, or click | Enter, or click |
-| Disc menu | Ctrl+M | Shift+M |
+| Press a button | Enter | Enter |
+| Disc menu | Ctrl+M | Ctrl+M |
 | Back / cancel (interactive menus) | Delete (⌫) | Backspace |
 | Remote's number keys (e.g. text entry in games) | 0–9 | 0–9 |
 | Remote's A / B / C / D buttons (used by some discs, e.g. zoom, bookmark) | Shift+F1–F4 | Shift+F1–F4 |
-| Previous / next chapter | Ctrl+U / Ctrl+D | Shift+P / Shift+N |
+| Previous / next chapter | Ctrl+P / Ctrl+N | Ctrl+P / Ctrl+N |
 
 ## Build
 
