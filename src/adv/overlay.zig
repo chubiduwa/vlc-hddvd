@@ -5,7 +5,7 @@
 //!
 //! - the sub video frame on screen (pipdec.zig), scaled, with its opacity and luma key;
 //! - the sub-picture plane: the display periods of the selected sub-picture streams (spudec.zig);
-//! - the graphics plane: the engine's last finished frame, only its tiles that hold anything;
+//! - the graphics plane: the engine's last finished frame, as one region over its whole canvas;
 //! - the cursor.
 //!
 //! The graphics frame's clear rectangles (§7.8.4) are holes through the sub-picture plane, and with target
@@ -294,15 +294,14 @@ fn subPictures(pres: *present.Presentation, ts: i64, clears: []const planes.Clea
     }
 }
 
-/// The graphics plane's occupied tiles, with straight alpha.
+/// The graphics plane as one region over the whole canvas, with straight alpha. (Each element as its own
+/// region, tile-based, had VLC scale the regions independently when the window is not video-sized, which
+/// showed as seams along their shared edges.)
 fn graphics(f: *planes.Frame, tail: **?*vlc.subpicture_region_t) void {
-    const spans = f.spans(gpa) catch return;
-    defer gpa.free(spans);
-    for (spans) |r| {
-        const region = hddvd_region_new_rgba(@intCast(r.w), @intCast(r.h)) orelse continue;
-        copyRgba(region, f.canvas, r);
-        append(tail, region, r.x, r.y);
-    }
+    const r = f.canvas.bounds();
+    const region = hddvd_region_new_rgba(@intCast(r.w), @intCast(r.h)) orelse return;
+    copyRgba(region, f.canvas, r);
+    append(tail, region, r.x, r.y);
 }
 
 fn cursor(pres: *present.Presentation, tail: **?*vlc.subpicture_region_t) void {

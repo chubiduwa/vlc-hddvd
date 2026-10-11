@@ -1,10 +1,12 @@
 //! The upper presentation planes of Advanced Content as they are handed to the overlay (HD DVD Vol. 1
 //! §4.3.13.3, Vol. 3 §7.3.1, §7.8.4):
 //!
-//! - a graphics `Frame`: the graphics plane (premultiplied RGBA, aperture size) rendered by the engine, the
-//!   clear rectangles it holds (holes through the sub-picture plane, and with target `main` through the sub
-//!   video plane too), and which tiles hold anything, so only those reach VLC. Frames are double-buffered:
-//!   the engine renders into one the overlay is not reading (§7.3.1.2);
+//! - a graphics `Frame`: the graphics plane (premultiplied RGBA, aperture size) rendered by the engine and
+//!   the clear rectangles it holds (holes through the sub-picture plane, and with target `main` through the
+//!   sub video plane too). Tile occupancy tracks where anything was drawn, so making an old frame empty only
+//!   clears those tiles. (The overlay sends the plane as one whole-canvas region: per-tile regions made VLC
+//!   scale them independently, which showed as seams when the window differed from the video size.) Frames
+//!   are double-buffered: the engine renders into one the overlay is not reading (§7.3.1.2);
 //! - the `Cursor`: position, hot spot, image (default: the player's own arrow), visibility and region
 //!   (Annex Z.5.5, Annex W Table W-6).
 //!
@@ -15,7 +17,7 @@ const raster = @import("raster.zig");
 
 const Rect = raster.Rect;
 
-/// Side of the square tiles a frame is split into for the overlay.
+/// Side of the square tiles occupancy is tracked in.
 pub const tile = 64;
 
 pub const Target = enum { main, sub };
