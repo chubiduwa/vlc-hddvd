@@ -46,12 +46,14 @@ Unzip it into a folder of its own, and let VLC find it through `VLC_PLUGIN_PATH`
 which would break the app's signature.
 
 ```sh
+# Install
 mkdir -p ~/vlc-hddvd && cd ~/vlc-hddvd
 curl -LO https://github.com/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-macos-aarch64.zip  # or -x86_64
 unzip hddvd-macos-aarch64.zip
 xattr -d com.apple.quarantine libhddvd_plugin.dylib 2>/dev/null  # only needed if downloaded with a browser
 
-VLC_PLUGIN_PATH=~/vlc-hddvd /Applications/VLC.app/Contents/MacOS/VLC --reset-plugins-cache "hddvd:///path/to/Disc.iso"
+# Running
+VLC_PLUGIN_PATH="$HOME/vlc-hddvd" /Applications/VLC.app/Contents/MacOS/VLC --reset-plugins-cache "hddvd:///path/to/Disc.iso"
 ```
 
 VLC only sees the plugin when started this way, from a terminal, not from the Dock or Finder.
@@ -72,11 +74,13 @@ After that, VLC finds the plugin however it is started.
 This works with the distribution's VLC, not the Snap or Flatpak versions:
 
 ```sh
+# Install
 mkdir -p ~/vlc-hddvd && cd ~/vlc-hddvd
 curl -LO https://github.com/chubiduwa/vlc-hddvd/releases/latest/download/hddvd-linux-x86_64.zip  # or -aarch64
 unzip hddvd-linux-x86_64.zip
 
-VLC_PLUGIN_PATH=~/vlc-hddvd vlc --reset-plugins-cache "hddvd:///path/to/Disc.iso"
+# Running
+VLC_PLUGIN_PATH="$HOME/vlc-hddvd" vlc --reset-plugins-cache "hddvd:///path/to/Disc.iso"
 ```
 
 ## Play
@@ -90,7 +94,7 @@ vlc "hddvd:///Volumes/DISC"
 vlc "hddvd:///C:/Discs/Disc.iso"          # Windows
 ```
 
-On Windows you can also use Media > Open Network Stream with the same `hddvd:///…` address.
+From the GUI, you can also use Media > Open Network Stream with the same `hddvd:///…` address.
 
 Append `#title[:chapter]` to start at a title, e.g. `hddvd:///path/to/Disc.iso#21`.
 
