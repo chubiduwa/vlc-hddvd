@@ -893,9 +893,11 @@ fn setSeekpoint(demux: *vlc.demux_t, i: c_int) callconv(.c) c_int {
     return vlc.VLC_SUCCESS;
 }
 
-/// DEMUX_SET_PAUSE_STATE: Advanced Content tells its applications (Standard Content has nothing to do).
-fn setPause(demux: *vlc.demux_t, paused: bool) callconv(.c) void {
-    if (adv.owns(demux)) adv.setPause(demux, paused);
+/// DEMUX_SET_PAUSE_STATE: Advanced Content may refuse a pause, to hand it to its applications first
+/// (Standard Content has nothing to do).
+fn setPause(demux: *vlc.demux_t, paused: bool) callconv(.c) c_int {
+    if (adv.owns(demux) and !adv.setPause(demux, paused)) return vlc.VLC_EGENERIC;
+    return vlc.VLC_SUCCESS;
 }
 
 /// DEMUX_NAV_*: 0 activate, 1 up, 2 down, 3 left, 4 right, 5 popup, 6 menu.

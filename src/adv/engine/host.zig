@@ -48,6 +48,9 @@ pub const Host = struct {
     // Under lock:
     stop: bool = false,
     events: std.ArrayList(engine.Event) = .empty,
+    /// The next pause VLC reports was asked for by the engine (Playlist.pause, or VK_PAUSE's default
+    /// handler), not by the user through VLC: the demux lets it through.
+    engine_pause: std.atomic.Value(bool) = .init(false),
     commands: std.ArrayList(engine.Command) = .empty,
 
     // The engine thread's own:
@@ -206,7 +209,10 @@ pub const Host = struct {
         const e = &h.eng;
         defer e.outbox.clearRetainingCapacity();
         for (e.outbox.items) |cmd| switch (cmd) {
-            .pause => |on| hddvd_input_pause(@ptrCast(h.obj), on),
+            .pause => |on| {
+                if (on) h.engine_pause.store(true, .release);
+                hddvd_input_pause(@ptrCast(h.obj), on);
+            },
             .mixing => |m| h.pres.setMixing(m.main, m.sub, m.effect),
             .effect_play => |p| h.playEffect(p.data, p.repeat, now),
             .effect_stop => {

@@ -992,11 +992,24 @@ fn loadPlaylist(demux: *vlc.demux_t, u: []const u8) !void {
 }
 
 /// DEMUX_SET_PAUSE_STATE: the applications' title clock stops (their other clocks go on).
-pub fn setPause(demux: *vlc.demux_t, paused: bool) void {
+/// VLC pauses or resumes (DEMUX_SET_PAUSE_STATE). A pause VLC started itself (its pause key or button, a
+/// click…) is the remote's Pause key: it goes to the applications as VK_PAUSE, and it is refused here.
+/// Annex V's default handler pauses when no application consumes the key, and that pause, asked for by the
+/// engine, is let through. Returns false to refuse. (A resume cannot be refused: VLC would stop.)
+pub fn setPause(demux: *vlc.demux_t, paused: bool) bool {
     const p = playerOf(demux);
+    if (p.host) |h| {
+        const ours = h.engine_pause.swap(false, .acq_rel);
+        if (paused and !ours) {
+            h.post(.{ .key_down = keys.pause });
+            h.post(.{ .key_up = keys.pause });
+            return false;
+        }
+    }
     p.paused = paused;
     if (p.pres) |pr| pr.setPaused(paused);
     if (p.host) |h| h.post(.{ .play_state = if (paused) .paused else .playing });
+    return true;
 }
 
 /// Sends the overlay's ES a block at `pts`: it starts its subpicture if it has none.

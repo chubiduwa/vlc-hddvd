@@ -45,7 +45,7 @@ int hddvd_get_meta(demux_t *, vlc_meta_t *);
 int hddvd_set_title(demux_t *, int);
 int hddvd_set_seekpoint(demux_t *, int);
 int hddvd_nav(demux_t *, int action);
-void hddvd_set_pause(demux_t *, bool paused);
+int hddvd_set_pause(demux_t *, bool paused);
 uint64_t hddvd_stream_size(stream_t *);
 
 vlc_module_begin()
@@ -131,8 +131,8 @@ int HddvdDemuxControl(demux_t *demux, int query, va_list args)
             return VLC_SUCCESS;
 
         case DEMUX_SET_PAUSE_STATE:
-            hddvd_set_pause(demux, (bool)va_arg(args, int));
-            return VLC_SUCCESS;
+            /* A failed pause leaves VLC playing (input.c ControlPause); a failed resume would stop it. */
+            return hddvd_set_pause(demux, (bool)va_arg(args, int));
 
         case DEMUX_GET_PTS_DELAY:
             *va_arg(args, int64_t *) = INT64_C(1000) * var_InheritInteger(demux, "disc-caching");
