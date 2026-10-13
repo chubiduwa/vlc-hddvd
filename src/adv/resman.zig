@@ -12,6 +12,7 @@
 //! - Network sources are chosen by the player's network throughput (§6.2.3.6).
 
 const std = @import("std");
+const aacs = @import("../aacs.zig");
 const xpl = @import("xpl.zig");
 const aca = @import("aca.zig");
 const uri = @import("uri.zig");
@@ -89,6 +90,9 @@ pub const Manager = struct {
     throughput_kbps: u32 = 0,
     /// Resources whose loading failed in this title (not retried until the title changes).
     failed: std.StringHashMapUnmanaged(void) = .empty,
+    /// The disc's AACS keys (null: not encrypted), for the archives multiplexed in the EVOBs: the packs
+    /// are clear, but their entries are wrapped like the disc's files. Read-only.
+    keys: ?*const aacs.Keys = null,
 
     pub fn init(gpa: std.mem.Allocator) Manager {
         return .{ .gpa = gpa, .cache = filecache.FileCache.init(gpa, filecache.data_cache_size) };
@@ -279,8 +283,9 @@ pub const Manager = struct {
         const n = match orelse return;
         const r = m.cache.find(n.uri) orelse return; // not reserved: not in its loading period
         if (r.loaded()) return;
-        // A copy still under AACS (rips decrypt the files on the disc, not the packs) cannot be used; the same
-        // file is on the disc (§6.5.4), so it is read from there.
+        // A copy still under AACS (no keys, or a rip that decrypted the files on the disc but not the packs)
+        // cannot be used; the same file is on the disc (§6.5.4), so it is read from there.
+        if (m.keys) |k| aacs.decryptFile(file.data, k);
         var a = aca.parse(m.gpa, file.data) catch null;
         const bad = if (a) |*x| blk: {
             defer x.deinit();

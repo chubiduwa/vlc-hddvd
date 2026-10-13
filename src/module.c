@@ -19,6 +19,7 @@
 #include <vlc_demux.h>
 #include <vlc_input.h>
 #include <vlc_stream.h>
+#include <vlc_dialog.h>
 
 /* Implemented in Zig (hddvd.zig). */
 int HddvdOpen(vlc_object_t *);
@@ -58,6 +59,10 @@ vlc_module_begin()
                "General parameters to set before playback starts, and again whenever a Title_Play resets them, "
                "as n=value pairs separated by commas (e.g. 1=5,2=1). Useful with hddvd:///disc.iso#title to start "
                "a title directly when it expects registers that the disc's menus normally set.", true)
+    add_string("hddvd-keydb", NULL, "AACS key database (KEYDB.cfg)",
+               "Path of a KEYDB.cfg file that maps disc IDs to volume unique keys, so AACS-protected discs "
+               "play without ripping. Default: where libaacs looks (~/.config/aacs/KEYDB.cfg, "
+               "~/Library/Preferences/aacs/KEYDB.cfg on macOS, %APPDATA%\\aacs\\KEYDB.cfg on Windows).", true)
     add_string("hddvd-pip", NULL, "Picture-in-picture layout (debugging)",
                "Advanced Content: show the sub video at x,y,width,height[,alpha] (aperture pixels, alpha 0-255) "
                "without waiting for the disc's application to place it.", true)
@@ -238,6 +243,12 @@ char *hddvd_inherit_string(vlc_object_t *obj, const char *name)
 void hddvd_free(void *p)
 {
     free(p);
+}
+
+/* An error dialog (the interface's, or only the log without one); the text is shown as is. */
+void hddvd_dialog_error(vlc_object_t *obj, const char *title, const char *text)
+{
+    vlc_dialog_display_error(obj, title, "%s", text);
 }
 
 void hddvd_set_update(demux_t *demux, unsigned flags, int title, int seekpoint)

@@ -227,7 +227,7 @@ fn onAudio(s: *Sys, kind: c_int, b: *vlc.block_t) void {
         return;
     }
     defer gpa.free(samples);
-    const r = &(s.sub_resampler orelse return);
+    const r = if (s.sub_resampler) |*x| x else return; // the resampler itself: it keeps state
     s.scratch.clearRetainingCapacity();
     r.process(gpa, samples, &s.scratch) catch return;
     s.sub_fifo.push(gpa, b.i_pts, s.scratch.items) catch {};

@@ -7,8 +7,8 @@
 //!     C  = AES-128CBCD(Kc, Ce, IV)        pack bytes 128..2048; AACS-wrapped files are one CBC chain under Kt
 //!
 //! with AES-G(x1, x2) = AES-128D(x1, x2) XOR x2 and a fixed AACS IV for every CBC operation. Pure logic,
-//! no VLC dependency; the disc probe, the per-cell pack streaming and the file/ACA reads that call this are
-//! integrated below the file layer, so the rest of the player always sees plain files.
+//! no VLC dependency. `aacsdisc.zig` finds the keys; `vfs.zig` decrypts with them (`decryptFile` on the
+//! files it reads whole, a `Stream` per EVOB file it reads), so the rest of the plugin sees plain data.
 //!
 //! Segment/sequence keys (KEY_VF 01) and audio-only title keys (ATKF) are not used by any known disc; the
 //! key use is detected but the decryption of both is [todo].
@@ -83,26 +83,33 @@ fn cbcEncrypt(key: [16]u8, data: []u8) void {
 ///     <DISC_ID: 40 hex> = <title> [| D | <date>] | V | <VUK: 32 hex>
 ///
 /// where DISC_ID is the SHA-1 of the disc's title key file (see `discId`). Only V (volume unique key)
-/// entries are collected; other fragment types (M/Km, I/VID, D, T…) and lines that do not parse are
+/// fragments are used; other fragment types (M/Km, I/VID, D, T…) and lines that do not parse are
 /// skipped, so a keydb written for other content formats can sit alongside the HD DVD ones. Comment
 /// lines start with `#`.
-pub const Db = struct {
-    entries: []const Entry = &.{},
-
-    pub const Entry = struct { id: [20]u8, vuk: [16]u8 };
-
-    pub fn deinit(db: Db, gpa: std.mem.Allocator) void {
-        if (db.entries.len > 0) gpa.free(@constCast(db.entries));
+///
+/// The VUK of disc ID `id` in the database text, or null. A pressed disc often carries several title key
+/// files (one per Advanced Content playlist group, e.g. VTKF000 + VTKF090, or a Standard plus an Advanced
+/// Content pair), and the database then has several IDs for the same disc; the first line for `id` wins.
+pub fn findVuk(text: []const u8, id: [20]u8) ?[16]u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const e = parseDbLine(line) orelse continue;
+        if (std.mem.eql(u8, &e.id, &id)) return e.vuk;
     }
+    return null;
+}
 
-    /// The VUK keyed by disc ID. A pressed disc often carries several title key files (one per Advanced
-    /// Content playlist group, e.g. VTKF000 + VTKF090, or a Standard plus an Advanced Content pair), and
-    /// the database then has several IDs for the same disc; the first match wins.
-    pub fn lookup(db: Db, id: [20]u8) ?[16]u8 {
-        for (db.entries) |e| if (std.mem.eql(u8, &e.id, &id)) return e.vuk;
-        return null;
+/// How many usable entries the database text has (for the log).
+pub fn countDb(text: []const u8) usize {
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (parseDbLine(line) != null) n += 1;
     }
-};
+    return n;
+}
+
+const DbEntry = struct { id: [20]u8, vuk: [16]u8 };
 
 /// The disc ID: SHA-1 of the whole title key file (`VTKF.AACS`, `VTKF000.AACS`, … as read from the disc).
 pub fn discId(tkf_file: []const u8) [20]u8 {
@@ -125,31 +132,7 @@ pub fn hexId(s: []const u8) ?[20]u8 {
     return id;
 }
 
-pub const DbError = error{OutOfMemory};
-
-/// Parses KEYDB.cfg text.
-pub fn parseDb(gpa: std.mem.Allocator, text: []const u8) DbError!Db {
-    var n: usize = 0;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (parseDbLine(line) != null) {
-            n += 1;
-        }
-    }
-
-    const entries = try gpa.alloc(Db.Entry, n);
-    var at: usize = 0;
-    lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (parseDbLine(line)) |e| {
-            entries[at] = e;
-            at += 1;
-        }
-    }
-    return .{ .entries = entries };
-}
-
-fn parseDbLine(line_in: []const u8) ?Db.Entry {
+fn parseDbLine(line_in: []const u8) ?DbEntry {
     const line = std.mem.trim(u8, line_in, " \t\r");
     if (line.len == 0 or line[0] == '#') return null;
 
@@ -380,11 +363,9 @@ fn wrappedNameEndsAacs(name: []const u8) bool {
 /// already-clear one, or unrelated data that merely starts with "AACS") and the buffer is left
 /// untouched. After this, the entry is clear and the name ends in ".AACS" (what `adv/aca.zig`'s
 /// `isEncrypted` looks for).
-///
-/// Note that `error.NotWrapped` on a copy the caller keeps is harmless: a caller which merely *looks*
-/// (rather than decrypts) should drive it with `adv/aca.zig`'s checks instead.
 pub fn decryptWrapped(buf: []u8, tkf: *const Tkf) WrappedError!void {
     if (buf.len < wrapped_header or !std.mem.eql(u8, buf[0..4], "AACS")) return error.NotWrapped;
+    const size: usize = std.mem.readInt(u24, buf[8..11], .big); // the data, per the wrapper's own size field
     const slot = std.mem.readInt(u16, buf[5..7], .big);
     const kt = tkf.kt(slot) orelse return error.NotWrapped;
 
@@ -393,7 +374,276 @@ pub fn decryptWrapped(buf: []u8, tkf: *const Tkf) WrappedError!void {
     cbcDecrypt(kt, &name);
     if (!wrappedNameEndsAacs(std.mem.sliceTo(name[0..], 0))) return error.NotWrapped;
 
-    cbcDecrypt(kt, buf[11..][0..(buf.len - 11) / 16 * 16]);
+    // The chain runs from byte 11 over the name field and the data; an ACA entry's 4-byte trailer after
+    // the data stays in the clear, as does the trailing partial block.
+    const span = (wrapped_name_len + size) / 16 * 16;
+    cbcDecrypt(kt, buf[11..][0 .. @min(buf.len - 11, span) / 16 * 16]);
+}
+
+/// Decrypts, in place, every encrypted AACS-wrapped entry of a file read from the disc: the file itself
+/// when it is wrapped, or each entry of an .aca archive (whose table is not encrypted). Each entry is
+/// tried with every title key file of the disc: the wrapper's name only decrypts to "<name>.AACS" under
+/// the right one, so nothing depends on which playlist is loaded. Anything else is left untouched.
+pub fn decryptFile(d: []u8, keys: *const Keys) void {
+    if (d.len >= 32 and std.mem.eql(u8, d[0..8], "HDDVDACA")) {
+        var it: ArchiveEntries = .{ .d = d };
+        while (it.next()) |e| decryptWrappedAny(e, keys);
+        return;
+    }
+    decryptWrappedAny(d, keys);
+}
+
+/// Whether a file read from the disc still holds encrypted wrapped data (itself, or an archive entry).
+pub fn fileEncrypted(d: []const u8) bool {
+    if (d.len >= 32 and std.mem.eql(u8, d[0..8], "HDDVDACA")) {
+        var it: ArchiveEntries = .{ .d = @constCast(d) };
+        while (it.next()) |e| if (wrappedEncrypted(e)) return true;
+        return false;
+    }
+    return wrappedEncrypted(d);
+}
+
+/// An AACS-wrapped file whose name field is still ciphertext (a decrypted one reads "<name>.AACS").
+fn wrappedEncrypted(d: []const u8) bool {
+    if (d.len < wrapped_header or !std.mem.eql(u8, d[0..4], "AACS")) return false;
+    return !wrappedNameEndsAacs(d[11..wrapped_header]);
+}
+
+fn decryptWrappedAny(d: []u8, keys: *const Keys) void {
+    if (!wrappedEncrypted(d)) return;
+    for (keys.tkfs[0..keys.n]) |*t| {
+        decryptWrapped(d, &t.tkf) catch continue;
+        return;
+    }
+}
+
+/// The entries of an .aca archive (Vol. 1 Table 6.5.4.1.2-1: a 32-byte header with the entry count at
+/// 12, then per entry BE32 offset, BE32 size, CRC, MIME, name length at 13, the name and 32 reserved
+/// bytes), as the stored bytes each entry points to.
+const ArchiveEntries = struct {
+    d: []u8,
+    i: usize = 0,
+    p: usize = 32,
+
+    fn next(it: *ArchiveEntries) ?[]u8 {
+        const n = std.mem.readInt(u16, it.d[12..14], .big);
+        while (it.i < n) {
+            it.i += 1;
+            const p = it.p;
+            if (p + 14 > it.d.len) return null;
+            const nl = it.d[p + 13];
+            if (p + 14 + nl + 32 > it.d.len) return null;
+            it.p += 14 + @as(usize, nl) + 32;
+            const off = std.mem.readInt(u32, it.d[p..][0..4], .big);
+            const size = std.mem.readInt(u32, it.d[p + 4 ..][0..4], .big);
+            if (off >= it.d.len) continue;
+            return it.d[off..][0..@min(@as(usize, size), it.d.len - off)];
+        }
+        return null;
+    }
+};
+
+// ---- the disc's keys and one stream of packs ----------------------------------------------------------------
+
+/// A slot key cap: an Advanced Content disc carries one title key file per playlist group (e.g. VTKF000 +
+/// VTKF090), a disc with Standard and Advanced Content adds Standard Content's VTKF.AACS.
+pub const max_tkfs = 8;
+
+/// One title key file of the disc, with its associated playlist name (from the file's header; empty for
+/// Standard Content's `VTKF.AACS`).
+pub const Tkk = struct {
+    tkf: Tkf,
+    playlist: [12]u8 = @splat(0), // NUL-padded
+
+    pub fn set(t: *Tkk, tkf: Tkf, playlist: []const u8) void {
+        t.tkf = tkf;
+        const n = @min(playlist.len, t.playlist.len);
+        @memcpy(t.playlist[0..n], playlist[0..n]);
+        @memset(t.playlist[n..], 0);
+    }
+};
+
+/// The title key files of a disc, their VUKs verified (the TKF MAC was checked at parse). Read-only once
+/// loaded, except `preferred`, which any thread may change: the key file packs are tried with first.
+pub const Keys = struct {
+    tkfs: [max_tkfs]Tkk = undefined,
+    n: usize = 0,
+    /// Index into `tkfs`: the key file of the loaded playlist (`setPlaylist`).
+    preferred: std.atomic.Value(u8) = .init(0),
+
+    pub fn add(k: *Keys, tkf: Tkf, playlist: []const u8) bool {
+        if (k.n == max_tkfs) return false;
+        k.tkfs[k.n].set(tkf, playlist);
+        k.n += 1;
+        return true;
+    }
+
+    /// The index of the key file of the playlist called `pl` ("VPLST000.XPL"…), or null when there is
+    /// none: with one key file it applies to everything; without a playlist name the Standard Content file
+    /// (the one with no associated playlist) is preferred; a playlist with no file of its own falls back
+    /// to it too.
+    pub fn indexFor(k: *const Keys, pl: ?[]const u8) ?u8 {
+        if (k.n == 0) return null;
+        if (pl) |p| for (k.tkfs[0..k.n], 0..) |*t, i| {
+            if (std.mem.eql(u8, std.mem.sliceTo(&t.playlist, 0), p)) return @intCast(i);
+        };
+        if (pl == null or k.n == 1) {
+            for (k.tkfs[0..k.n], 0..) |*t, i| if (t.playlist[0] == 0) return @intCast(i);
+        }
+        return 0;
+    }
+
+    /// Packs are now tried first with the key file of playlist `pl` (null: Standard Content).
+    pub fn setPlaylist(k: *Keys, pl: ?[]const u8) void {
+        k.preferred.store(k.indexFor(pl) orelse 0, .release);
+    }
+};
+
+/// How many packs a jump may read back through to find its EVOBU's navigation pack (an EVOBU lasts at most
+/// about a second, a few thousand packs at the highest bit rates).
+const max_backscan = 8192;
+
+/// How many packs the check for a decrypted copy reads ahead of a highlight pack (see `Stream.scrambled`).
+const max_probe = 64;
+
+/// The decryption state of one stream of packs (one EVOB file).
+pub const Stream = struct {
+    /// The CPI of the EVOBU the stream is in, when known; it holds while packs follow on.
+    cpi: ?Cpi = null,
+    /// Where the next pack follows on (anything else is a jump, after which `cpi` must be found again).
+    next: u64 = 0,
+    /// Whether the disc's content packs are scrambled (null until a pack tells). A decrypted copy keeps
+    /// the AACS folder and the navigation packs' CPI but clears every PES scrambling control: highlight
+    /// packs, which have no such flag, are then left alone.
+    scrambled: ?bool = null,
+    /// The key file that worked when it was not the preferred one (see `decrypt`).
+    tkf: ?u8 = null,
+    decrypted: u64 = 0,
+    no_key: u64 = 0,
+    /// Packs that `payloadCheck` found still scrambled after decryption, with every key file.
+    bad: u64 = 0,
+
+    /// Reads a whole pack of the stream at `off`, as stored (not decrypted).
+    pub const Reader = struct {
+        ctx: *anyopaque,
+        read: *const fn (*anyopaque, u64, *[pack_len]u8) bool,
+    };
+
+    /// Decrypts one pack of the stream in place. Navigation packs set the CPI of their EVOBU; scrambled
+    /// PES packs, and highlight packs of an encrypted disc, are decrypted with the title key of the
+    /// slot the CPI names. After a jump into an EVOBU the CPI is found by reading back through `reader`
+    /// to its navigation pack. Packs that cannot be decrypted (no key, no navigation pack) are left as
+    /// they are and counted in `no_key`.
+    pub fn pack(s: *Stream, buf: *[pack_len]u8, off: u64, keys: *const Keys, reader: ?Reader) void {
+        if (off != s.next) s.cpi = null;
+        s.next = off + pack_len;
+        switch (classifyPack(buf)) {
+            .nav => |c| s.cpi = c, // null without a GCI packet: the EVOBU's key use is unknown
+            .scrambled => {
+                s.scrambled = true;
+                s.decrypt(buf, off, keys, reader);
+            },
+            .highlight => {
+                if (s.cpi == null) s.resolve(off, reader);
+                const cpi = s.cpi orelse return;
+                if (cpiKey(cpi) != .title) return;
+                if (s.scrambled == null) s.probe(off, reader);
+                if (s.scrambled == false) return;
+                s.decrypt(buf, off, keys, reader);
+            },
+            .clear => {},
+        }
+    }
+
+    /// Decrypts with the preferred key file, checked by `payloadCheck`. A disc with several key files
+    /// may hold EVOBs of another playlist group (or the preferred one may not be set yet): when the
+    /// check fails, the others are tried, and the stream keeps the one that passes.
+    fn decrypt(s: *Stream, buf: *[pack_len]u8, off: u64, keys: *const Keys, reader: ?Reader) void {
+        if (s.cpi == null) s.resolve(off, reader);
+        const cpi = s.cpi orelse {
+            s.no_key += 1;
+            return;
+        };
+        if (keys.n == 0) {
+            s.no_key += 1;
+            return;
+        }
+        const first = @min(s.tkf orelse keys.preferred.load(.acquire), keys.n - 1);
+        const orig = buf.*;
+        var got_key = false;
+        var i: usize = 0;
+        while (i < keys.n) : (i += 1) {
+            const k: u8 = @intCast(if (i == 0) first else if (i <= first) i - 1 else i);
+            buf.* = orig;
+            decryptPackSlot(buf, &keys.tkfs[k].tkf, cpi) catch continue;
+            got_key = true;
+            if (payloadCheck(buf) != false) {
+                if (k != first) s.tkf = k;
+                s.decrypted += 1;
+                return;
+            }
+        }
+        if (!got_key) {
+            buf.* = orig;
+            s.no_key += 1;
+            return;
+        }
+        // No key file passes: keep the preferred one's result (the check can be fooled by odd payloads).
+        buf.* = orig;
+        decryptPackSlot(buf, &keys.tkfs[first].tkf, cpi) catch {};
+        s.bad += 1;
+        s.decrypted += 1;
+    }
+
+    /// Finds the CPI of the EVOBU `off` is in, reading back to its navigation pack.
+    fn resolve(s: *Stream, off: u64, reader: ?Reader) void {
+        const r = reader orelse return;
+        var buf: [pack_len]u8 = undefined;
+        var at = off;
+        var n: usize = 0;
+        while (at >= pack_len and n < max_backscan) : (n += 1) {
+            at -= pack_len;
+            if (!r.read(r.ctx, at, &buf)) return;
+            switch (classifyPack(&buf)) {
+                .nav => |c| {
+                    s.cpi = c;
+                    return;
+                },
+                else => {},
+            }
+        }
+    }
+
+    /// Settles `scrambled` from the PES packs that follow a highlight pack in its EVOBU (whose CPI asks
+    /// for a title key, so they are scrambled unless the copy was decrypted). Without one, the disc is
+    /// taken as encrypted.
+    fn probe(s: *Stream, off: u64, reader: ?Reader) void {
+        const r = reader orelse return;
+        var buf: [pack_len]u8 = undefined;
+        for (1..max_probe + 1) |k| {
+            if (!r.read(r.ctx, off + k * pack_len, &buf)) return;
+            switch (classifyPack(&buf)) {
+                .nav => return, // the next EVOBU
+                .scrambled => {
+                    s.scrambled = true;
+                    return;
+                },
+                .clear => if (isPes(&buf)) {
+                    s.scrambled = false;
+                    return;
+                },
+                .highlight => {},
+            }
+        }
+    }
+};
+
+/// A pack whose first inner packet is a PES packet with the scrambling-control flags (video, audio,
+/// sub-pictures), which a decrypted copy clears.
+fn isPes(p: []const u8) bool {
+    const o = firstPacket(p) orelse return false;
+    if (o + 7 > p.len or !std.mem.eql(u8, p[o .. o + 3], &.{ 0, 0, 1 })) return false;
+    return hasPesFlags(p[o + 3]) and p[o + 6] & 0xC0 == 0x80;
 }
 
 // ---- tests (synthetic data only) ---------------------------------------------------------------------------
@@ -441,26 +691,24 @@ test "KEYDB.cfg" {
         \\D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5 | not an entry
         \\D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5D5 = Movie 5: bad hex | V | 123456781234567812345678123456GG
     ;
-    var db = try parseDb(testing.allocator, text);
-    defer db.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 4), db.entries.len);
-
+    try testing.expectEqual(@as(usize, 4), countDb(text));
     try testing.expectEqualSlices(
         u8,
         &hexKey("31415926535897932384626433832795").?,
-        &db.lookup(hexId("DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF").?).?,
+        &findVuk(text, hexId("DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF").?).?,
     );
     try testing.expectEqualSlices(
         u8,
         &hexKey("27182818284590452353602874713527").?,
-        &db.lookup(hexId("0123456789ABCDEF0123456789ABCDEF01234567").?).?,
+        &findVuk(text, hexId("0123456789ABCDEF0123456789ABCDEF01234567").?).?,
     );
     try testing.expectEqualSlices(
         u8,
         &hexKey("11112222333344445555666677778888").?,
-        &db.lookup(hexId("FEDCBA9876543210FEDCBA9876543210FEDCBA98").?).?,
+        &findVuk(text, hexId("FEDCBA9876543210FEDCBA9876543210FEDCBA98").?).?,
     );
-    try testing.expect(db.lookup(@splat(0)) == null);
+    try testing.expect(findVuk(text, @splat(0)) == null);
+    try testing.expect(findVuk(text, hexId("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC").?) == null);
 }
 
 /// A synthetic video title key file: the given 1-based slots hold title keys `kts[s]` under `vuk`, and
@@ -657,7 +905,7 @@ test "AACS-wrapped entry" {
 
     // the encrypted entry
     var enc = entry;
-    cbcEncrypt(kt2, enc[11..][0..(enc.len - 11) / 16 * 16]);
+    cbcEncrypt(kt2, enc[11..][0 .. (enc.len - 11) / 16 * 16]);
     try testing.expect(!std.mem.endsWith(u8, std.mem.sliceTo(enc[11..wrapped_header], 0), ".AACS"));
 
     // decrypted in place back to exactly the plaintext
@@ -686,4 +934,307 @@ test "AACS-wrapped entry" {
     // too small for a wrapper
     var tiny: [wrapped_header - 1]u8 = undefined;
     try testing.expectError(error.NotWrapped, decryptWrapped(&tiny, &tkf));
+}
+
+test "AACS-wrapped ACA entry (with the 4-byte trailer)" {
+    const vuk: [16]u8 = @splat(0x5a);
+    const kt2: [16]u8 = @splat(0x22);
+    const tkf = try parseTkf(&fakeTkf(vuk, &.{2}, &.{kt2}), vuk);
+
+    const data_len = 380;
+    var entry: [wrapped_header + data_len]u8 = @splat(0);
+    @memcpy(entry[0..4], "AACS");
+    entry[4] = 1;
+    std.mem.writeInt(u16, entry[5..7], 2, .big);
+    std.mem.writeInt(u24, entry[8..11], data_len, .big);
+    const name = "example.aca.AACS";
+    @memcpy(entry[11..][0..name.len], name);
+    for (entry[wrapped_header..], 0..) |*x, i| x.* = @truncate(i * 5 + 9);
+
+    // As an archive entry on the disc it carries a 4-byte trailer after the data, outside the chain.
+    var with_trailer: [entry.len + 4]u8 = entry ++ [_]u8{ 0, 0, 0, 7 };
+    var enc = with_trailer;
+    cbcEncrypt(kt2, enc[11..][0 .. (wrapped_name_len + data_len) / 16 * 16]);
+    try testing.expect(!std.mem.endsWith(u8, std.mem.sliceTo(enc[11..wrapped_header], 0), ".AACS"));
+
+    try decryptWrapped(&enc, &tkf);
+    try testing.expectEqualSlices(u8, &with_trailer, &enc);
+}
+
+/// A synthetic EVOBU's navigation pack carrying `cpi` in its GCI packet (as in test "pack kinds").
+fn fakeNavPack(buf: *[pack_len]u8, cpi: Cpi) void {
+    @memset(buf, 0);
+    std.mem.writeInt(u32, buf[0..4], 0x000001BA, .big);
+    buf[4] = 0x44;
+    std.mem.writeInt(u32, buf[14..][0..4], 0x000001BB, .big);
+    std.mem.writeInt(u16, buf[18..][0..2], 40, .big);
+    const q = 14 + 6 + 40;
+    std.mem.writeInt(u32, buf[q..][0..4], 0x000001BF, .big);
+    std.mem.writeInt(u16, buf[q + 4 ..][0..2], 30, .big);
+    buf[q + 6] = 0x04;
+    buf[q + 7 + 12 ..][0..16].* = cpi;
+}
+
+test "Keys: the key file of the playlist" {
+    const vuk: [16]u8 = @splat(0x5a);
+    var k: Keys = .{};
+    try testing.expect(k.indexFor(null) == null);
+
+    _ = k.add(try parseTkf(&fakeTkf(vuk, &.{1}, &.{@as([16]u8, @splat(1))}), vuk), "");
+    try testing.expectEqual(@as(?u8, 0), k.indexFor(null));
+    // one key file: every playlist, named or not, uses it
+    try testing.expectEqual(@as(?u8, 0), k.indexFor("VPLST000.XPL"));
+
+    _ = k.add(try parseTkf(&fakeTkf(vuk, &.{1}, &.{@as([16]u8, @splat(2))}), vuk), "VPLST090.XPL");
+    try testing.expectEqual(@as(?u8, 0), k.indexFor(null));
+    try testing.expectEqual(@as(?u8, 1), k.indexFor("VPLST090.XPL"));
+    try testing.expectEqual(@as(?u8, 0), k.indexFor("VPLST001.XPL"));
+    try testing.expectEqual(@as(?u8, 0), k.indexFor(""));
+
+    k.setPlaylist("VPLST090.XPL");
+    try testing.expectEqual(@as(u8, 1), k.preferred.load(.acquire));
+    k.setPlaylist(null);
+    try testing.expectEqual(@as(u8, 0), k.preferred.load(.acquire));
+}
+
+/// Keys holding one synthetic title key file.
+fn testKeys(vuk: [16]u8, comptime slots: []const u16, kts: []const [16]u8) !Keys {
+    var k: Keys = .{};
+    _ = k.add(try parseTkf(&fakeTkf(vuk, slots, kts), vuk), "VPLST000.XPL");
+    return k;
+}
+
+/// An encrypted wrapped entry of `payload` (slot 2 of `kt`'s file), with the 4-byte trailer archive
+/// entries carry.
+fn fakeWrapped(comptime payload: []const u8, kt: [16]u8) [wrapped_header + payload.len + 4]u8 {
+    var e: [wrapped_header + payload.len + 4]u8 = @splat(0);
+    @memcpy(e[0..4], "AACS");
+    e[4] = 1;
+    std.mem.writeInt(u16, e[5..7], 2, .big);
+    std.mem.writeInt(u24, e[8..11], payload.len, .big);
+    @memcpy(e[11..][0.."example.es.AACS".len], "example.es.AACS");
+    @memcpy(e[wrapped_header..][0..payload.len], payload);
+    cbcEncrypt(kt, e[11..][0 .. (wrapped_name_len + payload.len) / 16 * 16]);
+    return e;
+}
+
+test "decrypting a file: wrapped, an archive's entries, and with the right key file" {
+    const vuk: [16]u8 = @splat(0x5a);
+    const kt_other: [16]u8 = @splat(0x33);
+    const kt: [16]u8 = @splat(0x22);
+    // two key files; only the second holds the entries' key, so both must be tried
+    var keys: Keys = .{};
+    _ = keys.add(try parseTkf(&fakeTkf(vuk, &.{2}, &.{kt_other}), vuk), "VPLST000.XPL");
+    _ = keys.add(try parseTkf(&fakeTkf(vuk, &.{2}, &.{kt}), vuk), "VPLST090.XPL");
+
+    const payload = "<example>a markup file of some length, past one AES block</example>";
+    const enc = fakeWrapped(payload, kt);
+
+    // a wrapped file
+    var file = enc;
+    try testing.expect(fileEncrypted(&file));
+    decryptFile(&file, &keys);
+    try testing.expect(!fileEncrypted(&file));
+    try testing.expectEqualStrings(payload, file[wrapped_header..][0..payload.len]);
+    // decrypting again changes nothing
+    const once = file;
+    decryptFile(&file, &keys);
+    try testing.expectEqualSlices(u8, &once, &file);
+
+    // an archive: header, two table entries (an encrypted wrapped one, a plain one), then the data
+    var d: std.ArrayList(u8) = .empty;
+    defer d.deinit(testing.allocator);
+    const gpa = testing.allocator;
+    try d.appendSlice(gpa, "HDDVDACA\x00\x10\x00\x01\x00\x02");
+    try d.appendNTimes(gpa, 0, 32 - d.items.len);
+    var table: [2]usize = undefined;
+    for ([_][]const u8{ "example.es", "plain.txt" }, 0..) |nm, i| {
+        table[i] = d.items.len;
+        try d.appendNTimes(gpa, 0, 14);
+        d.items[d.items.len - 1] = @intCast(nm.len);
+        try d.appendSlice(gpa, nm);
+        try d.appendNTimes(gpa, 0, 32);
+    }
+    const off_enc = d.items.len;
+    try d.appendSlice(gpa, &enc);
+    const off_plain = d.items.len;
+    try d.appendSlice(gpa, "PNG");
+    std.mem.writeInt(u32, d.items[table[0]..][0..4], @intCast(off_enc), .big);
+    std.mem.writeInt(u32, d.items[table[0] + 4 ..][0..4], @intCast(enc.len), .big);
+    std.mem.writeInt(u32, d.items[table[1]..][0..4], @intCast(off_plain), .big);
+    std.mem.writeInt(u32, d.items[table[1] + 4 ..][0..4], 3, .big);
+
+    try testing.expect(fileEncrypted(d.items));
+    decryptFile(d.items, &keys);
+    try testing.expect(!fileEncrypted(d.items));
+    try testing.expectEqualStrings(payload, d.items[off_enc + wrapped_header ..][0..payload.len]);
+    try testing.expectEqualStrings("PNG", d.items[off_plain..]);
+
+    // a file that is neither is left alone
+    var other: [64]u8 = @splat(0xaa);
+    decryptFile(&other, &keys);
+    for (other) |b| try testing.expectEqual(@as(u8, 0xaa), b);
+}
+
+/// A synthetic highlight pack (private_stream_2, sub-stream 0x08) with its data past the clear header
+/// encrypted under the pack key, as on a pressed disc.
+fn fakeHighlightPack(kt: [16]u8, cpi: Cpi, plain: *[pack_len]u8, scrambled: *[pack_len]u8) void {
+    @memset(plain, 0);
+    std.mem.writeInt(u32, plain[0..4], 0x000001BA, .big);
+    plain[4] = 0x44;
+    std.mem.writeInt(u32, plain[14..][0..4], 0x000001BF, .big);
+    std.mem.writeInt(u16, plain[18..][0..2], pack_len - 20, .big);
+    plain[20] = 0x08;
+    for (plain[clear_len..], 0..) |*x, i| x.* = @truncate(i);
+    scrambled.* = plain.*;
+    var d: [16]u8 = undefined;
+    @memcpy(d[0..4], plain[84..88]);
+    @memcpy(d[4..], cpi[4..]);
+    cbcEncrypt(aesG(kt, d), scrambled[clear_len..pack_len]);
+}
+
+/// Packs of a synthetic file, read by offset.
+const FakeFile = struct {
+    data: []const [pack_len]u8,
+
+    fn read(ctx: *anyopaque, off: u64, buf: *[pack_len]u8) bool {
+        const f: *const FakeFile = @ptrCast(@alignCast(ctx));
+        if (off % pack_len != 0 or off / pack_len >= f.data.len) return false;
+        buf.* = f.data[@intCast(off / pack_len)];
+        return true;
+    }
+
+    fn reader(f: *const FakeFile) Stream.Reader {
+        return .{ .ctx = @constCast(f), .read = read };
+    }
+};
+
+fn testCpi(slot: u16, seed: u8) Cpi {
+    var cpi: Cpi = undefined;
+    cpi[0] = 0x80; // KEY_VF 10
+    std.mem.writeInt(u16, cpi[1..3], slot, .big);
+    cpi[3] = 0;
+    for (cpi[4..], 0..) |*x, i| x.* = @truncate(i * 3 + seed);
+    return cpi;
+}
+
+test "Stream: in sequence, after a jump, and by reading back" {
+    const vuk: [16]u8 = @splat(0x5a);
+    const kt1: [16]u8 = @splat(0x11);
+    const kt2: [16]u8 = @splat(0x22);
+    const keys = try testKeys(vuk, &.{ 1, 2 }, &.{ kt1, kt2 });
+
+    // two EVOBUs under different slots and CPIs: nav + two scrambled packs each
+    const cpi_a = testCpi(1, 1);
+    const cpi_b = testCpi(2, 7);
+    var file: [6][pack_len]u8 = undefined;
+    var plain: [6][pack_len]u8 = undefined;
+    fakeNavPack(&file[0], cpi_a);
+    fakeScrambledPack(kt1, cpi_a, &plain[1], &file[1]);
+    fakeScrambledPack(kt1, cpi_a, &plain[2], &file[2]);
+    fakeNavPack(&file[3], cpi_b);
+    fakeScrambledPack(kt2, cpi_b, &plain[4], &file[4]);
+    fakeScrambledPack(kt2, cpi_b, &plain[5], &file[5]);
+    const fd: FakeFile = .{ .data = &file };
+
+    // streamed in sequence: every scrambled pack decrypts
+    var s: Stream = .{};
+    for (0..6) |k| {
+        var b = file[k];
+        s.pack(&b, k * pack_len, &keys, fd.reader());
+        if (k % 3 != 0) try testing.expectEqualSlices(u8, &plain[k], &b);
+    }
+    try testing.expectEqual(@as(u64, 4), s.decrypted);
+    try testing.expectEqual(@as(u64, 0), s.no_key);
+    try testing.expectEqual(true, s.scrambled);
+
+    // a jump back into the middle of the first EVOBU: its own CPI is read back, not the one in use
+    var b = file[2];
+    s.pack(&b, 2 * pack_len, &keys, fd.reader());
+    try testing.expectEqualSlices(u8, &plain[2], &b);
+
+    // a jump forward into the second EVOBU, without a reader: the key is unknown, the pack is left alone
+    b = file[5];
+    s.pack(&b, 5 * pack_len, &keys, null);
+    try testing.expectEqualSlices(u8, &file[5], &b);
+    try testing.expectEqual(@as(u64, 1), s.no_key);
+
+    // a new stream, starting mid-EVOBU: read back too
+    s = .{};
+    b = file[4];
+    s.pack(&b, 4 * pack_len, &keys, fd.reader());
+    try testing.expectEqualSlices(u8, &plain[4], &b);
+    b = file[5];
+    s.pack(&b, 5 * pack_len, &keys, null); // follows on: no reader needed
+    try testing.expectEqualSlices(u8, &plain[5], &b);
+}
+
+test "Stream: highlight packs, on a pressed disc and on a decrypted copy" {
+    const vuk: [16]u8 = @splat(0x5a);
+    const kt: [16]u8 = @splat(0x11);
+    const keys = try testKeys(vuk, &.{1}, &.{kt});
+    const cpi = testCpi(1, 1);
+
+    // nav, highlight, video: as pressed, and as decrypted (the CPI kept, the scrambling control cleared)
+    var pressed: [3][pack_len]u8 = undefined;
+    var copy: [3][pack_len]u8 = undefined;
+    fakeNavPack(&pressed[0], cpi);
+    fakeHighlightPack(kt, cpi, &copy[1], &pressed[1]);
+    fakeScrambledPack(kt, cpi, &copy[2], &pressed[2]);
+    copy[0] = pressed[0];
+
+    const fp: FakeFile = .{ .data = &pressed };
+    var s: Stream = .{};
+    for (0..3) |k| {
+        var b = pressed[k];
+        s.pack(&b, k * pack_len, &keys, fp.reader());
+        try testing.expectEqualSlices(u8, &copy[k], &b);
+    }
+    try testing.expectEqual(true, s.scrambled);
+
+    const fc: FakeFile = .{ .data = &copy };
+    s = .{};
+    for (0..3) |k| {
+        var b = copy[k];
+        s.pack(&b, k * pack_len, &keys, fc.reader());
+        try testing.expectEqualSlices(u8, &copy[k], &b);
+    }
+    try testing.expectEqual(false, s.scrambled);
+    try testing.expectEqual(@as(u64, 0), s.decrypted);
+}
+
+test "Stream: packs of another playlist group's key file" {
+    const vuk: [16]u8 = @splat(0x5a);
+    const kt_a: [16]u8 = @splat(0x11);
+    const kt_b: [16]u8 = @splat(0x22);
+    var keys: Keys = .{};
+    _ = keys.add(try parseTkf(&fakeTkf(vuk, &.{1}, &.{kt_a}), vuk), "VPLST000.XPL");
+    _ = keys.add(try parseTkf(&fakeTkf(vuk, &.{1}, &.{kt_b}), vuk), "VPLST090.XPL");
+
+    // the EVOB is under the second key file while the first is preferred: `payloadCheck` rejects the
+    // first, the second passes and the stream keeps it
+    const cpi = testCpi(1, 1);
+    var file: [3][pack_len]u8 = undefined;
+    var plain: [3][pack_len]u8 = undefined;
+    fakeNavPack(&file[0], cpi);
+    fakeScrambledPack(kt_b, cpi, &plain[1], &file[1]);
+    fakeScrambledPack(kt_b, cpi, &plain[2], &file[2]);
+    var s: Stream = .{};
+    for (0..3) |k| {
+        var b = file[k];
+        s.pack(&b, k * pack_len, &keys, null);
+        if (k > 0) try testing.expectEqualSlices(u8, &plain[k], &b);
+    }
+    try testing.expectEqual(@as(?u8, 1), s.tkf);
+    try testing.expectEqual(@as(u64, 2), s.decrypted);
+    try testing.expectEqual(@as(u64, 0), s.bad);
+
+    // a key file that holds no such key at all: nothing passes, the pack counts as bad
+    const one = try testKeys(vuk, &.{1}, &.{kt_a});
+    s = .{};
+    var b = file[0];
+    s.pack(&b, 0, &one, null);
+    b = file[1];
+    s.pack(&b, pack_len, &one, null);
+    try testing.expectEqual(@as(u64, 1), s.bad);
 }

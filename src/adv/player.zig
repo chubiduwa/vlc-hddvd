@@ -17,6 +17,7 @@ const xpl = @import("xpl.zig");
 const vti_mod = @import("vti.zig");
 const tmap = @import("tmap.zig");
 const aca = @import("aca.zig");
+const uri_mod = @import("uri.zig");
 const timeline = @import("timeline.zig");
 const present = @import("present.zig");
 const vdec = @import("vdec.zig");
@@ -432,6 +433,7 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
     }
     var pl = try xpl.parse(gpa, aca.unwrap(pl_bytes orelse return error.NoPlaylist));
     errdefer pl.deinit();
+    if (pl_uri) |u| fs.setPlaylist(uri_mod.fileName(u)); // an encrypted disc's packs use its key file
 
     const vti_bytes = (try fs.readFile(gpa, "HVDVD_TS/HVA00001.VTI")) orelse return error.NoVti;
     defer gpa.free(vti_bytes);
@@ -465,6 +467,7 @@ pub fn close(demux: *vlc.demux_t) void {
     if (p.pres) |pr| pr.unref();
     if (p.spu_shared) |sh| sh.unref();
     hddvd_esout_delete(p.esout);
+    p.closeFile(); // a file reads through the file system: close it first
     p.fs.close();
     p.deinit();
     gpa.destroy(p);
@@ -940,6 +943,7 @@ fn loadPlaylist(demux: *vlc.demux_t, u: []const u8) !void {
     p.pl = pl;
     gpa.free(p.playlist_uri);
     p.playlist_uri = new_uri;
+    p.fs.setPlaylist(uri_mod.fileName(new_uri));
     p.access.configure(&p.pl);
     p.held = false;
     p.audio_track = null;
@@ -1016,7 +1020,7 @@ fn streamRead(s: [*c]vlc.stream_t, buf: ?*anyopaque, len: usize) callconv(.c) is
     const out: [*]u8 = @ptrCast(buf orelse return -1);
     if (p.sector_off == sector_size) {
         if (p.pos >= p.end) return 0;
-        const f = &(p.file orelse return 0);
+        const f = if (p.file) |*x| x else return 0;
         const n = f.pread(p.pos, &p.sector) catch return -1;
         if (n != sector_size) {
             p.pos = p.end;

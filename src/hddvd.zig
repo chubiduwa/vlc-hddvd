@@ -18,6 +18,7 @@ const vfs = @import("vfs.zig");
 const vm_mod = @import("vm.zig");
 const hli = @import("hli.zig");
 const spudec = @import("spudec.zig");
+const aacsdisc = @import("aacsdisc.zig");
 const adv = @import("adv/player.zig");
 
 const Vm = vm_mod.Vm;
@@ -174,6 +175,8 @@ fn readSector(sys: *Sys, off: u64) !void {
     for (0..sys.evos.len) |i| {
         const f = try openEvo(sys, i);
         if (rel < f.size) {
+            // an EVOBU may run on from the previous file
+            if (rel == 0 and i > 0) if (sys.files[i - 1]) |*prev| f.continueFrom(prev);
             if (try f.pread(rel, &sys.sector) != sector_size) return error.ReadFailed;
             return;
         }
@@ -596,6 +599,16 @@ fn open(o: *vlc.vlc_object_t) callconv(.c) c_int {
         log(o, vlc.VLC_MSG_ERR, @src(), "cannot open %s (%s)", .{ demux.psz_file, @errorName(err).ptr });
         return vlc.VLC_EGENERIC;
     };
+    // An encrypted disc: the file system decrypts from now on.
+    switch (aacsdisc.load(o, fs)) {
+        .none => {},
+        .keys => |k| fs.setKeys(k),
+        .missing => |why| {
+            aacsdisc.report(o, why);
+            fs.close();
+            return vlc.VLC_EGENERIC;
+        },
+    }
     // ADV_OBJ/DISCID.DAT marks Advanced Content, which a player plays even if Standard VTSs exist (Vol. 1 §4.1.1).
     if (adv.detect(fs)) return adv.open(demux, fs);
     const d = ifo.loadDisc(gpa, fs) catch |err| {

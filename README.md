@@ -12,6 +12,7 @@ An HD DVD plugin for VLC 3.0.
   menu sounds, bookmarks for the session, games), picture-in-picture and commentary audio, every title,
   chapter, audio and subtitle track.
 - **Disc images** (`.iso`) read directly, or a folder holding a disc (a mounted disc, or a copy of one).
+- **Encrypted (AACS) discs**, with a key database (`KEYDB.cfg`) that has the disc's key: see [Encrypted discs](#encrypted-discs).
 - **VLC controls:** arrow keys, Enter and the mouse for buttons; the disc-menu key; Playback > Title and Chapter.
 
 Not supported yet:
@@ -21,7 +22,6 @@ Not supported yet:
 
 Not going to be supported:
 
-- encrypted (AACS) discs
 - physical drives (unless the disc is unencrypted)
 
 ## Install
@@ -103,11 +103,25 @@ Note: mouse interaction can be enabled/disabled by discs themselves and might no
 |---|---|---|
 | Move between buttons | Arrow keys | Arrow keys |
 | Press a button | Enter | Enter |
-| Disc menu | Ctrl+M | Ctrl+M |
+| Disc menu | Ctrl+M | Shift+M |
 | Back / cancel (interactive menus) | Delete (⌫) | Backspace |
 | Remote's number keys (e.g. text entry in games) | 0–9 | 0–9 |
 | Remote's A / B / C / D buttons (used by some discs, e.g. zoom, bookmark) | Shift+F1–F4 | Shift+F1–F4 |
-| Previous / next chapter | Ctrl+P / Ctrl+N | Ctrl+P / Ctrl+N |
+| Previous / next chapter | Ctrl+P / Ctrl+N | Shift+P / Shift+N |
+
+### Encrypted discs
+
+Encrypted (AACS) discs need the disc's key in a key database, `KEYDB.cfg` (the libaacs format: one line per
+disc, `<disc ID> = <title> | V | <volume unique key>`). The plugin looks for it where libaacs does:
+
+| System | Location |
+|---|---|
+| macOS | `~/Library/Preferences/aacs/KEYDB.cfg` or `~/.config/aacs/KEYDB.cfg` |
+| Windows | `%APPDATA%\aacs\KEYDB.cfg` |
+| Linux | `~/.config/aacs/KEYDB.cfg` |
+
+Or set its path with `--hddvd-keydb=/path/to/KEYDB.cfg` (Tools > Preferences > All > Input / Codecs > Access
+modules > HD DVD). When the key is missing, VLC shows an error naming the disc ID to look for.
 
 ## Build
 

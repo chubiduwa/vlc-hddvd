@@ -71,6 +71,7 @@ pub const Access = struct {
             .collector = .{ .gpa = gpa },
             .menu_language = lang,
         };
+        a.res.keys = fs.keys;
         vlc.vlc_mutex_init(&a.lock);
         a.files = .{
             .gpa = gpa,
