@@ -65,7 +65,7 @@ jobs:
       # libasound2-dev is for RtAudio: its headers alone, since /usr/include would shadow Zig's libc headers.
       - run: >-
           sudo apt-get update && sudo apt-get install -y --no-install-recommends libvlccore-dev libasound2-dev
-          vlc-bin vlc-plugin-base
+          vlc-bin vlc-plugin-base gdb
       - run: mkdir -p "$RUNNER_TEMP/alsa-include" && ln -s /usr/include/alsa "$RUNNER_TEMP/alsa-include/alsa"
       - run: zig build test --summary all
       - run: >-
@@ -83,7 +83,7 @@ jobs:
           path: ${{ runner.temp }}/test-discs
       - run: >-
           python3 tools/vlc_disc_test.py "$RUNNER_TEMP/test-discs" --vlc /usr/bin/vlc
-          --plugins zig-out/linux-${{ matrix.arch }}/lib --keep-logs "$RUNNER_TEMP/vlc-logs"
+          --plugins zig-out/linux-${{ matrix.arch }}/lib --keep-logs "$RUNNER_TEMP/vlc-logs" --gdb
       - uses: actions/upload-artifact@v4
         if: always()
         with:
