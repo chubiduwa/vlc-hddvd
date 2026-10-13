@@ -794,17 +794,17 @@ fn getMeta(demux: *vlc.demux_t, meta: *anyopaque) callconv(.c) c_int {
 }
 
 /// VLC's title list: "HD DVD Menu" (interactive, one entry per menu) then the disc's titles and chapters.
-/// NOTE (Windows): VLC frees these with its own C runtime's free(); fine on macOS/Linux.
+/// VLC frees these: allocated on its C runtime (crt.h).
 fn getTitleInfo(demux: *vlc.demux_t, out_titles: *[*c][*c]vlc.input_title_t, out_count: *c_int) callconv(.c) c_int {
     if (adv.owns(demux)) return adv.getTitleInfo(demux, out_titles, out_count);
     const sys = sysOf(demux);
     const titles = sys.disc.titles;
     const n = titles.len + 1;
-    const list: [*c][*c]vlc.input_title_t = @ptrCast(@alignCast(std.c.malloc(n * @sizeOf(*vlc.input_title_t)) orelse return vlc.VLC_ENOMEM));
+    const list: [*c][*c]vlc.input_title_t = @ptrCast(@alignCast(vlc.hddvd_vlc_malloc(n * @sizeOf(*vlc.input_title_t)) orelse return vlc.VLC_ENOMEM));
 
     const menu = vlc.vlc_input_title_New();
     hddvd_input_title_set_flags(menu, vlc.INPUT_TITLE_MENU | vlc.INPUT_TITLE_INTERACTIVE, "HD DVD Menu");
-    const mp: [*c][*c]vlc.seekpoint_t = @ptrCast(@alignCast(std.c.malloc(menu_points.len * @sizeOf(*vlc.seekpoint_t)) orelse return vlc.VLC_ENOMEM));
+    const mp: [*c][*c]vlc.seekpoint_t = @ptrCast(@alignCast(vlc.hddvd_vlc_malloc(menu_points.len * @sizeOf(*vlc.seekpoint_t)) orelse return vlc.VLC_ENOMEM));
     for (menu_points, 0..) |name, k| {
         mp[k] = vlc.vlc_seekpoint_New();
         hddvd_seekpoint_set_name(mp[k], name);
@@ -816,7 +816,7 @@ fn getTitleInfo(demux: *vlc.demux_t, out_titles: *[*c][*c]vlc.input_title_t, out
     for (titles, 1..) |t, i| {
         const it = vlc.vlc_input_title_New();
         it.*.i_length = t.duration_us;
-        const points: [*c][*c]vlc.seekpoint_t = @ptrCast(@alignCast(std.c.malloc(@max(1, t.chapter_us.len) * @sizeOf(*vlc.seekpoint_t)) orelse return vlc.VLC_ENOMEM));
+        const points: [*c][*c]vlc.seekpoint_t = @ptrCast(@alignCast(vlc.hddvd_vlc_malloc(@max(1, t.chapter_us.len) * @sizeOf(*vlc.seekpoint_t)) orelse return vlc.VLC_ENOMEM));
         for (t.chapter_us, 0..) |start, k| {
             points[k] = vlc.vlc_seekpoint_New();
             points[k].*.i_time_offset = start;

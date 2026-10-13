@@ -6,6 +6,7 @@
 #ifdef _WIN32
 # include "win32_fixups.h" /* must precede the VLC headers */
 #endif
+#include "crt.h" /* memory shared with VLC */
 #include <vlc_common.h>
 #include <vlc_messages.h>
 #include <vlc_demux.h>

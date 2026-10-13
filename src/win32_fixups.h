@@ -1,6 +1,7 @@
 /*
- * Included first by module.c on Windows. In-tree VLC builds get poll()/struct pollfd
- * from vlc_fixups.h, which the SDK does not ship; vlc_threads.h needs them in an inline.
+ * Included first, on Windows, by the C glue and vlc.h (before the VLC headers). In-tree VLC builds get
+ * poll()/struct pollfd from vlc_fixups.h, which the SDK does not ship; vlc_threads.h needs them in an inline.
+ * crt.h then sends the allocator to VLC's C runtime, for the VLC headers' inline helpers too.
  */
 #ifndef HDDVD_WIN32_FIXUPS_H
 #define HDDVD_WIN32_FIXUPS_H
@@ -11,5 +12,7 @@
 #include <winsock2.h>
 
 #define poll(fds, nfds, timeout) WSAPoll(fds, nfds, timeout)
+
+#include "crt.h"
 
 #endif

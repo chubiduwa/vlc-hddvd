@@ -1174,11 +1174,11 @@ pub fn setPosition(demux: *vlc.demux_t, f: f64) c_int {
 
 /// VLC's title list: "HD DVD Menu" (the menu key for the applications, like Standard Content's), then the
 /// playlist's titles, named, with their chapters.
-/// NOTE (Windows): VLC frees these with its own C runtime's free(); fine on macOS/Linux.
+/// VLC frees these: allocated on its C runtime (crt.h).
 pub fn getTitleInfo(demux: *vlc.demux_t, out_titles: *[*c][*c]vlc.input_title_t, out_count: *c_int) c_int {
     const p = playerOf(demux);
     const titles = p.pl.titles;
-    const list: [*c][*c]vlc.input_title_t = @ptrCast(@alignCast(std.c.malloc((titles.len + 1) * @sizeOf(*vlc.input_title_t)) orelse return vlc.VLC_ENOMEM));
+    const list: [*c][*c]vlc.input_title_t = @ptrCast(@alignCast(vlc.hddvd_vlc_malloc((titles.len + 1) * @sizeOf(*vlc.input_title_t)) orelse return vlc.VLC_ENOMEM));
     const menu = vlc.vlc_input_title_New();
     hddvd_input_title_set_flags(menu, vlc.INPUT_TITLE_MENU | vlc.INPUT_TITLE_INTERACTIVE, "HD DVD Menu");
     list[0] = menu;
@@ -1188,7 +1188,7 @@ pub fn getTitleInfo(demux: *vlc.demux_t, out_titles: *[*c][*c]vlc.input_title_t,
         it.*.i_length = p.tb().us(t.duration);
         const label = titleLabel(&t);
         hddvd_input_title_set_flags(it, 0, z(&name_buf, label));
-        const points: [*c][*c]vlc.seekpoint_t = @ptrCast(@alignCast(std.c.malloc(@max(1, t.chapters.len) * @sizeOf(*vlc.seekpoint_t)) orelse return vlc.VLC_ENOMEM));
+        const points: [*c][*c]vlc.seekpoint_t = @ptrCast(@alignCast(vlc.hddvd_vlc_malloc(@max(1, t.chapters.len) * @sizeOf(*vlc.seekpoint_t)) orelse return vlc.VLC_ENOMEM));
         for (t.chapters, 0..) |c, k| {
             points[k] = vlc.vlc_seekpoint_New();
             points[k].*.i_time_offset = p.tb().us(c.begin);

@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
 
     mod.addIncludePath(b.path("src"));
     mod.addIncludePath(vlc_include);
-    mod.addCSourceFiles(.{ .files = &.{ "src/module.c", "src/nav_glue.c", "src/spu_glue.c", "src/codec_glue.c" }, .flags = &common_flags });
+    mod.addCSourceFiles(.{ .files = &.{ "src/module.c", "src/nav_glue.c", "src/spu_glue.c", "src/codec_glue.c", "src/crt.c" }, .flags = &common_flags });
 
     switch (target.result.os.tag) {
         .windows => {
