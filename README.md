@@ -19,6 +19,7 @@ Not supported yet:
 
 - Advanced Content: network features, Advanced Subtitles, switching to Standard Content, bookmarks kept after
   closing VLC
+- Full list: [spec coverage](#spec-coverage)
 
 Not going to be supported:
 
@@ -155,6 +156,68 @@ are attached to each run as artifacts.
 ## Reference
 
 Based on HD-DVD spec from: https://github.com/amp64/hddvd-docs
+
+## Spec coverage
+
+What the plugin does not implement yet, by part of the HD DVD specification. The rest of the navigation,
+markup, timing and script APIs is implemented; a few details (such as some exception types) may still differ,
+and where discs rely on a different behaviour than the spec describes, the plugin follows the discs.
+
+Advanced Content (HDi):
+
+- Network: HTTP requests, network data sources, streamed secondary video and cookies (Annex Y). Scripts see an
+  offline player.
+- Advanced Subtitles.
+- Playing Standard Content from Advanced Content (`StandardContentPlayer.play` does nothing).
+- Secondary video played from a file by script (`SecondaryVideoPlayer.play`), and clips with `sync="none"`.
+- Persistent storage is kept only until VLC closes.
+- Trick play: fast forward, fast reverse, slow motion and frame stepping (the API reports them as unsupported).
+- Video capture (`MainVideo.capture`) and image scaling (`changeImageSize`).
+- The markup audio object (`audio/x-wav` objects in a page).
+- Restricted Mode (Annex X): every application runs with full rights.
+
+Standard Content:
+
+- Sub-picture colour changes within a unit (CHG_COLCON, used by karaoke-style subtitles); 8-bit sub-pictures are
+  untested.
+- Navigation timers (SPRM 9/10), counter-mode GPRMs, parental blocks, random and shuffle playback (played in
+  order).
+- Button groups other than the first, display-type selection, and some highlight modes (HLI_SS 2/3; 10/11 are
+  treated as new highlights).
+- Audio and subtitle stream selection by the disc's commands (VLC chooses the streams).
+- Angles in interleaved cells.
+- Resuming a menu call mid-cell (it resumes at the start of the cell).
+
+Decryption (AACS):
+
+- Segment and sequence keys, and audio-only title keys (no known disc uses them).
+- Keys from a drive or device keys: a key database (`KEYDB.cfg`) is required.
+- Recordable discs (UDF VAT or sparable partitions).
+
+### Differences from the spec
+
+Where discs were authored against players that behave differently from the specification, the plugin follows
+the discs:
+
+- `Chapter.number`, and the chapter event's `oldValue`/`newValue`, count from 0 (the chapter's index in
+  `Title.chapters`). The spec numbers chapters from 1.
+- An application's scripts run as one program, in manifest order, rather than as separate scripts: a script may
+  use a variable that a later one declares.
+- Re-enabling a timer (`enabled = false` then `true`) restarts its count; the spec continues it.
+- An explicit `navUp`/`navDown`/… of `none` blocks that direction; the spec treats `none` like an unset value.
+- `getProperty("backgroundImage")` returns absolute URIs, not the URI as written.
+- `changeLayout`'s crop rectangle applies to the scaled video.
+- Scripts may use `arguments` and `caller` on functions, which older script engines provided.
+- Playlists and markup are parsed leniently (for example integers where the spec has booleans).
+- Boolean arguments of DOM methods (`useCapture`, `deep`…) default to false when missing; the spec's argument
+  rules would throw.
+- `document.createElement` on a page creates an element in the page's namespace, so it is laid out.
+- A scheduled event exactly at the time a jump or a title starts from does not fire (discs resume at the time an
+  event fired and would get it again); one at 00:00:00:00 fires when a title starts from its beginning.
+- A title's first track events go only to the applications running before the title began.
+- An `application_end` sent because the title ended or a jump left it cannot be cancelled: the title has already
+  changed.
+- `dispatchEvent` always returns true: events reach each application later, as queued work items.
 
 ## License
 
