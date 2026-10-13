@@ -203,7 +203,6 @@ the discs:
   `Title.chapters`). The spec numbers chapters from 1.
 - An application's scripts run as one program, in manifest order, rather than as separate scripts: a script may
   use a variable that a later one declares.
-- Re-enabling a timer (`enabled = false` then `true`) restarts its count; the spec continues it.
 - An explicit `navUp`/`navDown`/… of `none` blocks that direction; the spec treats `none` like an unset value.
 - `getProperty("backgroundImage")` returns absolute URIs, not the URI as written.
 - `changeLayout`'s crop rectangle applies to the scaled video.

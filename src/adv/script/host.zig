@@ -1316,14 +1316,10 @@ pub const Timer = struct {
     fn getEnabled(tm: *Timer) bool {
         return tm.enabled;
     }
-    /// Enabling restarts the count from zero. Z.2.2.2 says disabling only stops the count and enabling counts on
-    /// from there, but discs rely on a restart: a menu bar resets its auto-close timer on every key with
-    /// `enabled = false` then `true`, and would otherwise close 15 s after opening however busy the user is.
+    /// Disabling stops the count without resetting it; enabling counts on from there (Z.2.2.2). Only a new
+    /// interval resets it.
     fn setEnabled(tm: *Timer, v: bool) void {
-        if (v and !tm.enabled) {
-            tm.last = null;
-            tm.count = 0;
-        }
+        if (v and !tm.enabled) tm.last = null; // the time it was disabled does not count
         tm.enabled = v;
     }
     fn getInterval(tm: *Timer) []const u8 {
@@ -1399,13 +1395,13 @@ test "the Application object, StringArray and timers" {
         \\var reset = 0; var t3 = createTimer("00:00:00:30", TIMER_APPLICATION, cb(function () { reset++; }));
         \\t3.autoReset = false; t3.enabled = true;
     , "app3.js");
-    // Re-enabling restarts the count: 20 + 20 ticks do not reach 30.
+    // Disabling stops the count and enabling counts on (Z.2.2.2): 20 ticks, a pause of 20, then 10 more fire it.
     try e.ticks(20);
-    try e.run("t3.enabled = false; t3.enabled = true;", "app4.js");
+    try e.run("t3.enabled = false;", "app4.js");
     try e.ticks(20);
-    try e.run("assertEq(reset, 0, 'restarted');", "app5.js");
-    try e.ticks(15);
-    try e.run("assertEq(reset, 1, 'fired 30 ticks after the restart');", "app6.js");
+    try e.run("assertEq(reset, 0, 'paused'); t3.enabled = true;", "app5.js");
+    try e.ticks(12);
+    try e.run("assertEq(reset, 1, 'fired 30 counted ticks after it started');", "app6.js");
 }
 
 test "XMLParser: parse, write and statuses" {
