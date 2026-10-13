@@ -9,8 +9,8 @@
 whole *run* are downloaded, since the GitHub artifacts API does not tie artifacts to jobs. Pass a run id and
 it is used directly. --version names the directory to make below releases/ ("v1.2").
 
-Downloaded artifacts (all but the excluded `vlc-sdk`) become one zip each, named after the artifact, with the
-plugin binary at the zip root:  releases/v1.2/hddvd-macos-aarch64.zip.
+Downloaded artifacts (all but the SDK, the test discs and the VLC logs) become one zip each, named after the
+artifact, with the plugin binary at the zip root:  releases/v1.2/hddvd-macos-aarch64.zip.
 
 `gh` must be installed and signed in; the repo is taken from this repo's git remote.
 """
@@ -24,8 +24,12 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-# The SDK artifact is an input to the other jobs, not a release piece.
-EXCLUDE = {"vlc-sdk"}
+# The SDK and the test discs are inputs to the other jobs, and the VLC logs their test output: not release pieces.
+EXCLUDE = {"vlc-sdk", "test-discs"}
+
+
+def excluded(name):
+    return name in EXCLUDE or name.startswith("vlc-logs-")
 
 
 def fail(msg):
@@ -71,12 +75,12 @@ def artifacts(run):
     """The run's live (name, size) artifact pairs, minus the excluded ones."""
     out = json.loads(gh("api", f"/repos/{repo()}/actions/runs/{run}/artifacts"))
     found = [(a["name"], a["size_in_bytes"]) for a in out["artifacts"]]
-    skipped = [n for n, _ in found if n in EXCLUDE]
+    skipped = [n for n, _ in found if excluded(n)]
     if not found:
         sys.exit(f"make_release: run {run} has no artifacts")
     if skipped:
-        print(f"skipped {' and '.join(skipped)}")
-    return [(n, s) for n, s in found if n not in EXCLUDE]
+        print(f"skipped {', '.join(skipped)}")
+    return [(n, s) for n, s in found if not excluded(n)]
 
 
 def download(run, name, into):

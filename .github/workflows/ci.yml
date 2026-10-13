@@ -30,8 +30,21 @@ jobs:
           path: vlc-sdk
           retention-days: 1
 
+  # Synthetic Standard and Advanced Content discs (tools/make_test_disc.py) that every platform plays in VLC.
+  discs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
+      - run: python3 tools/make_test_disc.py test-discs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-discs
+          path: test-discs
+          retention-days: 1
+
   linux:
-    needs: sdk
+    needs: [sdk, discs]
     strategy:
       fail-fast: false
       matrix:
@@ -50,7 +63,9 @@ jobs:
           path: ${{ runner.temp }}/vlc-sdk
       # Only libvlccore.so is taken from the system; the distribution's headers are older than the SDK's.
       # libasound2-dev is for RtAudio: its headers alone, since /usr/include would shadow Zig's libc headers.
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvlccore-dev libasound2-dev
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends libvlccore-dev libasound2-dev
+          vlc-bin vlc-plugin-base
       - run: mkdir -p "$RUNNER_TEMP/alsa-include" && ln -s /usr/include/alsa "$RUNNER_TEMP/alsa-include/alsa"
       - run: zig build test --summary all
       - run: >-
@@ -62,9 +77,22 @@ jobs:
         with:
           name: hddvd-linux-${{ matrix.arch }}
           path: zig-out/linux-${{ matrix.arch }}/lib/libhddvd_plugin.so
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-discs
+          path: ${{ runner.temp }}/test-discs
+      - run: >-
+          python3 tools/vlc_disc_test.py "$RUNNER_TEMP/test-discs" --vlc /usr/bin/vlc
+          --plugins zig-out/linux-${{ matrix.arch }}/lib --keep-logs "$RUNNER_TEMP/vlc-logs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vlc-logs-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/vlc-logs
+          retention-days: 7
 
   macos:
-    needs: sdk
+    needs: [sdk, discs]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -96,9 +124,23 @@ jobs:
         with:
           name: hddvd-macos-x86_64
           path: zig-out/macos-x86_64/lib/libhddvd_plugin.dylib
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-discs
+          path: ${{ runner.temp }}/test-discs
+      # The runner is arm64: the aarch64 plugin in the universal VLC.app.
+      - run: >-
+          python3 tools/vlc_disc_test.py "$RUNNER_TEMP/test-discs" --vlc "$RUNNER_TEMP/vlc/VLC.app/Contents/MacOS/VLC"
+          --plugins zig-out/macos-aarch64/lib --keep-logs "$RUNNER_TEMP/vlc-logs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vlc-logs-macos
+          path: ${{ runner.temp }}/vlc-logs
+          retention-days: 7
 
   windows:
-    needs: sdk
+    needs: [sdk, discs]
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
@@ -115,3 +157,23 @@ jobs:
         with:
           name: hddvd-windows-x86_64
           path: zig-out/windows-x86_64/bin/libhddvd_plugin.dll
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-discs
+          path: ${{ runner.temp }}/test-discs
+      - name: Fetch VLC
+        shell: bash
+        run: |
+          curl -fsSLo vlc.7z "https://download.videolan.org/pub/videolan/vlc/$VLC_VERSION/win64/vlc-$VLC_VERSION-win64.7z"
+          echo "$VLC_WIN64_SHA256  vlc.7z" | sha256sum -c
+          7z x -y -o"$RUNNER_TEMP" vlc.7z > /dev/null
+      - shell: bash
+        run: >-
+          python tools/vlc_disc_test.py "$RUNNER_TEMP/test-discs" --vlc "$RUNNER_TEMP/vlc-$VLC_VERSION/vlc.exe"
+          --plugins zig-out/windows-x86_64/bin --keep-logs "$RUNNER_TEMP/vlc-logs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vlc-logs-windows
+          path: ${{ runner.temp }}/vlc-logs
+          retention-days: 7
