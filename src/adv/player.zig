@@ -64,6 +64,9 @@ extern fn hddvd_input_pause(demux: *vlc.demux_t, paused: bool) void;
 const MenuKey = extern struct { cb: *const fn (?*anyopaque) callconv(.c) void, ctx: ?*anyopaque };
 extern fn hddvd_menu_key_take(demux: *vlc.demux_t, k: *MenuKey) void;
 extern fn hddvd_menu_key_release(demux: *vlc.demux_t, k: *MenuKey) void;
+const SkipKeys = extern struct { cb: *const fn (?*anyopaque, c_int) callconv(.c) void, ctx: ?*anyopaque };
+extern fn hddvd_skip_keys_take(demux: *vlc.demux_t, k: *SkipKeys) void;
+extern fn hddvd_skip_keys_release(demux: *vlc.demux_t, k: *SkipKeys) void;
 
 fn log(obj: *vlc.vlc_object_t, prio: c_int, src: std.builtin.SourceLocation, comptime fmt: [*:0]const u8, args: anytype) void {
     @call(.auto, vlc.vlc_Log, .{ obj, prio, "hddvd", src.file, @as(c_uint, src.line), src.fn_name, fmt } ++ args);
@@ -211,6 +214,7 @@ pub const Player = struct {
     sub_layout: VideoLayout = .{},
     /// Our callback for VLC's disc-menu key (nav_glue.c).
     menu_key: MenuKey = undefined,
+    skip_keys: SkipKeys = undefined,
 
     fn tb(p: *const Player) xpl.TimeBase {
         return p.pl.time_base;
@@ -299,6 +303,7 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
     }
     demux.p_sys = @ptrCast(p);
     p.menu_key = .{ .cb = menuKey, .ctx = p };
+    p.skip_keys = .{ .cb = skipKey, .ctx = p };
     demux.pf_demux = demuxOne;
     demux.pf_control = HddvdDemuxControl;
     log(o, vlc.VLC_MSG_INFO, @src(), "HD DVD Advanced Content: \"%s\", %u titles, %u EVOBs", .{
@@ -459,6 +464,7 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
 pub fn close(demux: *vlc.demux_t) void {
     const p = playerOf(demux);
     hddvd_menu_key_release(demux, &p.menu_key);
+    hddvd_skip_keys_release(demux, &p.skip_keys);
     // demux_Delete also deletes the demuxer's stream.
     if (p.ps) |ps| vlc.demux_Delete(ps) else if (p.stream) |s| hddvd_stream_delete(s);
     if (p.host) |h| h.destroy();
@@ -706,6 +712,7 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
     const p = playerOf(demux);
     p.menu_requested = false;
     hddvd_menu_key_take(demux, &p.menu_key);
+    hddvd_skip_keys_take(demux, &p.skip_keys);
     runCommands(demux);
     if (p.reselect) {
         p.reselect = false;
@@ -1179,6 +1186,16 @@ fn menuKey(ctx: ?*anyopaque) callconv(.c) void {
     const h = p.host orelse return;
     h.post(.{ .key_down = keys.menu });
     h.post(.{ .key_up = keys.menu });
+}
+
+/// VLC's next/previous chapter (its keys and buttons; any thread): the remote's skip keys, VK_SKIP_NEXT and
+/// VK_SKIP_PREV, for the applications. Annex V's default handler changes chapter when none consumes them.
+fn skipKey(ctx: ?*anyopaque, next: c_int) callconv(.c) void {
+    const p: *Player = @ptrCast(@alignCast(ctx.?));
+    const h = p.host orelse return;
+    const k = if (next != 0) keys.skip_next else keys.skip_prev;
+    h.post(.{ .key_down = k });
+    h.post(.{ .key_up = k });
 }
 
 /// VLC flushes every decoder (`es_out_SetTime(-1)`) before a title or chapter control, the disc-menu key's

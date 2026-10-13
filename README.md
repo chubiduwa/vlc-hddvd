@@ -108,7 +108,7 @@ Note: mouse interaction can be enabled/disabled by discs themselves and might no
 | Remote's number keys (e.g. text entry in games) | 0–9 | 0–9 |
 | Remote's A / B / C / D buttons (used by some discs, e.g. zoom, bookmark) | Shift+F1–F4 | Shift+F1–F4 |
 | Pause (some discs, e.g. games, open their options instead) | Space | Space |
-| Previous / next chapter | Ctrl+P / Ctrl+N | Shift+P / Shift+N |
+| Previous / next chapter (discs may use them, e.g. to leave a commentary) | Ctrl+P / Ctrl+N | Shift+P / Shift+N |
 
 ### Encrypted discs
 

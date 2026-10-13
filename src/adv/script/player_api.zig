@@ -419,10 +419,13 @@ pub const TrackSel = struct {
         return t.selectNumber(cx, .subtitle, track, 32);
     }
 
+    /// Only the range is checked (Z.10.13): a track the title does not have is still selected, keeping the
+    /// language, and Algorithm A1 picks what plays. Discs select a remembered track on titles without it
+    /// (a subtitle track on a title with no subtitles) and go on with the rest of the handler.
     fn selectNumber(t: *TrackSel, cx: *js.Context, kind: Kind, track: u32, max: u32) js.Error!void {
         const s = Script.of(cx);
         const title = t.refTitle(s) orelse return error.Argument;
-        if (track < 1 or track > max or !hasTrack(title, kind, @intCast(track))) return error.Argument;
+        if (track < 1 or track > max) return error.Argument;
         const tr = t.tracksOf(s);
         const nav = navOf(title, kind, @intCast(track));
         const lc = if (nav) |n| langCode(n.langcode) else null;
@@ -2319,7 +2322,8 @@ test "the Player API on a title" {
         \\// Track selection (Algorithm A1).
         \\var tr = Player.track; assertEq(tr.currentAudioTrackNumber, 1);
         \\tr.selectAudioTrackNumber(2); assertEq(tr.currentAudioTrackNumber, 2); assertEq(tr.selectedAudioLanguageCode, "ja");
-        \\assertThrows(function () { tr.selectAudioTrackNumber(5); }, "HDDVD_E_ARGUMENT");
+        \\tr.selectAudioTrackNumber(5); assertEq(tr.selectedAudioTrackNumber, 5, "no such track: still selected"); assertEq(tr.currentAudioTrackNumber, 2, "A1: the language kept");
+        \\assertThrows(function () { tr.selectAudioTrackNumber(9); }, "HDDVD_E_ARGUMENT"); assertThrows(function () { tr.selectAudioTrackNumber(0); }, "HDDVD_E_ARGUMENT");
         \\tr.selectAudioLanguage("en", 0); assertEq(tr.currentAudioTrackNumber, 1); assertEq(tr.selectedAudioTrackNumber, 1);
         \\// The play state.
         \\pl.pause(); assertEq(pl.playState, pl.PLAYSTATE_PAUSE); assertEq(pl.playSpeed, NaN);

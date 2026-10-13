@@ -369,6 +369,65 @@ void hddvd_menu_key_release(demux_t *demux, hddvd_menu_key_t *k)
         var_DelCallback(in, "title  0", MenuKeyCallback, k);
 }
 
+/* VLC's chapter keys (and the interfaces' chapter buttons) trigger the input's "next-chapter" and "prev-chapter"
+ * variables, whose callback queues a seekpoint change, flushing every decoder first. Advanced Content replaces
+ * both with its own, marked by their text, so they become the remote's skip keys for the applications instead.
+ * VLC creates them only when they do not exist (input_ControlVarTitle), so ours stay until VLC destroys them
+ * (at a title with one chapter, and at the end). They are made again whenever they are missing: a title with
+ * one chapter still has the skip keys (discs use them to leave it). */
+typedef struct { void (*cb)(void *, int next); void *ctx; } hddvd_skip_keys_t;
+
+static const char *const skip_vars[2] = { "prev-chapter", "next-chapter" };
+static const char *const skip_marks[2] = { "hddvd previous chapter", "hddvd next chapter" };
+
+static int SkipKeyCallback(vlc_object_t *obj, const char *var, vlc_value_t old, vlc_value_t val, void *data)
+{
+    VLC_UNUSED(obj); VLC_UNUSED(old); VLC_UNUSED(val);
+    hddvd_skip_keys_t *k = data;
+    k->cb(k->ctx, strcmp(var, "next-chapter") == 0);
+    return VLC_SUCCESS;
+}
+
+static bool VarHasText(input_thread_t *in, const char *var, const char *mark)
+{
+    vlc_value_t text;
+    if (var_Change(in, var, VLC_VAR_GETTEXT, &text, NULL) != VLC_SUCCESS)
+        return false;
+    bool ours = text.psz_string != NULL && strcmp(text.psz_string, mark) == 0;
+    free(text.psz_string); /* VLC's copy, from VLC's heap */
+    return ours;
+}
+
+void hddvd_skip_keys_take(demux_t *demux, hddvd_skip_keys_t *k)
+{
+    input_thread_t *in = demux->p_input;
+    if (in == NULL)
+        return;
+    for (int i = 0; i < 2; i++)
+    {
+        if (var_Type(in, skip_vars[i]) != 0)
+        {
+            if (VarHasText(in, skip_vars[i], skip_marks[i]))
+                continue; /* already ours */
+            var_Destroy(in, skip_vars[i]);
+        }
+        var_Create(in, skip_vars[i], VLC_VAR_VOID);
+        vlc_value_t text = { .psz_string = (char *)skip_marks[i] };
+        var_Change(in, skip_vars[i], VLC_VAR_SETTEXT, &text, NULL);
+        var_AddCallback(in, skip_vars[i], SkipKeyCallback, k);
+    }
+}
+
+void hddvd_skip_keys_release(demux_t *demux, hddvd_skip_keys_t *k)
+{
+    input_thread_t *in = demux->p_input;
+    if (in == NULL)
+        return;
+    for (int i = 0; i < 2; i++)
+        if (var_Type(in, skip_vars[i]) != 0 && VarHasText(in, skip_vars[i], skip_marks[i]))
+            var_DelCallback(in, skip_vars[i], SkipKeyCallback, k);
+}
+
 /* Pauses or resumes the input, as VLC's pause key does: through its "state" variable, which queues an
  * INPUT_CONTROL_SET_STATE (the demux then gets DEMUX_SET_PAUSE_STATE). */
 void hddvd_input_pause(demux_t *demux, bool paused)
