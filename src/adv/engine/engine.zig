@@ -23,8 +23,8 @@ pub const Point = struct { x: i32, y: i32 };
 
 /// From the demux and the user to the engine.
 pub const Event = union(enum) {
-    /// A title starts (null: the First Play title); `duration` in frames.
-    title_begin: struct { title: ?u16, duration: u64, tick_divisor: u32 = 1 },
+    /// A title starts (null: the First Play title) at title time `time`; `duration` in frames.
+    title_begin: struct { title: ?u16, duration: u64, tick_divisor: u32 = 1, time: u64 = 0 },
     title_end,
     /// The Title Timeline jumped to this title time (frames).
     jump: u64,
@@ -262,7 +262,9 @@ pub const Engine = struct {
                 e.in_title = true;
                 e.title_serial += 1;
                 e.title_duration = t.duration;
-                e.title_time = 0;
+                // A title can start part-way (a bookmark, Title.jump with a time): the scheduled events before
+                // that time are not played.
+                e.title_time = t.time;
                 if (t.tick_divisor != e.divisor) {
                     e.divisor = @max(1, t.tick_divisor);
                     if (e.last_tick) |l| e.last_tick = l / e.divisor * e.divisor;
@@ -358,13 +360,17 @@ test "ticks, clocks and pause" {
     try testing.expectEqual(@as(u64, 800), c.last.title);
     _ = e.step(261000, 801);
     try testing.expectEqual(@as(u64, 801), c.last.title);
+    // A title that starts part-way starts its clock there, not at 0 (or the stale read).
+    try e.post(.{ .title_begin = .{ .title = 2, .duration = 20000, .time = 14699 } });
+    _ = e.step(281000, 801);
+    try testing.expectEqual(@as(u64, 14699), c.last.title);
 
     // The page clock restarts with a new scene.
     var c2: Counter = .{};
-    e.setScene(.{ .ctx = &c2, .vtable = &Counter.vtable }, 261000);
-    _ = e.step(301000, 0);
+    e.setScene(.{ .ctx = &c2, .vtable = &Counter.vtable }, 281000);
+    _ = e.step(321000, 0);
     try testing.expectEqual(@as(u64, 2), c2.last.page);
-    try testing.expectEqual(@as(u64, 15), c2.last.app);
+    try testing.expectEqual(@as(u64, 16), c2.last.app);
 }
 
 test "tick divisor" {

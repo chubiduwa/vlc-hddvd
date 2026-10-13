@@ -251,6 +251,11 @@ pub const Apps = struct {
     records: std.ArrayList(*App) = .empty,
     /// The engine's title count when the records were made.
     title_serial: u32 = 0,
+    /// The scene is being torn down: deliveries are dropped, not passed on.
+    closing: bool = false,
+    /// The applications title_begin went to (those running before the title's own started): the title's first
+    /// track events go to them too.
+    begin_uids: ?[]u64 = null,
     title: ?u16 = null,
     /// The Selected Application Group (Annex W; Player.applicationGroup).
     app_group: ?u32 = null,
@@ -296,8 +301,10 @@ pub const Apps = struct {
 
     fn deinit(ctx: *anyopaque, gpa: std.mem.Allocator) void {
         const s: *Apps = @ptrCast(@alignCast(ctx));
+        s.closing = true;
         while (s.records.pop()) |a| s.destroyRecord(a);
         s.records.deinit(gpa);
+        if (s.begin_uids) |u| gpa.free(u);
         s.world.destroy();
         gpa.destroy(s);
     }
@@ -377,7 +384,9 @@ pub const Apps = struct {
             a.valid_range = .{ 0, null };
             s.load(a);
         };
-        s.sendSystem(.{ .kind = .title, .type = "title_begin", .id = s.titleId() }, s.loadedUids());
+        if (s.begin_uids) |u| s.gpa.free(u);
+        s.begin_uids = @constCast(s.loadedUids());
+        s.sendSystem(.{ .kind = .title, .type = "title_begin", .id = s.titleId() }, s.beginUids());
         const title = s.curTitle() orelse return;
         // The title's applications, by their zOrder.
         var segs: std.ArrayList(*const xpl.AppSegment) = .empty;
@@ -560,11 +569,31 @@ pub const Apps = struct {
     /// Unloads an application: its script context and page go; the record stays.
     fn unload(s: *Apps, a: *App) void {
         if (a.loaded) s.log("application {s} unloads", .{a.src});
+        // Events the application had not handled yet go on to the others (an event goes to every application
+        // in priority order, §8.3.5). A disc saves its settings to its playlist application right before a
+        // title jump that unloads it; dropping the event lost them.
+        var pending: std.ArrayList(*host.Delivery) = .empty;
+        defer pending.deinit(s.gpa);
+        var uid: ?u64 = null;
         if (a.script) |sc| {
+            uid = sc.uid;
+            sc.takeDeliveries(&pending);
             sc.pageGone();
             sc.destroy();
         }
         a.script = null;
+        for (pending.items) |d| {
+            const for_it = d.recipients != null and d.recipients.?.len == 1 and d.recipients.?[0] == uid;
+            if (s.closing or for_it) {
+                d.destroy();
+                continue;
+            }
+            if (uid) |u| {
+                d.visited.append(d.arena.allocator(), u) catch {};
+                if (d.origin == u) d.origin_node = null; // its page is gone
+            }
+            s.send(d) catch {};
+        }
         s.gpa.free(a.order);
         s.gpa.free(a.rank);
         a.order = &.{};
@@ -578,6 +607,12 @@ pub const Apps = struct {
         a.ending = false;
         a.numbered = false;
         a.look = 0;
+    }
+
+    /// A copy of `begin_uids`, for sendSystem (which takes it).
+    pub fn beginUids(s: *Apps) ?[]const u64 {
+        const u = s.begin_uids orelse return null;
+        return s.gpa.dupe(u64, u) catch null;
     }
 
     fn loadedUids(s: *Apps) ?[]const u64 {

@@ -129,6 +129,8 @@ pub const Model = struct {
     last_time: ?u64 = null,
     last_chapter: ?u32 = null,
     playing_clips: std.ArrayList(usize) = .empty,
+    /// The title's first track selection is still to come (see `reselect`).
+    first_tracks: bool = true,
 
     pub fn deinit(m: *Model, gpa: std.mem.Allocator) void {
         var it = m.general.iterator();
@@ -621,7 +623,6 @@ fn selectA1(w: *World, title: *const xpl.Title, kind: Kind, tr: *const Tracks, c
 /// The current tracks again (§4.3.19.4.2, 4.3.19.4.4) for the clip at the title time; changes raise track
 /// events (unless `quiet`) and tell the demux.
 pub fn reselect(w: *World, from_api: bool) void {
-    _ = from_api;
     const title = curTitle(w) orelse return;
     const clip = title.clipAt(.primary, w.title_time);
     const tr = &w.model.tracks;
@@ -636,16 +637,21 @@ pub fn reselect(w: *World, from_api: bool) void {
     };
     tr.cur_audio = selectA1(w, title, .audio, tr, clip);
     tr.cur_sub = selectA1(w, title, .subtitle, tr, clip);
-    if (old.cur_video != tr.cur_video) trackEvent(w, .video_track, "video_track", old.cur_video, tr.cur_video);
-    if (old.cur_audio != tr.cur_audio) trackEvent(w, .audio_track, "audio_track", old.cur_audio, tr.cur_audio);
-    if (old.cur_sub != tr.cur_sub) trackEvent(w, .subtitle_track, "subtitle_track", old.cur_sub, tr.cur_sub);
+    // The title's first selection goes, like title_begin, only to the applications running before the title
+    // began: one that starts with the title reads the tracks itself. A disc's bonus application saves its
+    // settings on subtitle_track, and would otherwise save them before it has loaded them.
+    const first = !from_api and w.model.first_tracks and clip != null;
+    if (first) w.model.first_tracks = false;
+    if (old.cur_video != tr.cur_video) trackEvent(w, first, .video_track, "video_track", old.cur_video, tr.cur_video);
+    if (old.cur_audio != tr.cur_audio) trackEvent(w, first, .audio_track, "audio_track", old.cur_audio, tr.cur_audio);
+    if (old.cur_sub != tr.cur_sub) trackEvent(w, first, .subtitle_track, "subtitle_track", old.cur_sub, tr.cur_sub);
     if (old.cur_video != tr.cur_video or old.cur_audio != tr.cur_audio or old.cur_sub != tr.cur_sub)
         if (w.eng) |e| e.command(.{ .tracks = .{ .video = tr.cur_video, .audio = tr.cur_audio, .subtitle = tr.cur_sub } });
 }
 
-fn trackEvent(w: *World, kind: events.Kind, type_: []const u8, old: ?u8, new: ?u8) void {
+fn trackEvent(w: *World, first: bool, kind: events.Kind, type_: []const u8, old: ?u8, new: ?u8) void {
     const a = w.apps orelse return;
-    a.sendSystem(.{ .kind = kind, .type = type_, .old = if (old) |o| o else null, .new = if (new) |n| n else null }, null);
+    a.sendSystem(.{ .kind = kind, .type = type_, .old = if (old) |o| o else null, .new = if (new) |n| n else null }, if (first) a.beginUids() orelse &.{} else null);
 }
 
 // ---- Bookmark (Z.10.3) --------------------------------------------------------------------------------------------
@@ -1994,6 +2000,7 @@ pub fn titleBegins(w: *World) void {
     m.last_time = null;
     m.last_chapter = null;
     m.playing_clips.clearRetainingCapacity();
+    m.first_tracks = true;
     m.play_state = PlayState.play;
     m.play_speed = null;
     m.main = .{ .crop_w = w.aperture_w, .crop_h = w.aperture_h };

@@ -506,6 +506,7 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
         .title = if (index) |i| @intCast(i) else null,
         .duration = title.duration,
         .tick_divisor = title.tick_divisor,
+        .time = t,
     } });
     const span = timeline.spanFrom(title, t) orelse {
         // Nothing to present (an application-only title): move on.
@@ -513,6 +514,7 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
         return;
     };
     if (!positionSpan(demux, span, @max(t, span.begin))) return;
+    if (p.pres) |pr| pr.setJumpTarget(@max(t, span.begin)); // a title started part-way: as a jump
     // A new ps demuxer: the ESes are recreated with this title's track names. It peeks at the stream when it
     // opens, so the reader is positioned first.
     if (p.ps) |ps| {

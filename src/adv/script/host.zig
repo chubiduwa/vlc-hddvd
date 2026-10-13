@@ -711,6 +711,21 @@ pub const Script = struct {
         }.d);
     }
 
+    /// Takes the deliveries still in the queue, in order (the application unloads: they go on to the others).
+    pub fn takeDeliveries(s: *Script, out: *std.ArrayList(*Delivery)) void {
+        const Ctx = struct { s: *Script, out: *std.ArrayList(*Delivery) };
+        var ctx: Ctx = .{ .s = s, .out = out };
+        s.queue.removeIf(&ctx, struct {
+            fn f(_: *Ctx, it: *const sched.Queue(Job).Item) bool {
+                return it.job == .delivery;
+            }
+        }.f, struct {
+            fn d(cx: *Ctx, job: Job) void {
+                cx.out.append(cx.s.gpa, job.delivery) catch job.delivery.destroy();
+            }
+        }.d);
+    }
+
     /// Drops the work items on the page clock (a new page starts, §8.5).
     pub fn dropPageItems(s: *Script) void {
         s.queue.removeIf(s, struct {
