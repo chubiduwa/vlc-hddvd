@@ -512,6 +512,11 @@ pub const Script = struct {
 
     /// Queues mutation event `type_` at `target` with its path as it is now.
     fn mutation(s: *Script, type_: []const u8, target: *dom.Node, bubbles: bool, related: ?*dom.Node, prev: []const u8, new: []const u8, attr: []const u8, change: u16) !void {
+        return s.mutationTo(type_, target, bubbles, related, js.null, prev, new, attr, change);
+    }
+
+    /// `mutation` with a relatedNode that is not a tree node (`related_v`, borrowed: an Attr).
+    fn mutationTo(s: *Script, type_: []const u8, target: *dom.Node, bubbles: bool, related: ?*dom.Node, related_v: Value, prev: []const u8, new: []const u8, attr: []const u8, change: u16) !void {
         if (s.closing or !s.wants(type_)) return;
         const e = try events.Event.create(s.gpa, .mutation, s.nowMs());
         const ev = s.cx.wrapAs(events.Event, &events.Event.mutation_class, e) catch |err| {
@@ -528,7 +533,7 @@ pub const Script = struct {
             const rv = try dom_api.wrap(s, r);
             defer s.cx.free(rv);
             e.related = s.cx.dup(rv);
-        }
+        } else if (!c.JS_IsNull(related_v)) e.related = s.cx.dup(related_v);
         e.prev_value = try a.dupe(u8, prev);
         e.new_value = try a.dupe(u8, new);
         e.attr_name = try a.dupe(u8, attr);
@@ -569,7 +574,12 @@ pub const Script = struct {
     /// An attribute changed (old/new null: added/removed): DOMAttrModified.
     pub fn attrChanged(s: *Script, el: *dom.Node, attr: []const u8, old: ?[]const u8, new: ?[]const u8) !void {
         const change: u16 = if (old == null) 2 else if (new == null) 3 else 1;
-        try s.mutation("DOMAttrModified", el, true, null, old orelse "", new orelse "", attr, change);
+        if (!s.closing and s.wants("DOMAttrModified")) {
+            // relatedNode: the Attr (DOM2 Events §1.6.4).
+            const rv = dom_api.Attr.forEvent(s, el, attr, if (new == null) old else null) catch js.null;
+            defer s.cx.free(rv);
+            try s.mutationTo("DOMAttrModified", el, true, null, rv, old orelse "", new orelse "", attr, change);
+        }
         try s.mutation("DOMSubtreeModified", el, true, null, "", "", "", 0);
         if (s.isPageDoc(el.doc)) if (s.app) |a| {
             a.attrs_dirty = true;
@@ -926,9 +936,16 @@ fn moveToBottom(s: *Script) void {
 
 /// link(uri) (Z.1.1.3): the page is replaced once the new one has loaded; a malformed page changes nothing.
 fn link(s: *Script, u: []const u8) js.Error!void {
-    if (u.len == 0 or !uri.valid(u) or uri.locate(u) == null) return error.Argument;
+    if (u.len == 0) return error.Argument;
     const a = s.app orelse return;
-    const copy = try s.gpa.dupe(u8, u);
+    // A relative URI is resolved against the current page, as in markup.
+    const colon = std.mem.indexOfScalar(u8, u, ':');
+    const slash = std.mem.indexOfScalar(u8, u, '/');
+    const absolute = colon != null and (slash == null or colon.? < slash.?);
+    const abs: []u8 = if (absolute) try s.gpa.dupe(u8, u) else if (a.page) |p| p.resolve(&p.doc.node, u) catch return error.Argument else return error.Argument;
+    defer s.gpa.free(abs);
+    if (!uri.valid(abs) or uri.locate(abs) == null) return error.Argument;
+    const copy = try s.gpa.dupe(u8, abs);
     if (a.link_requested) |old| s.gpa.free(old);
     a.link_requested = copy;
 }
@@ -972,7 +989,9 @@ fn removeEventListener(s: *Script, type_: []const u8, f: Value, capture_arg: ?bo
 fn dispatchEvent(s: *Script, ev_v: Value) js.Error!bool {
     const e = s.cx.unwrap(events.Event, ev_v) orelse return error.TypeError;
     if (!e.initialized or e.type.len == 0) return events.throwUnspecifiedEventType(s.cx);
-    const d = try Delivery.create(s.gpa, s.cx.rt, .app, .{ .kind = .app, .type = e.type, .bubbles = e.bubbles, .cancelable = e.cancelable });
+    // A ControllerKeyEvent the script made keeps its class and key fields (Z.5.3); others go as Application Events.
+    const kind: events.Kind = if (e.kind == .key) .key else .app;
+    const d = try Delivery.create(s.gpa, s.cx.rt, .app, .{ .kind = kind, .type = e.type, .bubbles = e.bubbles, .cancelable = e.cancelable, .key = e.key });
     errdefer d.destroy();
     d.spec.extras = try events.extrasOf(s.cx, d.arena.allocator(), ev_v);
     if (s.world.apps) |w| {
@@ -1058,7 +1077,8 @@ const AA = struct {
         return if (a.id.len > 0) cx.string(a.id) else js.undefined;
     }
     fn state(a: *apps.App) u32 {
-        return if (!a.valid) 3 else if (a.active()) 1 else 2;
+        // Active once activated, while it loads (activate() does not wait for it).
+        return if (!a.valid) 3 else if (a.selected and a.ready and !a.terminated) 1 else 2;
     }
     fn zOrder(a: *apps.App, cx: *js.Context) f64 {
         const w = Script.of(cx).world.apps orelse return std.math.nan(f64);

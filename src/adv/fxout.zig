@@ -52,6 +52,9 @@ pub const Output = struct {
     /// The sound playing, shared with the audio callback under `busy`.
     busy: std.atomic.Value(bool) = .init(false),
     sound: mix.Effects = .{},
+    /// The id of the sound playing, and of the last one that finished (for `takeDone`).
+    sound_id: u64 = 0,
+    done: std.atomic.Value(u64) = .init(0),
     gain: f32 = 1,
     /// The applications' effect gain times VLC's volume.
     app_gain: f32 = 1,
@@ -74,7 +77,7 @@ pub const Output = struct {
 
     /// Starts an effect sound (mono or stereo samples at `rate`), replacing any playing. Returns an error message
     /// if no output could be opened.
-    pub fn play(o: *Output, samples: []const f32, channels: usize, rate: u32, rows: ?[2][mix.hd_channels]u8, gain: f32, settings: Settings, now: i64) ?[*:0]const u8 {
+    pub fn play(o: *Output, samples: []const f32, channels: usize, rate: u32, rows: ?[2][mix.hd_channels]u8, gain: f32, settings: Settings, now: i64, sound: u64) ?[*:0]const u8 {
         o.stop();
         if (!settings.audible) return null; // VLC itself is silent (no audio output, or the dummy one)
         if (o.fx == null) o.fx = hddvd_fx_new();
@@ -96,6 +99,7 @@ pub const Output = struct {
         const out = mix.convertEffect(gpa, samples, channels, rate, stereo, o.rate, rows) catch return "out of memory";
         o.acquire();
         o.sound.start(gpa, out, stereo.n);
+        o.sound_id = sound;
         o.app_gain = gain;
         o.gain = gain * settings.amplitude;
         o.release();
@@ -141,7 +145,16 @@ pub const Output = struct {
         // Never wait here: the engine thread holds `busy` only to swap the sound or the gain.
         if (o.busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return;
         defer o.release();
-        if (o.sound.playing()) o.sound.mixInto(buf, o.gain);
+        if (o.sound.playing()) {
+            o.sound.mixInto(buf, o.gain);
+            if (!o.sound.playing()) o.done.store(o.sound_id, .release);
+        }
+    }
+
+    /// The id of the sound that finished since the last call, if any.
+    pub fn takeDone(o: *Output) ?u64 {
+        const id = o.done.swap(0, .acq_rel);
+        return if (id != 0) id else null;
     }
 };
 

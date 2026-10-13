@@ -31,6 +31,8 @@ pub const Effect = struct {
     rate: u32,
     /// When it was requested (mdate()); sounds requested while paused go stale.
     at: i64,
+    /// The script's effect id, reported back through `effect_done` when the sound ends.
+    id: u64 = 0,
 };
 
 /// One display period of a sub-picture unit on the sub-picture plane (from spudec.zig).
@@ -86,6 +88,8 @@ pub const Presentation = struct {
     /// An effect sound to start, taken by the mixer, or the one playing to stop.
     effect: ?Effect = null,
     stop_effect: bool = false,
+    /// The id of an effect sound the mixer finished (or dropped), for the engine; 0: none since the last look.
+    effect_done: u64 = 0,
     /// VLC is paused: its audio output does not play, so effect sounds go to their own output (fxout.zig).
     paused: bool = false,
 
@@ -215,6 +219,22 @@ pub const Presentation = struct {
         if (p.effect) |old| gpa.free(old.samples);
         p.effect = e;
         p.stop_effect = false;
+    }
+
+    /// The mixer finished (or dropped) the effect sound `id`.
+    pub fn effectDone(p: *Presentation, id: u64) void {
+        if (id == 0) return;
+        p.lockIt();
+        defer p.unlock();
+        p.effect_done = id;
+    }
+
+    /// The id of the effect sound the mixer finished since the last call, if any.
+    pub fn takeEffectDone(p: *Presentation) ?u64 {
+        p.lockIt();
+        defer p.unlock();
+        defer p.effect_done = 0;
+        return if (p.effect_done != 0) p.effect_done else null;
     }
 
     /// Stops the effect sound playing (or about to).

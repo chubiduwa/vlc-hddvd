@@ -1,8 +1,9 @@
 //! Files as Advanced Applications see them (HD DVD Annex Z.3, Vol. 1 §4.3.20.4, Vol. 3 §10): the File Cache's
 //! API Managed Area ("file:///filecache/", read-write), its Resource Area (read-only, by original URI), the disc
 //! (read-only) and the persistent storage (the provider's area and the common area). Reads of a URI outside
-//! the API Managed Area look in the Resource Area first. Files inside .aca archives are reached only through the
-//! Resource Area and cannot be written.
+//! the API Managed Area look in the Resource Area first. Files inside .aca archives are reached through the
+//! Resource Area, or, for an archive a script put in the API Managed Area, as "file:///filecache/x.aca/name"
+//! (listed, stat'ed and read: Z.3.1.2 getFiles, getFileInfo); they cannot be written.
 //!
 //! The player supplies the disc and the Resource Area (`Backend`); the API Managed Area and the persistent
 //! storage are memfs trees it owns, used under its lock. No VLC dependency.
@@ -12,6 +13,7 @@ const uri = @import("../uri.zig");
 const memfs = @import("../memfs.zig");
 const pstore = @import("../pstore.zig");
 const aca = @import("../aca.zig");
+const filecache = @import("../filecache.zig");
 
 pub const Error = error{ NotFound, NotPermitted, NoSpace, IsDirectory, NotDirectory, Exists, NotEmpty, BadPath, OutOfMemory };
 
@@ -41,7 +43,18 @@ pub const Backend = struct {
     now_ms: *const fn (ctx: *anyopaque) i64,
     /// Free File Cache bytes (DataCache.availableFileCacheSize): unused blocks and available resources.
     cache_available: ?*const fn (ctx: *anyopaque) u64 = null,
+    /// When a file of the Resource Area (by original URI) was stored there, ms since the epoch, or null.
+    resource_modified: ?*const fn (ctx: *anyopaque, u: []const u8) ?i64 = null,
 };
+
+/// The API Managed Area's directory for the player's own files (the copies TextStreams work on, Z.3.1.2
+/// openTextFile: "This copied file is not able to be opened"). No URI reaches it and listings leave it out, but
+/// its files take room like any other.
+const private_dir = "\x00player";
+
+fn isPrivate(p: []const u8) bool {
+    return std.mem.startsWith(u8, p, private_dir) and (p.len == private_dir.len or p[private_dir.len] == '/');
+}
 
 pub const Files = struct {
     gpa: std.mem.Allocator,
@@ -84,7 +97,7 @@ pub const Files = struct {
     fn tempPath(f: *Files, u: []const u8) Error![]u8 {
         const loc = uri.locate(u) orelse return error.BadPath;
         const p = try uri.percentDecode(f.gpa, std.mem.trim(u8, loc.path, "/"));
-        if (!memfs.Fs.validPath(p)) {
+        if (!memfs.Fs.validPath(p) or isPrivate(p)) {
             f.gpa.free(p);
             return error.BadPath;
         }
@@ -107,12 +120,56 @@ pub const Files = struct {
         return f.readAt(gpa, u, w);
     }
 
+    /// Whether reading `u` is served by the Resource Area (outside the API Managed Area, by original URI), so
+    /// that no disc access happens.
+    pub fn inResourceArea(f: *Files, u: []const u8) bool {
+        const w = where(u) catch return false;
+        if (w == .temp) return false;
+        f.lock();
+        defer f.unlock();
+        return f.backend.resource(f.backend.ctx, u) != null;
+    }
+
+    /// A Resource Area file's date: when it was stored there, else now.
+    fn resourceModified(f: *Files, u: []const u8) i64 {
+        if (f.backend.resource_modified) |m| if (m(f.backend.ctx, u)) |t| return t;
+        return f.now();
+    }
+
+    const Archived = struct {
+        /// Borrowed from the archive's file (valid while locked).
+        data: []const u8,
+        /// The archive's date.
+        modified: i64,
+    };
+
+    /// A file inside an archive of the API Managed Area ("file:///filecache/x.aca/name"), or null when `u` is not
+    /// in such an archive. error.NotFound when the archive is there but not that file.
+    fn tempArchived(f: *Files, u: []const u8) Error!?Archived {
+        const m = uri.archiveMember(u) orelse return null;
+        const p = f.tempPath(m.archive) catch return null;
+        defer f.gpa.free(p);
+        const n = f.temp.get(p) orelse return null;
+        if (n.dir) return null;
+        var a = parseArchive(f.gpa, n.data.items) orelse return error.NotFound;
+        defer a.deinit();
+        const name = try uri.percentDecode(f.gpa, m.name);
+        defer f.gpa.free(name);
+        const d = a.get(name) orelse return error.NotFound;
+        return .{ .data = d, .modified = n.modified };
+    }
+
+    fn parseArchive(gpa: std.mem.Allocator, d: []const u8) ?aca.Archive {
+        return aca.parse(gpa, d) catch aca.parse(gpa, aca.unwrap(d)) catch null;
+    }
+
     /// Reads a file where its URI points (no Resource Area).
     fn readAt(f: *Files, gpa: std.mem.Allocator, u: []const u8, w: Where) Error![]u8 {
         switch (w) {
             .temp => {
                 const p = try f.tempPath(u);
                 defer f.gpa.free(p);
+                if (!f.temp.exists(p)) if (try f.tempArchived(u)) |m| return gpa.dupe(u8, m.data);
                 const d = f.temp.read(p) catch |e| return mapFs(e);
                 return gpa.dupe(u8, d);
             },
@@ -138,13 +195,16 @@ pub const Files = struct {
         const w = try where(u);
         f.lock();
         defer f.unlock();
-        if (w != .temp) if (f.backend.resource(f.backend.ctx, u)) |d| return .{ .dir = false, .size = d.len, .modified = 0 };
+        if (w != .temp) if (f.backend.resource(f.backend.ctx, u)) |d| return .{ .dir = false, .size = d.len, .modified = f.resourceModified(u) };
         switch (w) {
             .temp => {
                 const p = try f.tempPath(u);
                 defer f.gpa.free(p);
                 if (p.len == 0) return .{ .dir = true, .size = f.temp.usedBytes(""), .modified = 0 };
-                const n = f.temp.get(p) orelse return error.NotFound;
+                const n = f.temp.get(p) orelse {
+                    const m = try f.tempArchived(u) orelse return error.NotFound;
+                    return .{ .dir = false, .size = m.data.len, .modified = m.modified };
+                };
                 return .{ .dir = n.dir, .size = if (n.dir) f.temp.usedBytes(p) else n.data.items.len, .modified = n.modified };
             },
             .disc => {
@@ -171,9 +231,24 @@ pub const Files = struct {
             .temp => {
                 const p = try f.tempPath(u);
                 defer f.gpa.free(p);
-                if (!f.temp.isDir(p)) return error.NotFound;
+                if (!f.temp.isDir(p)) {
+                    // An archive lists its files (and has no directories).
+                    const n = f.temp.get(p) orelse return error.NotFound;
+                    if (dirs or !std.ascii.endsWithIgnoreCase(p, ".aca")) return error.NotFound;
+                    var a = parseArchive(f.gpa, n.data.items) orelse return error.NotFound;
+                    defer a.deinit();
+                    var out: std.ArrayList([]u8) = .empty;
+                    errdefer freeNames(gpa, &out);
+                    for (a.entries) |e| try appendName(gpa, &out, e.name);
+                    return out.toOwnedSlice(gpa);
+                }
                 const names = f.temp.list(f.gpa, p, dirs) catch |e| return mapFs(e);
-                return dupNames(gpa, f.gpa, names);
+                defer f.gpa.free(names);
+                // The player's own directory is not there for scripts.
+                var out: std.ArrayList([]u8) = .empty;
+                errdefer freeNames(gpa, &out);
+                for (names) |n| if (p.len != 0 or !isPrivate(n)) try appendName(gpa, &out, n);
+                return out.toOwnedSlice(gpa);
             },
             .disc => {
                 const p = try f.discPath(u);
@@ -189,6 +264,19 @@ pub const Files = struct {
             },
             .network, .resource_only => return error.NotPermitted,
         }
+    }
+
+    fn appendName(gpa: std.mem.Allocator, out: *std.ArrayList([]u8), name: []const u8) Error!void {
+        const d = try gpa.dupe(u8, name);
+        out.append(gpa, d) catch |e| {
+            gpa.free(d);
+            return e;
+        };
+    }
+
+    fn freeNames(gpa: std.mem.Allocator, out: *std.ArrayList([]u8)) void {
+        for (out.items) |x| gpa.free(x);
+        out.deinit(gpa);
     }
 
     fn dupNames(gpa: std.mem.Allocator, owner: std.mem.Allocator, names: [][]const u8) Error![][]u8 {
@@ -227,6 +315,26 @@ pub const Files = struct {
             },
             else => return error.NotPermitted,
         }
+    }
+
+    /// Writes one of the player's own files in the API Managed Area (unreachable by URI; `name` is a plain file
+    /// name), with the room checks of `write`.
+    pub fn writePrivate(f: *Files, name: []const u8, data: []const u8) Error!void {
+        var buf: [private_dir.len + 1 + 64]u8 = undefined;
+        const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ private_dir, name }) catch return error.BadPath;
+        f.lock();
+        defer f.unlock();
+        const old: u64 = if (f.temp.get(p)) |n| n.data.items.len else 0;
+        if (f.temp.usedBytes("") - old + data.len > f.temp_capacity) return error.NoSpace;
+        f.temp.write(p, data, f.now(), true) catch |e| return mapFs(e);
+    }
+
+    pub fn removePrivate(f: *Files, name: []const u8) void {
+        var buf: [private_dir.len + 1 + 64]u8 = undefined;
+        const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ private_dir, name }) catch return;
+        f.lock();
+        defer f.unlock();
+        f.temp.remove(p, false) catch {};
     }
 
     pub fn makeDir(f: *Files, u: []const u8) Error!void {
@@ -353,6 +461,10 @@ pub const TestBackend = struct {
     resources: std.StringHashMapUnmanaged([]const u8) = .empty,
     busy: bool = false,
     time: i64 = 1_000_000,
+    /// The date of the files in `resources`.
+    resource_time: i64 = 500_000,
+    /// A File Cache whose Resource Area is looked up after `resources`, and whose room DataCache reports.
+    cache: ?*filecache.FileCache = null,
 
     pub fn init(gpa: std.mem.Allocator) TestBackend {
         return .{ .disc = .init(gpa) };
@@ -364,14 +476,36 @@ pub const TestBackend = struct {
     }
 
     pub fn backend(b: *TestBackend) Backend {
-        return .{ .ctx = b, .resource = resource, .disc_read = discRead, .disc_list = discList, .disc_stat = discStat, .disc_busy = discBusy, .now_ms = nowMs };
+        return .{
+            .ctx = b,
+            .resource = resource,
+            .disc_read = discRead,
+            .disc_list = discList,
+            .disc_stat = discStat,
+            .disc_busy = discBusy,
+            .now_ms = nowMs,
+            .cache_available = cacheAvailable,
+            .resource_modified = resourceModified,
+        };
     }
 
     fn self(ctx: *anyopaque) *TestBackend {
         return @ptrCast(@alignCast(ctx));
     }
     fn resource(ctx: *anyopaque, u: []const u8) ?[]const u8 {
-        return self(ctx).resources.get(u);
+        const b = self(ctx);
+        if (b.resources.get(u)) |d| return d;
+        return if (b.cache) |c| c.lookup(u) else null;
+    }
+    fn resourceModified(ctx: *anyopaque, u: []const u8) ?i64 {
+        const b = self(ctx);
+        if (b.resources.contains(u)) return b.resource_time;
+        return if (b.cache) |c| c.storedAt(u) else null;
+    }
+    fn cacheAvailable(ctx: *anyopaque) u64 {
+        const b = self(ctx);
+        const c = b.cache orelse return default_temp_capacity; // an empty File Cache
+        return c.availableBlocks() * filecache.block_size;
     }
     fn discRead(ctx: *anyopaque, gpa: std.mem.Allocator, p: []const u8) anyerror!?[]u8 {
         const d = self(ctx).disc.read(p) catch return null;

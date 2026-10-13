@@ -36,6 +36,8 @@ pub const Event = union(enum) {
     /// A user input key (Annex V).
     key_down: keys.Key,
     key_up: keys.Key,
+    /// A resource the File Cache could not load (its URI, owned: the engine frees it).
+    resource_not_found: []u8,
 };
 
 /// From the engine to the demux.
@@ -65,7 +67,7 @@ pub const Command = union(enum) {
     /// Audio levels (Table W-4): main volumes, sub and effect mix-downs.
     mixing: struct { main: [8]u8, sub: [2][8]u8, effect: [2][8]u8 },
     /// Plays a WAV file (owned by the command; the demux frees it) `repeat` times.
-    effect_play: struct { data: []u8, repeat: u32 },
+    effect_play: struct { data: []u8, repeat: u32, id: u64 = 0 },
     effect_stop,
     /// Soft reset with another playlist (Playlist.load); the URI is owned.
     load_playlist: []u8,
@@ -150,6 +152,12 @@ pub const Engine = struct {
     /// The current title (null: the First Play title), once one has begun, and how many titles have begun.
     title: ?u16 = null,
     in_title: bool = false,
+    /// Counts the stops of the playback (title_end events from the demux).
+    stop_serial: u32 = 0,
+    /// The id of the last effect sound that finished playing (or could not), set by the host.
+    effect_done: u64 = 0,
+    /// Resources not found since the scene last looked (owned URIs; the applications send resource_not_found).
+    missing: std.ArrayList([]u8) = .empty,
     title_serial: u32 = 0,
     /// How many jumps within the title (the Title Timeline moved).
     jump_serial: u32 = 0,
@@ -177,8 +185,11 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         if (e.scene) |s| s.vtable.deinit(s.ctx, e.gpa);
+        for (e.inbox.items) |ev| if (ev == .resource_not_found) e.gpa.free(ev.resource_not_found);
         e.inbox.deinit(e.gpa);
         e.outbox.deinit(e.gpa);
+        for (e.missing.items) |u| e.gpa.free(u);
+        e.missing.deinit(e.gpa);
     }
 
     /// Replaces the scene (the old one is freed); its page clock starts at `now`.
@@ -271,13 +282,14 @@ pub const Engine = struct {
                 }
                 e.dirty = true;
             },
-            .title_end => {},
+            .title_end => e.stop_serial += 1, // the playback stopped (the playlist ended, or a stop)
             .jump => |t| {
                 e.title_time = t;
                 e.jump_serial += 1;
             },
             .play_state => |p| e.play_state = p,
             .mouse_move, .mouse_down, .mouse_up, .key_down, .key_up => {},
+            .resource_not_found => |u| e.missing.append(e.gpa, u) catch e.gpa.free(u),
         }
     }
 

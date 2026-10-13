@@ -4,6 +4,7 @@
 //! (advpck.zig).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const vlc = @import("vlc");
 const vfs = @import("../vfs.zig");
 const vlcio = @import("../vlcio.zig");
@@ -48,6 +49,8 @@ pub const Access = struct {
     /// Applications of the current title already checked (debug), and the Playlist Application.
     checked: std.DynamicBitSetUnmanaged = .{},
     checked_playlist: bool = false,
+    /// Told of each resource that could not be loaded (the player tells the applications), on the demux thread.
+    on_missing: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, []const u8) void } = null,
     /// The demux thread updates the File Cache while the engine thread reads it.
     lock: vlc.vlc_mutex_t = undefined,
     /// Files as the applications' scripts see them (Annex Z.3), over the File Cache, the store and the disc.
@@ -72,6 +75,7 @@ pub const Access = struct {
             .menu_language = lang,
         };
         a.res.keys = fs.keys;
+        a.res.cache.now_ms = wallMs;
         vlc.vlc_mutex_init(&a.lock);
         a.files = .{
             .gpa = gpa,
@@ -88,6 +92,7 @@ pub const Access = struct {
                 .disc_busy = filesDiscBusy,
                 .now_ms = filesNow,
                 .cache_available = filesCacheAvailable,
+                .resource_modified = filesResourceModified,
             },
         };
         return a;
@@ -160,11 +165,27 @@ pub const Access = struct {
     }
 
     fn filesNow(_: *anyopaque) i64 {
-        return @divTrunc(hddvd_now_us(), 1000);
+        return wallMs();
+    }
+
+    /// File dates are calendar dates (scripts read them as Date objects), not VLC's monotonic clock.
+    fn wallMs() i64 {
+        if (builtin.os.tag == .windows) {
+            // 100 ns units since 1601.
+            const t = std.os.windows.ntdll.RtlGetSystemTimePrecise();
+            return @divTrunc(t, 10_000) - 11_644_473_600_000;
+        }
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+        return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+    }
+
+    fn filesResourceModified(ctx: *anyopaque, u: []const u8) ?i64 {
+        return of(ctx).res.cache.storedAt(u);
     }
 
     fn filesCacheAvailable(ctx: *anyopaque) u64 {
-        return of(ctx).res.cache.freeBlocks() * filecache.block_size;
+        return of(ctx).res.cache.availableBlocks() * filecache.block_size;
     }
 
     pub fn destroy(a: *Access) void {
@@ -220,7 +241,10 @@ pub const Access = struct {
             .loaded => |l| log(a.obj, vlc.VLC_MSG_DBG, @src(), "File Cache: %s loaded (%u bytes%s)", .{
                 z(&b, l.uri), @as(c_uint, @intCast(l.bytes)), if (l.pushed) " from the Advanced stream".ptr else "".ptr,
             }),
-            .failed => |f| log(a.obj, vlc.VLC_MSG_ERR, @src(), "File Cache: cannot load %s (%s)", .{ z(&b, f.uri), @errorName(f.err).ptr }),
+            .failed => |f| {
+                log(a.obj, vlc.VLC_MSG_ERR, @src(), "File Cache: cannot load %s (%s)", .{ z(&b, f.uri), @errorName(f.err).ptr });
+                if (a.on_missing) |m| m.f(m.ctx, f.uri);
+            },
             .unusable => |x| log(a.obj, vlc.VLC_MSG_DBG, @src(), "File Cache: the multiplexed %s is encrypted; reading %s", .{
                 z(b[0..256], x.name), z(b[256..], x.uri),
             }),

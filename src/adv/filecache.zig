@@ -53,6 +53,8 @@ pub const Resource = struct {
     priority: u32,
     /// Insertion order, to discard older resources first among equals.
     stamp: u64 = 0,
+    /// When the data was stored, ms since the epoch (`FileCache.now_ms`): the file's date for scripts.
+    stored: i64 = 0,
 
     pub fn loaded(r: *const Resource) bool {
         return r.data != null;
@@ -66,6 +68,8 @@ pub const FileCache = struct {
     /// The API Managed Area. A file's owner is the application that wrote it.
     temp: memfs.Fs,
     clock: u64 = 0,
+    /// The wall clock, ms since the epoch, for the resources' dates (none: 0).
+    now_ms: ?*const fn () i64 = null,
 
     pub fn init(gpa: std.mem.Allocator, capacity_bytes: u64) FileCache {
         return .{ .gpa = gpa, .capacity_blocks = capacity_bytes / block_size, .temp = memfs.Fs.init(gpa) };
@@ -105,6 +109,16 @@ pub const FileCache = struct {
 
     pub fn freeBlocks(c: *const FileCache) u64 {
         return c.capacity_blocks -| c.usedBlocks();
+    }
+
+    /// The blocks that new data can have (DataCache.availableFileCacheSize, Z.9.1.2): the unused ones and those
+    /// held by resources that `makeRoom` may discard (available or non-exist).
+    pub fn availableBlocks(c: *const FileCache) u64 {
+        var n = c.freeBlocks();
+        for (c.resources.items) |r| if (r.state == .available or r.state == .non_exist) {
+            n += blocks(r.reserved);
+        };
+        return @min(n, c.capacity_blocks);
     }
 
     /// The resource stored under `u`, in any state.
@@ -172,6 +186,7 @@ pub const FileCache = struct {
         if (r.data) |d| c.gpa.free(d);
         r.data = data;
         r.reserved = data.len;
+        r.stored = if (c.now_ms) |now| now() else 0;
         if (std.ascii.endsWithIgnoreCase(r.uri, ".aca")) {
             r.archive = aca.parse(c.gpa, data) catch null;
         }
@@ -192,6 +207,15 @@ pub const FileCache = struct {
         const r = c.find(m.archive) orelse return null;
         const a = &(r.archive orelse return null);
         return a.get(m.name);
+    }
+
+    /// When the file `lookup` finds for `u` was stored (an archived file: its archive), or null.
+    pub fn storedAt(c: *const FileCache, u: []const u8) ?i64 {
+        if (c.find(u)) |r| if (r.data != null) return r.stored;
+        const m = uri.archiveMember(u) orelse return null;
+        const r = c.find(m.archive) orelse return null;
+        const a = &(r.archive orelse return null);
+        return if (a.get(m.name) != null) r.stored else null;
     }
 
     // ---- the API Managed Area -------------------------------------------------------------------------------
@@ -242,6 +266,8 @@ test "block accounting and discard order" {
     _ = try fill(&c, "file:///dvddisc/a9", 2 * block_size, .app, 9, .available);
     _ = try fill(&c, "file:///dvddisc/used", 3 * block_size, .app, 99, .used);
     try testing.expectEqual(@as(u64, 1), c.freeBlocks());
+    // The available resources count as room for new data; the used one does not.
+    try testing.expectEqual(@as(u64, 7), c.availableBlocks());
 
     // 4 blocks: the app-level resource with the lowest priority goes first, then the next app-level one.
     _ = try fill(&c, "file:///dvddisc/new", 4 * block_size, .title, 0, .used);
@@ -271,10 +297,18 @@ test "archive members and the API Managed Area" {
     std.mem.writeInt(u32, d.items[36..40], 4, .big);
     try d.appendSlice(gpa, "<a/>");
     const r = try c.reserve("file:///dvddisc/ADV_OBJ/x.aca", d.items.len, .app, 0);
+    c.now_ms = struct {
+        fn now() i64 {
+            return 42;
+        }
+    }.now;
     try c.store(r, try gpa.dupe(u8, d.items));
     try testing.expectEqualStrings("<a/>", c.lookup("file:///dvddisc/ADV_OBJ/x.aca/a.xmu").?);
     try testing.expectEqual(null, c.lookup("file:///dvddisc/ADV_OBJ/x.aca/b.xmu"));
     try testing.expectEqual(null, c.lookup("file:///dvddisc/ADV_OBJ/y.aca/a.xmu"));
+    // A file's date is its archive's, set when it was stored.
+    try testing.expectEqual(@as(?i64, 42), c.storedAt("file:///dvddisc/ADV_OBJ/x.aca/a.xmu"));
+    try testing.expectEqual(null, c.storedAt("file:///dvddisc/ADV_OBJ/x.aca/b.xmu"));
 
     try c.temp.makeDir("saves", 0);
     try c.tempWrite("saves/s.txt", "data", 7, 0);

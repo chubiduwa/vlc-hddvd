@@ -253,6 +253,10 @@ pub const Apps = struct {
     records: std.ArrayList(*App) = .empty,
     /// The engine's title count when the records were made.
     title_serial: u32 = 0,
+    /// The engine's stop count last handled.
+    stop_serial: u32 = 0,
+    /// The last finished effect sound handled.
+    effect_done: u64 = 0,
     /// The scene is being torn down: deliveries are dropped, not passed on.
     closing: bool = false,
     /// The applications title_begin went to (those running before the title's own started): the title's first
@@ -376,7 +380,7 @@ pub const Apps = struct {
             s.log("application {s} ends", .{a.src});
             s.destroyRecord(a);
         }
-        if (s.title_serial > 0) s.sendSystem(.{ .kind = .title, .type = "title_end", .id = s.titleId() }, null);
+        if (s.title_serial > 0) s.sendSystem(.{ .kind = .title, .type = "title_end", .id = s.titleId(), .at = s.world.model.left_time }, null);
         s.title_serial = e.title_serial;
         s.title = e.title;
         const pl = s.cfg.pl;
@@ -460,10 +464,12 @@ pub const Apps = struct {
 
     /// activate() (Z.1.2.3): only while valid and selected.
     pub fn activate(s: *Apps, a: *App) bool {
+        _ = s;
         if (!a.valid or !a.selected) return false;
+        // It starts at the next tick (lifecycle loads it): activate() does not wait for it (Z.1.2.3), and its
+        // scripts must not run inside the caller's.
         a.ready = true;
         a.terminated = false;
-        if (!a.loaded) s.load(a);
         return true;
     }
 
@@ -736,6 +742,23 @@ pub const Apps = struct {
         w.title_running = e.play_state == .playing;
         w.paused = e.play_state == .paused;
         if (!e.in_title) return false;
+        // Resources the File Cache could not load (Table 8.3.1-1, Z.6.2: Resource Not Found, with the URI).
+        for (e.missing.items) |u| {
+            s.sendSystem(.{ .kind = .resource_not_found, .type = "resource_not_found", .uri = u }, null);
+            e.gpa.free(u);
+        }
+        e.missing.clearRetainingCapacity();
+        if (e.effect_done != s.effect_done) {
+            s.effect_done = e.effect_done;
+            player_api.effectFinished(w, e.effect_done);
+        }
+        // The playback stopped (§8.3.1 Case 2: the last title ends, then Stop Request).
+        if (e.stop_serial != s.stop_serial) {
+            s.stop_serial = e.stop_serial;
+            player_api.titleEnds(w);
+            s.sendSystem(.{ .kind = .title, .type = "title_end", .id = s.titleId(), .at = w.model.left_time }, null);
+            s.sendSystem(.{ .kind = .stop_request, .type = "stop_request" }, null);
+        }
         var changed = false;
         if (e.title_serial != s.title_serial) {
             // The title being left first (§8.3.1 Case 2): its clips end, then its applications.
@@ -744,7 +767,6 @@ pub const Apps = struct {
             player_api.titleBegins(w);
             s.jump_serial = e.jump_serial;
             s.engine_state = e.play_state;
-            s.reported_state = player_api.PlayState.play;
             s.titleChanged(e, c);
             changed = true;
         }
@@ -871,7 +893,7 @@ pub const Apps = struct {
     /// Stamps a system event with the title time.
     fn timeOf(s: *Apps, d: *host.Delivery) void {
         var buf: [16]u8 = undefined;
-        d.spec.time = d.arena.allocator().dupe(u8, events.timecode(&buf, s.world.title_time, s.world.fps)) catch null;
+        d.spec.time = d.arena.allocator().dupe(u8, events.timecode(&buf, d.spec.at orelse s.world.title_time, s.world.fps)) catch null;
     }
 
     /// Sends a system event to the applications (only `recipients` if not null; the list is taken).

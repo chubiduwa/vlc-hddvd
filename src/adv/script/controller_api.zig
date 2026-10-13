@@ -212,7 +212,9 @@ pub const CursorManager = struct {
         changed(s);
     }
 
-    /// moveCursor(x, y): inside the cursor region, else HDDVD_E_ARGUMENT.
+    /// moveCursor(x, y): inside the cursor region, else HDDVD_E_ARGUMENT. The Cursor Manager moves the cursor,
+    /// and a move of an enabled cursor raises cursor_move (Table Z.5.3.4.2-1): it goes through the engine like
+    /// a mouse move (none while the cursor is disabled), and the applications get it at the next tick.
     fn moveCursor(s: *Script, x: u32, y: u32) js.Error!void {
         const c = cursorOf(s);
         if (x > std.math.maxInt(i32) or y > std.math.maxInt(i32)) return error.Argument;
@@ -220,6 +222,7 @@ pub const CursorManager = struct {
         c.x = @intCast(x);
         c.y = @intCast(y);
         changed(s);
+        if (s.world.eng) |e| e.post(.{ .mouse_move = .{ .x = c.x, .y = c.y } }) catch return error.OutOfMemory;
     }
 
     /// setRegion(x, y, width, height): inside the aperture; a cursor outside moves to its origin.
@@ -283,4 +286,19 @@ test "ControllerManager and CursorManager" {
         \\C.setImage(null, 0, 0); assertEq(C.image, undefined); assertEq(C.hotSpotX, 0);
         \\C.visible = false; assertEq(C.visible, false); C.enable = false; assertEq(C.enable, false);
     , "controller.js");
+}
+
+test "moveCursor moves the engine's cursor and raises cursor_move only while enabled" {
+    const e = try testenv.Env.create();
+    defer e.destroy();
+    var eng = engine.Engine.init(std.testing.allocator, 1920, 1080, 60);
+    defer eng.deinit();
+    e.world.eng = &eng;
+    defer e.world.eng = null;
+    try e.run("CursorManager.moveCursor(10, 20);", "move1.js");
+    try std.testing.expectEqual(@as(i32, 20), eng.cursor.y);
+    try std.testing.expectEqual(0, eng.inbox.items.len);
+    try e.run("CursorManager.enable = true; CursorManager.moveCursor(30, 40); assertEq(CursorManager.x, 30);", "move2.js");
+    try std.testing.expectEqual(1, eng.inbox.items.len);
+    try std.testing.expectEqual(engine.Event{ .mouse_move = .{ .x = 30, .y = 40 } }, eng.inbox.items[0]);
 }

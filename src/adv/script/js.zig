@@ -301,7 +301,8 @@ pub const Runtime = struct {
         const name = name_c[0..n];
         const v: Value = blk: {
             if (ex.length) |len| if (indexOf(name)) |i| {
-                if (i >= len(cx, ptr)) return 0;
+                // As item(i): null past the end (the DOM2 ECMAScript binding).
+                if (i >= len(cx, ptr)) break :blk @"null";
                 break :blk ex.item.?(cx, ptr, i) catch |e| {
                     _ = cx.throw(e);
                     return -1;

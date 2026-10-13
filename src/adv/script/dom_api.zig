@@ -280,6 +280,7 @@ fn setPrefix(n: *Node, cx: *js.Context, p: js.NullStr) js.Error!void {
         if (std.mem.eql(u8, prefix, "xml") and !std.mem.eql(u8, n.ns, dom.xml_ns)) return events.throwDom(cx, .namespace);
     }
     n.prefix = try n.doc.intern(prefix);
+    n.doc.version +%= 1; // its qualified name changed (getElementsByTagName lists)
 }
 
 fn getLocalName(n: *Node, cx: *js.Context) js.Error!Value {
@@ -323,9 +324,16 @@ fn checkInsert(cx: *js.Context, parent: *Node, child: *Node) js.Error!void {
     if (!allowedChild(parent, child)) return events.throwDom(cx, .hierarchy_request);
 }
 
+/// The node to insert: an Attr cannot be a child (HIERARCHY_REQUEST_ERR), anything else is a TypeError.
+fn childArg(cx: *js.Context, v: Value) js.Error!*Node {
+    if (nodeOf(cx, v)) |n| return n;
+    if (cx.unwrap(Attr, v) != null) return events.throwDom(cx, .hierarchy_request);
+    return error.TypeError;
+}
+
 fn insertBefore(n: *Node, cx: *js.Context, new_v: Value, ref_v: Value) js.Error!Value {
     const s = scriptOf(cx);
-    const child = nodeOf(cx, new_v) orelse return error.TypeError;
+    const child = try childArg(cx, new_v);
     const ref: ?*Node = if (c.JS_IsNull(ref_v) or c.JS_IsUndefined(ref_v)) null else nodeOf(cx, ref_v) orelse return error.TypeError;
     try checkInsert(cx, n, child);
     if (ref) |r| if (r.parent != n) return events.throwDom(cx, .not_found);
@@ -348,7 +356,7 @@ fn appendChild(n: *Node, cx: *js.Context, new_v: Value) js.Error!Value {
 
 fn replaceChild(n: *Node, cx: *js.Context, new_v: Value, old_v: Value) js.Error!Value {
     const s = scriptOf(cx);
-    const child = nodeOf(cx, new_v) orelse return error.TypeError;
+    const child = try childArg(cx, new_v);
     const old = nodeOf(cx, old_v) orelse return error.TypeError;
     if (old.parent != n) return events.throwDom(cx, .not_found);
     if (child == old) return cx.dup(old_v);
@@ -381,24 +389,33 @@ fn cloneNode(n: *Node, cx: *js.Context, deep_arg: ?bool) js.Error!Value {
     return wrap(scriptOf(cx), try n.clone(deep));
 }
 
+/// Drops empty text nodes and merges adjacent ones, with the mutation events of those changes (DOM2 Events
+/// §1.6.4): DOMNodeRemoved for each node it removes, DOMCharacterDataModified for each node it extends.
 fn normalize(n: *Node, cx: *js.Context) js.Error!void {
+    const s = scriptOf(cx);
     var cur = n.first;
     while (cur) |k| {
-        const next = k.next;
         if (k.type == .text) {
             if (k.data.len == 0) {
+                cur = k.next;
+                try s.beforeRemoval(k);
                 k.detach();
-            } else while (k.next) |m| {
+                continue;
+            }
+            while (k.next) |m| {
                 if (m.type != .text) break;
-                const joined = try std.mem.concat(n.doc.gpa, u8, &.{ k.data, m.data });
-                n.doc.gpa.free(k.data);
-                k.data = joined;
+                if (m.data.len > 0) {
+                    const joined = try std.mem.concat(s.gpa, u8, &.{ k.data, m.data });
+                    defer s.gpa.free(joined);
+                    try setData(cx, k, joined);
+                }
+                try s.beforeRemoval(m);
                 m.detach();
             }
         } else if (k.type == .element) try normalize(k, cx);
-        cur = if (k.parent == n) k.next else next;
+        cur = k.next;
     }
-    scriptOf(cx).treeChanged(n.doc);
+    s.treeChanged(n.doc);
 }
 
 fn isSupported(_: *Node, feature: []const u8, version: js.NullStr) bool {
@@ -580,8 +597,12 @@ fn removeAttributeNS(n: *Node, cx: *js.Context, ns: js.NullStr, local: []const u
     const s = scriptOf(cx);
     const old = try s.gpa.dupe(u8, n.attrs.items[i].value);
     defer s.gpa.free(old);
+    // attrName is the qualified name, as for setAttributeNS.
+    const at = n.attrs.items[i];
+    const qname = if (at.prefix.len == 0) at.local else try std.mem.concat(s.gpa, u8, &.{ at.prefix, ":", at.local });
+    defer if (at.prefix.len > 0) s.gpa.free(qname);
     n.removeAttrAt(i);
-    try s.attrChanged(n, local, old, null);
+    try s.attrChanged(n, qname, old, null);
 }
 
 fn getAttributeNodeNS(n: *Node, cx: *js.Context, ns: js.NullStr, local: []const u8) js.Error!Value {
@@ -826,7 +847,7 @@ fn createEntityReference(_: *Node, cx: *js.Context, _: []const u8) js.Error!Valu
 
 fn importNode(n: *Node, cx: *js.Context, v: Value, deep_arg: ?bool) js.Error!Value {
     const deep = deep_arg orelse false; // DOM2 ECMAScript binding: a missing boolean is false
-    if (cx.unwrap(Attr, v)) |a| return Attr.detached(scriptOf(cx), n.doc, a.ns, a.prefix, a.local) catch |e| e;
+    if (cx.unwrap(Attr, v)) |a| return a.copyInto(scriptOf(cx), n.doc);
     const src = nodeOf(cx, v) orelse return error.TypeError;
     if (src.type == .document) return events.throwDom(cx, .not_supported);
     return wrap(scriptOf(cx), try n.doc.importNode(src, deep));
@@ -868,10 +889,13 @@ fn evaluateXPath(n: *Node, cx: *js.Context, expr: []const u8, ctx_v: Value) js.E
     const scope: *const Node = if (ctx_node.type == .element) ctx_node else n.firstElement() orelse ctx_node;
     const r = x.eval(arena.allocator(), .{ .node = ctx_node, .scope = scope, .host = &h }) catch return error.EvalError;
     if (r != .nodes) return js.null;
-    var list: std.ArrayList(*Node) = .empty;
-    defer list.deinit(s.gpa);
-    for (r.nodes) |it| if (it.attr == null) try list.append(s.gpa, it.node);
-    return NodeList.make(s, n.doc, .{ .fixed = try s.gpa.dupe(*Node, list.items) });
+    // Attributes are in the result as Attr nodes (Z.12.7.2 step 6).
+    const f = try s.gpa.alloc(NodeList.Entry, r.nodes.len);
+    for (f, r.nodes) |*e, it| e.* = .{ .node = it.node, .attr = if (it.attr) |i| blk: {
+        const a = it.node.attrs.items[i];
+        break :blk .{ .ns = a.ns, .prefix = a.prefix, .local = a.local };
+    } else null };
+    return NodeList.make(s, n.doc, .{ .fixed = f });
 }
 
 /// Script variables first, then the presentation engine's (the page's host).
@@ -914,12 +938,12 @@ fn setXPathVariable(n: *Node, cx: *js.Context, name: []const u8, value: js.NullS
 fn getXPathVariable(n: *Node, cx: *js.Context, name: []const u8) js.Error!Value {
     const s = scriptOf(cx);
     if (!isVarName(name)) return error.TypeError;
-    if (s.systemVariable(name)) |v| return switch (v) {
-        .string => |x| cx.string(x),
-        .number => |x| cx.number(x),
-        .boolean => |x| cx.boolean(x),
-        .nodes => js.null,
-    };
+    // The value as a String (Z.12.7.2), as XPath's string() makes it.
+    if (s.systemVariable(name)) |v| {
+        var arena: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena.deinit();
+        return cx.string(xpath.toStr(arena.allocator(), v) catch return error.OutOfMemory);
+    }
     const st = try stateOf(s, n.doc);
     return if (st.vars.get(name)) |v| cx.string(v) else js.null;
 }
@@ -950,10 +974,12 @@ const document_members = [_]js.Member{
 
 const document_class: js.Class = .{ .name = "Document", .parent = &node_class, .finalize = finalizeNode, .members = &document_members };
 
-/// `document.foo` is the element with id "foo" (Z.13.1.1), unless Document has a property of that name.
+/// `document.foo` is the element with id "foo" (Z.13.1.1), unless Document has a property of that name; null
+/// when no element has that id (Z.13.1.1.2's [[Get]]). Only names that can be ids (XML Names) are looked up.
 fn namedElement(cx: *js.Context, ptr: *anyopaque, name: []const u8) js.Error!?Value {
     const n: *Node = @ptrCast(@alignCast(ptr));
-    const el = n.doc.getElementById(name) orelse return null;
+    if (!isXmlName(name)) return null;
+    const el = n.doc.getElementById(name) orelse return js.null;
     return try wrap(scriptOf(cx), el);
 }
 
@@ -990,6 +1016,22 @@ pub const Attr = struct {
             s.gpa.destroy(a);
             return e;
         };
+    }
+
+    /// DOMAttrModified's relatedNode: the element's attribute `qname`, or for one just removed, a detached Attr
+    /// holding `removed` (its old value).
+    pub fn forEvent(s: *Script, el: *Node, qname: []const u8, removed: ?[]const u8) js.Error!Value {
+        if (removed) |old| {
+            const colon = std.mem.indexOfScalar(u8, qname, ':');
+            const prefix = if (colon) |i| qname[0..i] else "";
+            const local = if (colon) |i| qname[i + 1 ..] else qname;
+            const v = try detached(s, el.doc, "", prefix, local);
+            const a = s.cx.unwrap(Attr, v).?;
+            a.value = el.doc.gpa.dupe(u8, old) catch return v;
+            return v;
+        }
+        const i = el.attrIndexQ(qname) orelse return js.null;
+        return ofElement(s, el, i);
     }
 
     fn detached(s: *Script, doc: *dom.Document, ns: []const u8, prefix: []const u8, local: []const u8) js.Error!Value {
@@ -1085,17 +1127,70 @@ pub const Attr = struct {
     fn childNodes(a: *Attr, cx: *js.Context) js.Error!Value {
         return NodeList.make(scriptOf(cx), a.doc, .{ .fixed = &.{} });
     }
-    fn cloneAttr(a: *Attr, cx: *js.Context, _: bool) js.Error!Value {
-        const v = try detached(scriptOf(cx), a.doc, a.ns, a.prefix, a.local);
-        if (cx.unwrap(Attr, v)) |b| b.value = try a.doc.gpa.dupe(u8, a.current());
+    /// A detached copy, with its value, owned by `doc` (cloneNode, importNode).
+    fn copyInto(a: *const Attr, s: *Script, doc: *dom.Document) js.Error!Value {
+        const v = try detached(s, doc, a.ns, a.prefix, a.local);
+        if (s.cx.unwrap(Attr, v)) |b| b.value = doc.gpa.dupe(u8, a.current()) catch |e| {
+            s.cx.free(v);
+            return e;
+        };
         return v;
+    }
+    fn cloneAttr(a: *Attr, cx: *js.Context, _: ?bool) js.Error!Value {
+        return a.copyInto(scriptOf(cx), a.doc);
+    }
+
+    /// DOM2 lets an attribute's prefix be set, with the checks of Node.prefix and those of attributes.
+    fn setPrefixA(a: *Attr, cx: *js.Context, p: js.NullStr) js.Error!void {
+        const prefix = p.s orelse "";
+        if (prefix.len > 0) {
+            if (!isNcName(prefix)) return events.throwDom(cx, .invalid_character);
+            if (a.ns.len == 0) return events.throwDom(cx, .namespace);
+            if (std.mem.eql(u8, prefix, "xml") and !std.mem.eql(u8, a.ns, dom.xml_ns)) return events.throwDom(cx, .namespace);
+            if (std.mem.eql(u8, prefix, "xmlns") and !std.mem.eql(u8, a.ns, dom.xmlns_ns)) return events.throwDom(cx, .namespace);
+            if (a.prefix.len == 0 and std.mem.eql(u8, a.local, "xmlns")) return events.throwDom(cx, .namespace);
+        }
+        a.prefix = try a.doc.intern(prefix);
+        if (a.owner) |o| if (o.attrIndex(a.ns, a.local)) |i| {
+            o.attrs.items[i].prefix = a.prefix;
+        };
+    }
+
+    // The children of an attribute (its value as Text nodes) are not modelled: it has none, and takes none.
+    fn insertChild(_: *Attr, cx: *js.Context, _: Value, _: Value) js.Error!Value {
+        return events.throwDom(cx, .hierarchy_request);
+    }
+    fn appendChildA(_: *Attr, cx: *js.Context, _: Value) js.Error!Value {
+        return events.throwDom(cx, .hierarchy_request);
+    }
+    fn replaceChildA(_: *Attr, cx: *js.Context, _: Value, _: Value) js.Error!Value {
+        return events.throwDom(cx, .not_found);
+    }
+    fn removeChildA(_: *Attr, cx: *js.Context, _: Value) js.Error!Value {
+        return events.throwDom(cx, .not_found);
+    }
+    fn normalizeA(_: *Attr) void {}
+    fn isSupportedA(_: *Attr, feature: []const u8, version: js.NullStr) bool {
+        return hasFeatureImpl(feature, version.s);
+    }
+
+    // EventTarget: no event is ever dispatched to an attribute (mutation events target its element), so its
+    // listeners are never called and are not kept.
+    fn addListenerA(_: *Attr, _: []const u8, _: Value, _: ?bool) void {}
+    fn removeListenerA(_: *Attr, _: []const u8, _: Value, _: ?bool) void {}
+    fn dispatchA(_: *Attr, cx: *js.Context, ev_v: Value) js.Error!bool {
+        const e = cx.unwrap(events.Event, ev_v) orelse return error.TypeError;
+        if (!e.initialized or e.type.len == 0) return events.throwUnspecifiedEventType(cx);
+        return true;
     }
 
     pub const js_class = attr_class;
 };
 
+/// An Attr is a Node (DOM2 Core §1.2): it overrides every Node member, since its native value is not a dom.Node.
 const attr_class: js.Class = .{
     .name = "Attr",
+    .parent = &node_class,
     .finalize = Attr.finalize,
     .members = &([_]js.Member{
         js.prop("name", Attr.getName, null),
@@ -1106,7 +1201,7 @@ const attr_class: js.Class = .{
         js.prop("nodeValue", Attr.getValue, Attr.setValue),
         js.prop("nodeType", Attr.nodeType, null),
         js.prop("namespaceURI", Attr.getNs, null),
-        js.prop("prefix", Attr.getPrefixA, null),
+        js.prop("prefix", Attr.getPrefixA, Attr.setPrefixA),
         js.prop("localName", Attr.getLocal, null),
         js.prop("ownerDocument", Attr.getOwnerDoc, null),
         js.prop("parentNode", Attr.nullValue, null),
@@ -1119,7 +1214,16 @@ const attr_class: js.Class = .{
         js.method("hasChildNodes", Attr.falseValue),
         js.method("hasAttributes", Attr.falseValue),
         js.method("cloneNode", Attr.cloneAttr),
-    } ++ node_constants),
+        js.method("insertBefore", Attr.insertChild),
+        js.method("replaceChild", Attr.replaceChildA),
+        js.method("removeChild", Attr.removeChildA),
+        js.method("appendChild", Attr.appendChildA),
+        js.method("normalize", Attr.normalizeA),
+        js.method("isSupported", Attr.isSupportedA),
+        js.method("addEventListener", Attr.addListenerA),
+        js.method("removeEventListener", Attr.removeListenerA),
+        js.method("dispatchEvent", Attr.dispatchA),
+    }),
 };
 
 // ---- NodeList, NamedNodeMap ---------------------------------------------------------------------------------------
@@ -1127,6 +1231,10 @@ const attr_class: js.Class = .{
 pub const NodeList = struct {
     doc: *dom.Document,
     src: Source,
+    /// A live list's nodes as they were at `version` of the document (null: not known). The tree is walked once
+    /// after each change, not at every `length` or `item`, so a loop over the list is linear.
+    cache: std.ArrayList(*Node) = .empty,
+    version: ?u64 = null,
     obj: *anyopaque = undefined,
 
     const Source = union(enum) {
@@ -1135,7 +1243,13 @@ pub const NodeList = struct {
         /// Live: elements by name under a node, in document order.
         tag: struct { root: *Node, ns: ?[]const u8, name: []const u8, by_ns: bool = false },
         /// A snapshot (owned).
-        fixed: []*Node,
+        fixed: []Entry,
+    };
+
+    /// A snapshot's item: a node, or an attribute of element `node` (by name, as its index may change).
+    pub const Entry = struct {
+        node: *Node,
+        attr: ?struct { ns: []const u8, prefix: []const u8, local: []const u8 } = null,
     };
 
     fn make(s: *Script, doc: *dom.Document, src: Source) js.Error!Value {
@@ -1152,6 +1266,7 @@ pub const NodeList = struct {
         const l: *NodeList = @ptrCast(@alignCast(ptr));
         const doc = l.doc;
         if (l.src == .fixed) doc.gpa.free(l.src.fixed);
+        l.cache.deinit(doc.gpa);
         const obj = l.obj;
         doc.gpa.destroy(l);
         dropDependent(doc, obj);
@@ -1168,7 +1283,32 @@ pub const NodeList = struct {
         return std.mem.eql(u8, t.name, "*") or std.mem.eql(u8, n.qname(), t.name);
     }
 
-    fn at(l: *const NodeList, index: u32) ?*Node {
+    /// A live list's nodes now: the cache, rebuilt if the document changed since. Null if it cannot be
+    /// rebuilt (out of memory).
+    fn live(l: *NodeList) ?[]const *Node {
+        if (l.version == l.doc.version) return l.cache.items;
+        l.version = null;
+        l.cache.clearRetainingCapacity();
+        const gpa = l.doc.gpa;
+        switch (l.src) {
+            .children => |p| {
+                var x = p.first;
+                while (x) |k| : (x = k.next) l.cache.append(gpa, k) catch return null;
+            },
+            .tag => |t| {
+                var x = t.root.first;
+                while (x) |k| : (x = k.following(t.root)) if (l.matches(k)) {
+                    l.cache.append(gpa, k) catch return null;
+                };
+            },
+            .fixed => unreachable,
+        }
+        l.version = l.doc.version;
+        return l.cache.items;
+    }
+
+    /// Without the cache: a walk of the tree.
+    fn walkAt(l: *const NodeList, index: u32) ?*Node {
         var i: u32 = 0;
         switch (l.src) {
             .children => |p| {
@@ -1185,31 +1325,34 @@ pub const NodeList = struct {
                     i += 1;
                 };
             },
-            .fixed => |f| return if (index < f.len) f[index] else null,
+            .fixed => unreachable,
         }
         return null;
     }
 
-    fn count(l: *const NodeList) u32 {
+    fn count(l: *NodeList) u32 {
+        if (l.src == .fixed) return @intCast(l.src.fixed.len);
+        if (l.live()) |ns| return @intCast(ns.len);
         var i: u32 = 0;
-        switch (l.src) {
-            .children => |p| {
-                var x = p.first;
-                while (x) |k| : (x = k.next) i += 1;
-            },
-            .tag => |t| {
-                var x = t.root.first;
-                while (x) |k| : (x = k.following(t.root)) if (l.matches(k)) {
-                    i += 1;
-                };
-            },
-            .fixed => |f| i = @intCast(f.len),
-        }
+        while (l.walkAt(i) != null) i += 1;
         return i;
     }
 
     fn item(l: *NodeList, cx: *js.Context, index: u32) js.Error!Value {
-        return wrapOrNull(scriptOf(cx), l.at(index));
+        const s = scriptOf(cx);
+        switch (l.src) {
+            .fixed => |f| {
+                if (index >= f.len) return js.null;
+                const e = f[index];
+                const a = e.attr orelse return wrap(s, e.node);
+                if (e.node.attrIndex(a.ns, a.local)) |i| return Attr.ofElement(s, e.node, i);
+                return Attr.detached(s, l.doc, a.ns, a.prefix, a.local); // removed since
+            },
+            else => {
+                const n = if (l.live()) |ns| (if (index < ns.len) ns[index] else null) else l.walkAt(index);
+                return wrapOrNull(s, n);
+            },
+        }
     }
 
     fn getLength(l: *NodeList) u32 {
@@ -1402,7 +1545,7 @@ test "DOM Level 2 Core" {
         \\assertEq(doc.doctype, null); assertEq(doc.implementation, XMLParser);
         \\var r = doc.documentElement; assertEq(r.tagName, "r"); assertEq(r.parentNode, doc); assertEq(r.ownerDocument, doc);
         \\var x = r.firstChild; assertEq(x, r.childNodes.item(0), "identity"); assertEq(x, r.childNodes[0], "index");
-        \\assertEq(r.childNodes.length, 2); assertEq(r.childNodes[2], undefined);
+        \\assertEq(r.childNodes.length, 2); assertEq(r.childNodes[2], null);
         \\assertEq(x.getAttribute("id"), "1"); assertEq(x.getAttribute("none"), "");
         \\assertEq(x.getAttributeNS("urn:a", "k"), "v"); assert(x.hasAttributeNS("urn:a", "k"));
         \\assertEq(x.attributes.length, 2); assertEq(x.attributes.getNamedItem("id").value, "1");
@@ -1486,4 +1629,102 @@ test "documents live as long as their wrappers" {
         \\assertEq(el.ownerDocument.documentElement.tagName, "r"); assertEq(el.firstChild.data, "x");
         \\var list = XMLParser.parseString("<r><a/><a/></r>").getElementsByTagName("a"); assertEq(list.length, 2);
     , "life.js");
+}
+
+test "attributes are nodes, also in XPath results" {
+    const e = try testenv.Env.create();
+    defer e.destroy();
+    try e.run(
+        \\var doc = XMLParser.parseString('<r xmlns:a="urn:a"><x id="1" a:k="v"/><x id="2"/></r>'); var x = doc.documentElement.firstChild;
+        \\var ids = doc.evaluateXPath("//x/@id", doc); assertEq(ids.length, 2);
+        \\var id = ids[0]; assert(id instanceof Node, "an Attr is a Node"); assertEq(id.nodeType, Node.ATTRIBUTE_NODE); assertEq(id.ATTRIBUTE_NODE, 2);
+        \\assertEq(id.nodeName, "id"); assertEq(id.value, "1"); assertEq(id.nodeValue, "1"); assertEq(id.ownerElement, x); assertEq(id.parentNode, null);
+        \\assertEq(ids.item(1).value, "2");
+        \\var mixed = doc.evaluateXPath("//x[1] | //x[1]/@*", doc); assertEq(mixed.length, 3); assertEq(mixed[0], x); assertEq(mixed[2].namespaceURI, "urn:a");
+        \\// The Node interface.
+        \\assert(id.isSupported("Core", "2.0")); assertEq(id.hasChildNodes(), false); assertEq(id.childNodes.length, 0); id.normalize();
+        \\id.addEventListener("x", function () {}); id.removeEventListener("x", function () {});
+        \\try { id.appendChild(doc.createTextNode("t")); assert(false); } catch (ex) { assertEq(ex.code, DOMException.HIERARCHY_REQUEST_ERR); }
+        \\try { x.appendChild(id); assert(false); } catch (ex) { assertEq(ex.code, DOMException.HIERARCHY_REQUEST_ERR); }
+        \\try { id.prefix = "p"; assert(false); } catch (ex) { assertEq(ex.code, DOMException.NAMESPACE_ERR); }
+        \\var k = x.getAttributeNodeNS("urn:a", "k"); k.prefix = "b"; assertEq(k.name, "b:k"); assertEq(x.getAttributeNS("urn:a", "k"), "v");
+        \\assert(x.hasAttribute("b:k"));
+        \\// importNode keeps the value.
+        \\var other = XMLParser.parseString("<o/>"); var imp = other.importNode(id, false);
+        \\assertEq(imp.value, "1"); assertEq(imp.ownerDocument, other); assertEq(imp.ownerElement, null);
+        \\assertEq(id.cloneNode().value, "1");
+        \\// A removed attribute stays in the snapshot, detached.
+        \\x.removeAttribute("id"); assertEq(ids[0].ownerElement, null); assertEq(ids[0].name, "id");
+    , "attr.js");
+}
+
+test "normalize and attribute changes send mutation events" {
+    const e = try testenv.Env.create();
+    defer e.destroy();
+    try e.run(
+        \\var doc = XMLParser.parseString('<r xmlns:a="urn:a"><p>a</p></r>'); var r = doc.documentElement; var p = r.firstChild; var log = [];
+        \\p.appendChild(doc.createTextNode("")); p.appendChild(doc.createTextNode("b")); p.appendChild(doc.createTextNode("c"));
+        \\r.addEventListener("DOMCharacterDataModified", cb(function (ev) { log.push("data:" + ev.prevValue + ">" + ev.newValue); }), true);
+        \\r.addEventListener("DOMNodeRemoved", cb(function (ev) { log.push("rem:" + ev.relatedNode.tagName); }), true);
+        \\r.addEventListener("DOMAttrModified", cb(function (ev) { log.push("attr:" + ev.attrName + ":" + ev.attrChange); }), true);
+        \\r.normalize(); assertEq(p.childNodes.length, 1); assertEq(p.firstChild.data, "abc");
+        \\p.setAttributeNS("urn:a", "a:k", "1"); p.removeAttributeNS("urn:a", "k");
+    , "norm.js");
+    try e.run(
+        \\assertEq(log.join(","), "rem:p,data:a>ab,rem:p,data:ab>abc,rem:p,attr:a:k:2,attr:a:k:3");
+    , "norm2.js");
+}
+
+test "live lists follow the tree" {
+    const e = try testenv.Env.create();
+    defer e.destroy();
+    try e.run(
+        \\var doc = XMLParser.parseString("<r><a/><b><a/></b></r>"); var r = doc.documentElement;
+        \\var as = doc.getElementsByTagName("a"); var kids = r.childNodes;
+        \\var n = 0; for (var i = 0; i < as.length; i++) { if (as.item(i).tagName == "a") n++; } assertEq(n, 2);
+        \\assertEq(as.item(2), null); assertEq(kids.length, 2);
+        \\r.appendChild(doc.createElement("a")); assertEq(as.length, 3); assertEq(kids.length, 3); assertEq(as[2], r.lastChild);
+        \\r.removeChild(r.firstChild); assertEq(as.length, 2); assertEq(kids[0].tagName, "b");
+        \\var pa = doc.getElementsByTagName("p:a"); assertEq(pa.length, 0);
+        \\var ns = doc.createElementNS("urn:p", "a"); r.appendChild(ns); assertEq(pa.length, 0); assertEq(as.length, 3);
+        \\ns.prefix = "p"; assertEq(pa.length, 1); assertEq(as.length, 2);
+        \\for (var j = 0; j < 500; j++) r.appendChild(doc.createElement("a"));
+        \\var m = 0; for (var k = 0; k < as.length; k++) { if (as.item(k)) m++; } assertEq(m, 502);
+    , "lists.js");
+}
+
+test "XPath variables are strings, document.<id> is null when absent" {
+    const e = try testenv.Env.create();
+    defer e.destroy();
+    const d = try dom.parse(std.testing.allocator, "<root xmlns='http://www.dvdforum.org/2005/ihd'><div id='menu'/></root>", null);
+    defer d.destroy();
+    e.script.page_doc = d;
+    defer e.script.pageGone();
+    try e.run(
+        \\assertEq(document.getXPathVariable("dataCacheSize"), "65536"); assertEq(typeof document.getXPathVariable("closedCaption"), "string");
+        \\assertEq(document.menu.getAttribute("id"), "menu"); assertEq(document.none, null);
+        \\assertEq(typeof document.createElement, "function");
+    , "page.js");
+}
+
+test "a document built by script is written with its namespaces and parses back the same" {
+    const e = try testenv.Env.create();
+    defer e.destroy();
+    try e.run(
+        \\var doc = XMLParser.createDocument("urn:a", "p:marks", null); var root = doc.documentElement;
+        \\root.setAttributeNS("urn:b", "q:k", "a\tb\nc");
+        \\var item = doc.createElementNS("urn:c", "item"); root.appendChild(item); item.setAttributeNS("urn:d", "z", "w");
+        \\item.appendChild(doc.createTextNode("x\r\ny"));
+        \\var st; XMLParser.write(doc, "file:///required/marks.xml", XMLParser.UTF8, cb(function (s) { st = s; }));
+    , "write1.js");
+    try e.run(
+        \\assertEq(st, XMLParser.OK);
+        \\var back; XMLParser.parse("file:///required/marks.xml", cb(function (s, d) { back = d; }));
+    , "write2.js");
+    try e.run(
+        \\var r = back.documentElement; assertEq(r.namespaceURI, "urn:a"); assertEq(r.prefix, "p"); assertEq(r.localName, "marks");
+        \\assertEq(r.getAttributeNS("urn:b", "k"), "a\tb\nc");
+        \\var it = r.firstChild; assertEq(it.namespaceURI, "urn:c"); assertEq(it.prefix, null); assertEq(it.getAttributeNS("urn:d", "z"), "w");
+        \\assertEq(it.firstChild.data, "x\r\ny");
+    , "write3.js");
 }

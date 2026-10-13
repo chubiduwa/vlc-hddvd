@@ -162,7 +162,15 @@ pub const Scheduled = struct {
     time: u64,
 };
 
-pub const Chapter = struct { begin: u64, name: []const u8 = "" };
+/// An element's attribute as written (`Title.attributes`, `Chapter.attributes`, Z.10.13.2, Z.10.14.2).
+pub const RawAttr = struct { name: [:0]const u8, value: []const u8 };
+
+pub const Chapter = struct {
+    begin: u64,
+    name: []const u8 = "",
+    /// Its attributes as written (empty for the implicit chapter of a title without a ChapterList).
+    attrs: []const RawAttr = &.{},
+};
 
 pub const NavTrack = struct {
     track: u8,
@@ -186,6 +194,8 @@ pub const Title = struct {
     on_end: []const u8 = "",
     display_name: []const u8 = "",
     description: []const u8 = "",
+    /// Its attributes as written.
+    attrs: []const RawAttr = &.{},
     clips: []Clip = &.{},
     apps: []AppSegment = &.{},
     resources: []Resource = &.{},
@@ -380,6 +390,16 @@ const Builder = struct {
         return b.a.dupe(u8, s orelse return "");
     }
 
+    /// The element's attributes as written ("xml:base" with its prefix).
+    fn rawAttrs(b: *Builder, e: *const dom.Node) Error![]const RawAttr {
+        const out = try b.a.alloc(RawAttr, e.attrs.items.len);
+        for (e.attrs.items, out) |at, *o| o.* = .{
+            .name = if (at.prefix.len > 0) try std.fmt.allocPrintSentinel(b.a, "{s}:{s}", .{ at.prefix, at.local }, 0) else try b.a.dupeSentinel(u8, at.local, 0),
+            .value = try b.a.dupe(u8, at.value),
+        };
+        return out;
+    }
+
     fn time(b: *Builder, s: ?[]const u8) ?u64 {
         return parseTime(s orelse return null, b.tb);
     }
@@ -396,6 +416,7 @@ const Builder = struct {
             .on_end = try b.str(e.attr("onEnd")),
             .display_name = try b.str(e.attr("displayName")),
             .description = try b.str(e.attr("description")),
+            .attrs = try b.rawAttrs(e),
         };
         if (e.attr("type")) |ty| {
             if (std.mem.eql(u8, ty, "Original")) t.type = .original;
@@ -449,7 +470,7 @@ const Builder = struct {
                 var s = x.firstElement();
                 while (s) |y| : (s = y.nextElement()) {
                     if (!y.is(ns, "Chapter")) continue;
-                    try list.append(a, .{ .begin = b.time(y.attr("titleTimeBegin")) orelse continue, .name = try b.str(y.attr("displayName")) });
+                    try list.append(a, .{ .begin = b.time(y.attr("titleTimeBegin")) orelse continue, .name = try b.str(y.attr("displayName")), .attrs = try b.rawAttrs(y) });
                 }
                 std.mem.sort(Chapter, list.items, {}, struct {
                     fn lt(_: void, l: Chapter, r: Chapter) bool {

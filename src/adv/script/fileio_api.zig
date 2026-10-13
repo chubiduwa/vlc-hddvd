@@ -3,8 +3,8 @@
 //! The operations are asynchronous for script: their result comes in a callback, a work item after the call
 //! (§8.5). The file operation itself is done at the call (files.zig), which nothing can observe differently.
 //! Text files are UTF-16BE with a BOM; a TextStream works on a copy in the API Managed Area (opened files of
-//! other areas are copied there under a name of the player's, deleted when the stream goes), and LF alone ends
-//! a line (Z.3). Positions count UTF-16 units, as script strings do. No VLC dependency.
+//! other areas are copied there under a name of the player's that no URI reaches, deleted when the stream goes),
+//! and LF alone ends a line (Z.3). Positions count UTF-16 units, as script strings do. No VLC dependency.
 
 const std = @import("std");
 const js = @import("js.zig");
@@ -60,6 +60,13 @@ fn isDisc(u: []const u8) bool {
     return (Files.where(u) catch return false) == .disc;
 }
 
+/// A read of a disc file while video plays from the disc (HDDVD_E_INVALIDCALL, Z.3): not when the file is in
+/// the Resource Area, which is read instead of the disc (Z.3: "Player firstly checks whether a file originally
+/// located in the uri exists in Resource Area").
+fn discBlocked(f: *Files, u: []const u8) bool {
+    return isDisc(u) and f.discBusy() and !f.inResourceArea(u);
+}
+
 fn callback(s: *Script, f: Value, args: []const Value) void {
     if (!s.cx.isFunction(f)) {
         for (args) |a| s.cx.free(a);
@@ -107,15 +114,14 @@ pub const FileIO = struct {
         const p = try checkUri(u);
         const f = try filesOf(s);
         if (mode < 1 or mode > 3) return error.Argument;
-        if (isDisc(p)) {
-            if (mode != Mode.read) return error.InvalidCall;
-            if (f.discBusy()) return error.InvalidCall;
-        }
+        if (isDisc(p) and mode != Mode.read) return error.InvalidCall;
+        if (discBlocked(f, p)) return error.InvalidCall;
         if (TextStream.isOpen(s, p)) return error.Io;
+        // "This function shall not operate on files contained within an .aca file", in any mode.
+        if (uri_mod.archiveMember(p) != null) return callback(s, cb, &.{ js.null, num(s.cx, Info.not_permitted) });
         const in_cache = (Files.where(p) catch .temp) == .temp;
         const st = f.stat(p) catch null;
         const exists = st != null and !st.?.dir;
-        if (uri_mod.archiveMember(p) != null and mode != Mode.read) return callback(s, cb, &.{ js.null, num(s.cx, Info.not_permitted) });
         // A: the file; B: a copy of it; C: failure; D: emptied; E: a new empty file.
         const Behavior = enum { a, b, c, d, e };
         const b: Behavior = if (mode == Mode.read)
@@ -158,11 +164,12 @@ pub const FileIO = struct {
         callback(s, cb, &.{num(s.cx, r)});
     }
 
+    /// copy's asynchronous steps: the source exists, neither file is in an .aca archive, then the destination.
     fn copyFile(s: *Script, from: []const u8, to: []const u8, overwrite: bool) u32 {
         const f = s.world.files orelse return Info.failed;
-        if (uri_mod.archiveMember(to) != null) return Info.not_permitted;
         const st = f.stat(from) catch return Info.file_not_found;
         if (st.dir) return Info.file_not_found;
+        if (uri_mod.archiveMember(from) != null or uri_mod.archiveMember(to) != null) return Info.not_permitted;
         if (f.exists(to) and !overwrite) return Info.io;
         const data = f.read(s.gpa, from) catch |e| return infoOf(e);
         defer s.gpa.free(data);
@@ -178,7 +185,7 @@ pub const FileIO = struct {
         const d = try checkUri(dest);
         const f = try filesOf(s);
         if (isDisc(d)) return error.InvalidCall;
-        if (isDisc(p) and f.discBusy()) return error.InvalidCall;
+        if (discBlocked(f, p)) return error.InvalidCall;
         callback(s, cb, &.{num(s.cx, copyFile(s, p, d, overwrite))});
     }
 
@@ -188,11 +195,20 @@ pub const FileIO = struct {
         const d = try checkUri(dest);
         const f = try filesOf(s);
         if (isDisc(p) or isDisc(d)) return error.InvalidCall;
-        if (uri_mod.archiveMember(p) != null) return callback(s, cb, &.{num(s.cx, Info.not_permitted)});
-        var r = copyFile(s, p, d, false);
-        if (r == Info.succeeded) f.remove(p, false) catch {
-            f.remove(d, false) catch {};
-            r = Info.failed;
+        const r: u32 = blk: {
+            const st = f.stat(p) catch break :blk Info.file_not_found;
+            if (st.dir) break :blk Info.file_not_found;
+            // Only files of the API Managed Area and the persistent storage move: a file found in the Resource
+            // Area ("a file in filecache") or in an archive is NOT_PERMITTED.
+            const w = Files.where(p) catch break :blk Info.not_permitted;
+            if ((w != .temp and w != .store) or f.inResourceArea(p) or uri_mod.archiveMember(p) != null) break :blk Info.not_permitted;
+            const r = copyFile(s, p, d, false);
+            if (r != Info.succeeded) break :blk r;
+            f.remove(p, false) catch {
+                f.remove(d, false) catch {};
+                break :blk Info.failed;
+            };
+            break :blk Info.succeeded;
         };
         callback(s, cb, &.{num(s.cx, r)});
     }
@@ -219,7 +235,7 @@ pub const FileIO = struct {
     fn list(s: *Script, u: js.NullStr, cb: Value, dirs: bool) js.Error!void {
         const p = try checkUri(u);
         const f = try filesOf(s);
-        if (isDisc(p) and f.discBusy()) return error.InvalidCall;
+        if (discBlocked(f, p)) return error.InvalidCall;
         const names = f.list(s.gpa, p, dirs) catch return callback(s, cb, &.{ js.null, num(s.cx, Info.directory_not_found) });
         defer {
             for (names) |n| s.gpa.free(n);
@@ -247,7 +263,7 @@ pub const FileIO = struct {
     fn getFileInfo(s: *Script, u: js.NullStr, cb: Value) js.Error!void {
         const p = try checkUri(u);
         const f = try filesOf(s);
-        if (isDisc(p) and f.discBusy()) return error.InvalidCall;
+        if (discBlocked(f, p)) return error.InvalidCall;
         const st = f.stat(p) catch return callback(s, cb, &.{ js.null, num(s.cx, Info.file_not_found) });
         if (st.dir) return callback(s, cb, &.{ js.null, num(s.cx, Info.file_not_found) });
         const obj = try Entry.make(s, &Entry.file_class, p, st);
@@ -257,7 +273,7 @@ pub const FileIO = struct {
     fn getDirectoryInfo(s: *Script, u: js.NullStr, cb: Value) js.Error!void {
         const p = try checkUri(u);
         const f = try filesOf(s);
-        if (isDisc(p) and f.discBusy()) return error.InvalidCall;
+        if (discBlocked(f, p)) return error.InvalidCall;
         const st = f.stat(p) catch return callback(s, cb, &.{ js.null, num(s.cx, Info.directory_not_found) });
         if (!st.dir) return callback(s, cb, &.{ js.null, num(s.cx, Info.directory_not_found) });
         const obj = try Entry.make(s, &Entry.directory_class, p, st);
@@ -271,7 +287,8 @@ pub const FileIO = struct {
         const f = try filesOf(s);
         var ms: f64 = 0;
         if (c.JS_ToFloat64(s.cx.ctx, &ms, date) < 0) return error.Thrown;
-        if (std.math.isNan(ms)) return error.Argument;
+        // A time an ECMAScript Date can hold (±8.64e15 ms, ECMA-262 15.9.1.1); anything else is no date.
+        if (!std.math.isFinite(ms) or @abs(ms) > 8.64e15) return error.Argument;
         const r: u32 = blk: {
             const st = f.stat(p) catch break :blk Info.file_not_found;
             if (st.dir) break :blk Info.argument;
@@ -393,8 +410,9 @@ pub const TextStream = struct {
     /// that file, in the API Managed Area).
     uri: []u8,
     source: ?[]u8,
-    /// The associated file in the API Managed Area.
-    temp: []u8,
+    /// The associated file when it is a copy: one of the player's own files in the API Managed Area
+    /// (`Files.writePrivate`), which scripts cannot reach. Null: the associated file is `uri` itself.
+    temp: ?[]u8,
     mode: u32,
     text: std.ArrayList(u16) = .empty,
     /// Read pointer (units), and its line and column (1-based).
@@ -410,11 +428,11 @@ pub const TextStream = struct {
         const f = s.world.files orelse return error.Failed;
         const ts = try s.gpa.create(TextStream);
         errdefer s.gpa.destroy(ts);
-        const temp = if (source == null) try s.gpa.dupe(u8, u) else blk: {
+        const temp = if (source == null) null else blk: {
             serial += 1;
-            break :blk try std.fmt.allocPrint(s.gpa, "file:///filecache/~textstream{d}.txt", .{serial});
+            break :blk try std.fmt.allocPrint(s.gpa, "textstream{d}.txt", .{serial});
         };
-        errdefer s.gpa.free(temp);
+        errdefer if (temp) |x| s.gpa.free(x);
         ts.* = .{ .gpa = s.gpa, .script = s, .uri = try s.gpa.dupe(u8, u), .source = if (source) |x| try s.gpa.dupe(u8, x) else null, .temp = temp, .mode = mode };
         try ts.text.appendSlice(s.gpa, text);
         ts.store(f) catch |e| {
@@ -435,7 +453,7 @@ pub const TextStream = struct {
         ts.text.deinit(ts.gpa);
         ts.gpa.free(ts.uri);
         if (ts.source) |x| ts.gpa.free(x);
-        ts.gpa.free(ts.temp);
+        if (ts.temp) |x| ts.gpa.free(x);
         ts.gpa.destroy(ts);
     }
 
@@ -443,7 +461,7 @@ pub const TextStream = struct {
     fn store(ts: *TextStream, f: *Files) !void {
         const data = try encodeText(ts.gpa, ts.text.items);
         defer ts.gpa.free(data);
-        try f.write(ts.temp, data);
+        if (ts.temp) |name| try f.writePrivate(name, data) else try f.write(ts.uri, data);
     }
 
     fn isOpen(s: *Script, u: []const u8) bool {
@@ -455,7 +473,7 @@ pub const TextStream = struct {
     fn close(ts: *TextStream, s: *Script) void {
         if (ts.closed) return;
         ts.closed = true;
-        if (ts.source != null) if (s.world.files) |f| f.remove(ts.temp, false) catch {};
+        if (ts.temp) |name| if (s.world.files) |f| f.removePrivate(name);
     }
 
     /// The stream's object is gone, or its context is (`release`).
@@ -516,11 +534,24 @@ pub const TextStream = struct {
         return cx.string(utf8);
     }
 
+    /// The line and column of the end of the text (where writes go).
+    fn endPosition(ts: *const TextStream) struct { line: u32, column: u32 } {
+        const items = ts.text.items;
+        const last = std.mem.lastIndexOfScalar(u16, items, '\n');
+        return .{
+            .line = @intCast(1 + std.mem.count(u16, items, &.{'\n'})),
+            .column = @intCast(1 + items.len - if (last) |i| i + 1 else 0),
+        };
+    }
+
+    /// line and column follow the read pointer; a WRITE stream has none, so they follow what is written (Z.3.4.2:
+    /// "before anything is written, Line is equal to 1"; "After a newline character has been written, … Column
+    /// is equal to 1").
     fn getLine(ts: *TextStream) u32 {
-        return ts.line;
+        return if (ts.mode == Mode.write) ts.endPosition().line else ts.line;
     }
     fn getColumn(ts: *TextStream) u32 {
-        return ts.column;
+        return if (ts.mode == Mode.write) ts.endPosition().column else ts.column;
     }
     fn atEndOfLine(ts: *TextStream) bool {
         return ts.pos >= ts.text.items.len or ts.text.items[ts.pos] == '\n';
@@ -614,14 +645,11 @@ pub const TextStream = struct {
         const a = if (nl == null and start > 0) start - 1 else start;
         const b = if (nl) |x| x + 1 else ts.text.items.len;
         ts.text.replaceRange(ts.gpa, a, b - a, &.{}) catch return error.OutOfMemory;
-        if (ts.pos > a) {
-            ts.pos = a;
-            ts.line = 1;
-            ts.column = 1;
-            const p = ts.pos;
-            ts.pos = 0;
-            ts.advance(p);
-        }
+        // Step 3: the read pointer goes to the end of the previous line, where the deleted line was.
+        ts.pos = 0;
+        ts.line = 1;
+        ts.column = 1;
+        ts.advance(a);
         const f = scriptFiles(cx) orelse return error.Io;
         ts.store(f) catch return error.Io;
     }
@@ -704,4 +732,117 @@ test "FileIO and TextStream" {
     // The saved file is UTF-16BE with its BOM: "one\ntwo\nthree\n" after the third line went.
     const saved = try e.store.read("file:///required/notes.txt");
     try std.testing.expectEqual(@as(usize, 2 + 14 * 2), saved.len);
+}
+
+/// A one-file .aca archive (Vol. 3 §6.5.4) for tests.
+fn testArchive(gpa: std.mem.Allocator, name: []const u8, content: []const u8) ![]u8 {
+    var d: std.ArrayList(u8) = .empty;
+    errdefer d.deinit(gpa);
+    try d.appendSlice(gpa, "HDDVDACA\x00\x10\x00\x01\x00\x01");
+    try d.appendNTimes(gpa, 0, 32 - d.items.len);
+    try d.appendNTimes(gpa, 0, 14);
+    d.items[d.items.len - 1] = @intCast(name.len);
+    try d.appendSlice(gpa, name);
+    try d.appendNTimes(gpa, 0, 32);
+    std.mem.writeInt(u32, d.items[32..36], @intCast(d.items.len), .big);
+    std.mem.writeInt(u32, d.items[36..40], @intCast(content.len), .big);
+    try d.appendSlice(gpa, content);
+    return d.toOwnedSlice(gpa);
+}
+
+test "FileIO: the Resource Area during disc playback, archives, move, dates" {
+    const gpa = std.testing.allocator;
+    const e = try testenv.Env.create();
+    defer e.destroy();
+    try e.backend.disc.write("ADV_OBJ/t.txt", "\xfe\xff\x00a", 0, true);
+    try e.backend.resources.put(gpa, "file:///dvddisc/ADV_OBJ/res.txt", "\xfe\xff\x00r\x00e\x00s");
+    try e.backend.resources.put(gpa, "file:///dvddisc/ADV_OBJ/r.aca/x.txt", "member");
+    try e.backend.resources.put(gpa, "file:///required/res.xml", "<a/>");
+    const arc = try testArchive(gpa, "m.txt", "inside");
+    defer gpa.free(arc);
+    try e.temp.write("a.aca", arc, 1234, true);
+    e.backend.busy = true;
+    try e.run(
+        \\var r = {};
+        \\// Video plays from the disc: a disc file is out of reach, unless the Resource Area holds it.
+        \\assertThrows(function () { FileIO.getFileInfo("file:///dvddisc/ADV_OBJ/t.txt", function () {}); }, "HDDVD_E_INVALIDCALL");
+        \\assertThrows(function () { FileIO.openTextFile("file:///dvddisc/ADV_OBJ/t.txt", 1, false, false, function () {}); }, "HDDVD_E_INVALIDCALL");
+        \\assertThrows(function () { FileIO.copy("file:///dvddisc/ADV_OBJ/t.txt", "file:///filecache/t.txt", false, function () {}); }, "HDDVD_E_INVALIDCALL");
+        \\assertThrows(function () { FileIO.getFiles("file:///dvddisc/ADV_OBJ", function () {}); }, "HDDVD_E_INVALIDCALL");
+        \\FileIO.getFileInfo("file:///dvddisc/ADV_OBJ/res.txt", cb(function (f, i) { r.info = i + ":" + f.size + ":" + f.lastModifiedTime.getTime(); }));
+        \\FileIO.openTextFile("file:///dvddisc/ADV_OBJ/res.txt", 1, false, false, cb(function (ts, i) { r.open = i + ":" + ts.readAll(); }));
+        \\FileIO.copy("file:///dvddisc/ADV_OBJ/res.txt", "file:///filecache/c.txt", false, cb(function (i) { r.copy = i; }));
+        \\// Files in archives: not opened, copied (either way) or moved; an archive in the API Managed Area lists its files.
+        \\FileIO.openTextFile("file:///dvddisc/ADV_OBJ/r.aca/x.txt", 1, false, false, cb(function (ts, i) { r.openAca = i + ":" + ts; }));
+        \\FileIO.copy("file:///dvddisc/ADV_OBJ/r.aca/x.txt", "file:///filecache/x.txt", false, cb(function (i) { r.copyAca = i; }));
+        \\FileIO.copy("file:///filecache/a.aca/m.txt", "file:///filecache/m.txt", false, cb(function (i) { r.copyAca2 = i; }));
+        \\FileIO.copy("file:///dvddisc/ADV_OBJ/res.txt", "file:///filecache/a.aca/n.txt", false, cb(function (i) { r.copyIntoAca = i; }));
+        \\FileIO.copy("file:///filecache/none.txt", "file:///filecache/a.aca/n.txt", false, cb(function (i) { r.copyNone = i; }));
+        \\FileIO.move("file:///filecache/a.aca/m.txt", "file:///filecache/m.txt", cb(function (i) { r.moveAca = i; }));
+        \\FileIO.getFiles("file:///filecache/a.aca", cb(function (a, i) { r.acaFiles = i + ":" + a.size + ":" + a.get(0); }));
+        \\FileIO.getDirectories("file:///filecache/a.aca", cb(function (a, i) { r.acaDirs = i; }));
+        \\FileIO.getFileInfo("file:///filecache/a.aca/m.txt", cb(function (f, i) { r.acaInfo = i + ":" + f.uri + ":" + f.name + ":" + f.size + ":" + f.lastModifiedTime.getTime(); }));
+        \\FileIO.getFileInfo("file:///filecache/a.aca/none.txt", cb(function (f, i) { r.acaNone = i; }));
+        \\FileIO.remove("file:///filecache/a.aca/m.txt", false, cb(function (i) { r.removeAca = i; }));
+        \\// A file found in the Resource Area does not move; a missing one is not found.
+        \\FileIO.move("file:///required/res.xml", "file:///filecache/res.xml", cb(function (i) { r.moveRes = i; }));
+        \\FileIO.move("file:///required/none.xml", "file:///filecache/none.xml", cb(function (i) { r.moveNone = i; }));
+        \\// Dates a Date cannot hold.
+        \\assertThrows(function () { FileIO.setLastModifiedDate("file:///filecache/a.aca", Infinity, function () {}); }, "HDDVD_E_ARGUMENT");
+        \\assertThrows(function () { FileIO.setLastModifiedDate("file:///filecache/a.aca", -Infinity, function () {}); }, "HDDVD_E_ARGUMENT");
+        \\assertThrows(function () { FileIO.setLastModifiedDate("file:///filecache/a.aca", 1e300, function () {}); }, "HDDVD_E_ARGUMENT");
+        \\assertThrows(function () { FileIO.setLastModifiedDate("file:///filecache/a.aca", new Date(NaN), function () {}); }, "HDDVD_E_ARGUMENT");
+        \\FileIO.setLastModifiedDate("file:///filecache/a.aca", new Date(8.64e15), cb(function (i) { r.maxDate = i; }));
+    , "fileio_cache1.js");
+    try e.run(
+        \\assertEq(r.info, "1:8:500000", "the Resource Area's date"); assertEq(r.open, "1:res"); assertEq(r.copy, FileIO.SUCCEEDED);
+        \\assertEq(r.openAca, FileIO.NOT_PERMITTED + ":null"); assertEq(r.copyAca, FileIO.NOT_PERMITTED); assertEq(r.copyAca2, FileIO.NOT_PERMITTED);
+        \\assertEq(r.copyIntoAca, FileIO.NOT_PERMITTED); assertEq(r.copyNone, FileIO.FILE_NOT_FOUND); assertEq(r.moveAca, FileIO.NOT_PERMITTED);
+        \\assertEq(r.acaFiles, "1:1:file:///filecache/a.aca/m.txt"); assertEq(r.acaDirs, FileIO.DIRECTORY_NOT_FOUND);
+        \\assertEq(r.acaInfo, "1:file:///filecache/a.aca/m.txt:m.txt:6:1234", "the archive's date"); assertEq(r.acaNone, FileIO.FILE_NOT_FOUND);
+        \\assertEq(r.removeAca, FileIO.NOT_PERMITTED);
+        \\assertEq(r.moveRes, FileIO.NOT_PERMITTED); assertEq(r.moveNone, FileIO.FILE_NOT_FOUND); assertEq(r.maxDate, FileIO.SUCCEEDED);
+    , "fileio_cache2.js");
+    // The Resource Area file stayed where it was.
+    try std.testing.expect(e.backend.resources.contains("file:///required/res.xml"));
+}
+
+test "TextStream: positions after writes and deleteLine, hidden copies" {
+    const e = try testenv.Env.create();
+    defer e.destroy();
+    try e.run(
+        \\var r = {};
+        \\FileIO.openTextFile("file:///filecache/w.txt", FileIO.FILE_IOMODE_WRITE, true, true, cb(function (ts, i) {
+        \\  assertEq(i, FileIO.SUCCEEDED); assertEq(ts.line, 1); assertEq(ts.column, 1);
+        \\  ts.write("ab"); assertEq(ts.line, 1); assertEq(ts.column, 3);
+        \\  ts.writeLine("c"); assertEq(ts.line, 2); assertEq(ts.column, 1);
+        \\  ts.writeBlankLines(2); ts.write("x"); assertEq(ts.line, 4); assertEq(ts.column, 2);
+        \\  r.w = true;
+        \\}));
+        \\FileIO.openTextFile("file:///required/rw.txt", FileIO.FILE_IOMODE_READWRITE, false, true, cb(function (ts, i) {
+        \\  assertEq(i, FileIO.SUCCEEDED);
+        \\  ts.writeLine("one"); ts.writeLine("two"); ts.writeLine("three");
+        \\  assertEq(ts.line, 1, "a READWRITE stream's position is its read pointer");
+        \\  assertEq(ts.readLine(), "one"); ts.readAll(); assertEq(ts.line, 4);
+        \\  ts.deleteLine(2); assertEq(ts.line, 2); assertEq(ts.column, 1); assertEq(ts.readLine(), "three");
+        \\  ts.deleteLine(1); assertEq(ts.line, 1); assertEq(ts.column, 1); assertEq(ts.readAll(), "three\n");
+        \\  r.ts = ts;
+        \\  // The stream's copy in the API Managed Area is the player's: not listed, not reachable.
+        \\  FileIO.getFiles("file:///filecache", cb(function (a, i) { var l = []; for (var k = 0; k < a.size; k++) l.push(a.get(k)); r.files = l.join(","); }));
+        \\  FileIO.getDirectories("file:///filecache", cb(function (a, i) { r.dirs = a.size; }));
+        \\  FileIO.getFileInfo("file:///filecache/%00player/textstream2.txt", cb(function (f, i) { r.hidden = i; }));
+        \\  FileIO.getDirectoryInfo("file:///filecache", cb(function (d, i) { r.size = d.size; }));
+        \\}));
+    , "textstream1.js");
+    try e.run(
+        \\assert(r.w); assertEq(r.files, "file:///filecache/w.txt"); assertEq(r.dirs, 0); assertEq(r.hidden, FileIO.FILE_NOT_FOUND);
+        \\assert(r.size > 14, "the copy takes room");
+        \\FileIO.saveTextFile(r.ts, cb(function (i) { r.saved = i; }));
+    , "textstream2.js");
+    try e.run(
+        \\assertEq(r.saved, FileIO.SUCCEEDED);
+        \\FileIO.getDirectoryInfo("file:///filecache", cb(function (d, i) { r.size2 = d.size; }));
+    , "textstream3.js");
+    // Saved and gone: only w.txt (BOM + "abc\n\n\nx") is left.
+    try e.run("assertEq(r.size2, 2 + 7 * 2);", "textstream4.js");
 }

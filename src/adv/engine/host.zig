@@ -204,6 +204,9 @@ pub const Host = struct {
             }
         }
         const now = hddvd_now_us();
+        // Effect sounds that ended, in the mixer or in the output used while paused.
+        if (h.pres.takeEffectDone()) |id| e.effect_done = id;
+        if (h.fx.takeDone()) |id| e.effect_done = id;
         const r = e.step(now, h.pres.titleNow(now) orelse e.title_time);
         if (r.redraw) {
             if (h.frame()) |f| {
@@ -227,7 +230,7 @@ pub const Host = struct {
                 hddvd_input_pause(@ptrCast(h.obj), on);
             },
             .mixing => |m| h.pres.setMixing(m.main, m.sub, m.effect),
-            .effect_play => |p| h.playEffect(p.data, p.repeat, now),
+            .effect_play => |p| h.playEffect(p.data, p.repeat, p.id, now),
             .effect_stop => {
                 h.fx.stop();
                 h.pres.stopEffect();
@@ -242,10 +245,11 @@ pub const Host = struct {
 
     /// Plays an effect sound (takes `data`, a WAV file): through our mixer (adec.zig) while VLC plays, through
     /// our own output while it is paused. One sound at a time: each replaces the other's.
-    fn playEffect(h: *Host, data: []u8, repeat: u32, now: i64) void {
+    fn playEffect(h: *Host, data: []u8, repeat: u32, id: u64, now: i64) void {
         defer gpa.free(data);
         const w = mix.decodeWav(gpa, data, repeat) catch |err| {
             log(h.obj, vlc.VLC_MSG_WARN, @src(), "effect sound: %s", .{@errorName(err).ptr});
+            h.eng.effect_done = id; // nothing plays: the callback comes at once
             return;
         };
         const p = h.pres;
@@ -256,16 +260,18 @@ pub const Host = struct {
         p.unlock();
         if (!paused) {
             h.fx.stop();
-            p.playEffect(.{ .samples = w.samples, .channels = w.channels, .rate = w.rate, .at = now });
+            p.playEffect(.{ .samples = w.samples, .channels = w.channels, .rate = w.rate, .at = now, .id = id });
             return;
         }
         defer gpa.free(w.samples);
         p.stopEffect();
         const s = settings(h);
-        if (h.fx.play(w.samples, w.channels, w.rate, rows, gain, s, now)) |msg| {
+        if (h.fx.play(w.samples, w.channels, w.rate, rows, gain, s, now, id)) |msg| {
             log(h.obj, vlc.VLC_MSG_WARN, @src(), "effect sound while paused: %s", .{msg});
+            h.eng.effect_done = id;
         } else if (!s.audible) {
             log(h.obj, vlc.VLC_MSG_DBG, @src(), "effect sound while paused: not played, VLC has no audio output", .{});
+            h.eng.effect_done = id;
         } else log(h.obj, vlc.VLC_MSG_DBG, @src(), "effect sound while paused: %s at %u Hz, amplitude %.5f", .{
             @as([*:0]const u8, @ptrCast(&h.fx.device_name)), @as(c_uint, h.fx.rate), @as(f64, s.amplitude),
         });

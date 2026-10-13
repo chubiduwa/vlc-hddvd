@@ -178,6 +178,8 @@ pub const Model = struct {
     playing_clips: std.ArrayList(usize) = .empty,
     /// The title's first track selection is still to come (see `reselect`).
     first_tracks: bool = true,
+    /// The last title time of the title just left (title_end and its clip_end carry it).
+    left_time: ?u64 = null,
 
     pub fn deinit(m: *Model, gpa: std.mem.Allocator) void {
         var it = m.general.iterator();
@@ -195,8 +197,17 @@ pub const Model = struct {
 pub const State = struct {
     titles: std.AutoHashMapUnmanaged(u16, Value) = .empty,
     chapters: std.AutoHashMapUnmanaged(u32, Value) = .empty,
+    /// Other objects that keep their identity across reads (Track objects, attributes, VideoScales), by `objKey`.
+    objs: std.AutoHashMapUnmanaged(u64, Value) = .empty,
+    /// The effect sound this script played: its id and the callback for when it ends (an EffectDone function).
+    effect_wait: ?struct { id: u64, f: Value } = null,
 
     pub fn deinit(st: *State, s: *Script) void {
+        if (st.effect_wait) |w| s.cx.free(w.f);
+        st.effect_wait = null;
+        var io = st.objs.valueIterator();
+        while (io.next()) |v| s.cx.free(v.*);
+        st.objs.deinit(s.gpa);
         var it = st.titles.valueIterator();
         while (it.next()) |v| s.cx.free(v.*);
         st.titles.deinit(s.gpa);
@@ -205,6 +216,24 @@ pub const State = struct {
         st.chapters.deinit(s.gpa);
     }
 };
+
+const ObjKind = enum(u8) { track = 1, title_attributes, chapter_attributes, scale };
+
+fn objKey(kind: ObjKind, a: u32, b: u32) u64 {
+    return (@as(u64, @backingInt(kind)) << 56) | (@as(u64, a) << 24) | b;
+}
+
+/// The cached object for `key`, or null (a new reference).
+fn cachedObj(s: *Script, key: u64) ?Value {
+    const v = s.apis.player.objs.get(key) orelse return null;
+    return s.cx.dup(v);
+}
+
+/// Keeps `v` as the object for `key` (takes a reference of its own) and returns it.
+fn keepObj(s: *Script, key: u64, v: Value) Value {
+    s.apis.player.objs.put(s.gpa, key, s.cx.dup(v)) catch s.cx.free(v);
+    return v;
+}
 
 fn modelOf(s: *Script) *Model {
     return &s.world.model;
@@ -1100,6 +1129,11 @@ pub const TitleRef = struct {
         const arr = try cx.array();
         errdefer cx.free(arr);
         for (navList(ti, kind), 0..) |n, i| {
+            const key = objKey(.track, t.index, (@as(u32, @backingInt(kind)) << 8) | n.track);
+            if (cachedObj(s, key)) |v| {
+                try cx.setIndex(arr, @intCast(i), v);
+                continue;
+            }
             const tr = try s.gpa.create(TrackRef);
             tr.* = .{ .title = t.index, .kind = kind, .track = n.track };
             const v = cx.wrapAs(TrackRef, switch (kind) {
@@ -1110,7 +1144,7 @@ pub const TitleRef = struct {
                 s.gpa.destroy(tr);
                 return e;
             };
-            try cx.setIndex(arr, @intCast(i), v);
+            try cx.setIndex(arr, @intCast(i), keepObj(s, key, v));
         }
         return arr;
     }
@@ -1129,8 +1163,16 @@ pub const TitleRef = struct {
     fn attributes(t: *TitleRef, cx: *js.Context) js.Error!Value {
         const s = Script.of(cx);
         const ti = try t.title(cx);
+        const key = objKey(.title_attributes, t.index, 0);
+        if (cachedObj(s, key)) |v| return v;
         const o = try cx.object();
         errdefer cx.free(o);
+        // The element's own attributes, as written: none added for attributes the playlist leaves out.
+        if (ti.attrs.len > 0) {
+            for (ti.attrs) |at| try cx.set(o, at.name, try cx.string(at.value));
+            _ = c.JS_FreezeObject(cx.ctx, o);
+            return keepObj(s, key, o);
+        }
         var buf: [32]u8 = undefined;
         if (ti.id.len > 0) try cx.set(o, "id", try cx.string(ti.id));
         try cx.set(o, "titleNumber", try cx.string(std.fmt.bufPrint(&buf, "{d}", .{ti.number}) catch ""));
@@ -1147,7 +1189,7 @@ pub const TitleRef = struct {
         if (ti.display_name.len > 0) try cx.set(o, "displayName", try cx.string(ti.display_name));
         if (ti.description.len > 0) try cx.set(o, "description", try cx.string(ti.description));
         _ = c.JS_FreezeObject(cx.ctx, o);
-        return o;
+        return keepObj(s, key, o);
     }
 
     fn jump(t: *TitleRef, cx: *js.Context, time: []const u8, bookmark: bool) js.Error!void {
@@ -1207,13 +1249,20 @@ pub const ChapterRef = struct {
     fn attributes(ch: *ChapterRef, cx: *js.Context) js.Error!Value {
         const s = Script.of(cx);
         _, const chap = try ch.get(cx);
+        const key = objKey(.chapter_attributes, ch.title, ch.index);
+        if (cachedObj(s, key)) |v| return v;
         const o = try cx.object();
         errdefer cx.free(o);
-        var buf: [16]u8 = undefined;
-        try cx.set(o, "titleTimeBegin", try cx.string(events.timecode(&buf, chap.begin, fps(s))));
-        if (chap.name.len > 0) try cx.set(o, "displayName", try cx.string(chap.name));
+        if (chap.attrs.len > 0) {
+            // The element's own attributes, as written (id, description… included).
+            for (chap.attrs) |at| try cx.set(o, at.name, try cx.string(at.value));
+        } else {
+            // The implicit chapter of a title without a ChapterList.
+            var buf: [16]u8 = undefined;
+            try cx.set(o, "titleTimeBegin", try cx.string(events.timecode(&buf, chap.begin, fps(s))));
+        }
         _ = c.JS_FreezeObject(cx.ctx, o);
-        return o;
+        return keepObj(s, key, o);
     }
 
     /// jump(time, bookmark): `time` within the chapter.
@@ -1415,7 +1464,9 @@ fn L(comptime main: bool) type {
         }
         fn scale(s: *Script) js.Error!Value {
             const sc = layoutOf(s, main).scale orelse return js.null;
-            return VideoScale.make(s, sc[0], sc[1]);
+            const key = objKey(.scale, @intFromBool(main), (@as(u32, sc[0]) << 8) | sc[1]);
+            if (cachedObj(s, key)) |v| return v;
+            return keepObj(s, key, try VideoScale.make(s, sc[0], sc[1]));
         }
         fn cropX(s: *Script) u32 {
             return layoutOf(s, main).crop_x;
@@ -1689,10 +1740,9 @@ const AU = struct {
     fn setVolumes(s: *Script, a: Args8) js.Error!void {
         const m = modelOf(s);
         const old = m.main_volume;
-        for (a.v, 0..) |x, i| {
-            if (x > 255) return error.Argument;
-            m.main_volume[i] = @intCast(x);
-        }
+        // Every argument is checked before any is applied.
+        for (a.v) |x| if (x > 255) return error.Argument;
+        for (a.v, 0..) |x, i| m.main_volume[i] = @intCast(x);
         if (!totalVolumeOk(m)) {
             m.main_volume = old;
             return error.Argument;
@@ -1703,10 +1753,8 @@ const AU = struct {
     fn setMix(s: *Script, target: *[2][8]u8, a: [16]u32) js.Error!void {
         const m = modelOf(s);
         const old = target.*;
-        for (a, 0..) |x, i| {
-            if (x > 255) return error.Argument;
-            target[i / 8][i % 8] = @intCast(x);
-        }
+        for (a) |x| if (x > 255) return error.Argument;
+        for (a, 0..) |x, i| target[i / 8][i % 8] = @intCast(x);
         if (!totalVolumeOk(m)) {
             target.* = old;
             return error.Argument;
@@ -1745,11 +1793,13 @@ const AU = struct {
             s.gpa.free(data);
             return effectDone(s, cb, Result.wrong_format, serial);
         };
-        command(s, .{ .effect_play = .{ .data = data, .repeat = repeat } });
-        // FINISHED when the sound has played (it is timed here; the mixer plays it).
-        const ticks: u64 = @intFromFloat(@ceil(@as(f64, @floatFromInt(ms * repeat)) / 1000 * s.world.tick_rate));
+        _ = ms;
+        // FINISHED when the mixer (or the output used while paused) reports the sound has ended (effectFinished).
         const done = try EffectDone.make(s, cb, serial);
-        s.post(.{ .call = .{ .f = done, .args = &.{}, .what = "effect audio" } }, .app, s.appTicks() + ticks, null) catch {};
+        const st = &s.apis.player;
+        if (st.effect_wait) |w| s.cx.free(w.f);
+        st.effect_wait = .{ .id = serial, .f = done };
+        command(s, .{ .effect_play = .{ .data = data, .repeat = repeat, .id = serial } });
     }
 
     fn effectDone(s: *Script, cb: Value, status: u32, serial: u64) js.Error!void {
@@ -1795,6 +1845,20 @@ const EffectDone = struct {
         return js.undefined;
     }
 };
+
+/// The effect sound `id` has ended (reported by the mixer, or stopped by a title change): the script that played
+/// it gets its callback.
+pub fn effectFinished(w: *World, id: u64) void {
+    const apps = w.apps orelse return;
+    for (apps.records.items) |a| {
+        const s = a.script orelse continue;
+        const st = &s.apis.player;
+        const wait = st.effect_wait orelse continue;
+        if (wait.id != id) continue;
+        st.effect_wait = null;
+        s.post(.{ .call = .{ .f = wait.f, .args = &.{}, .what = "effect audio" } }, .app, 0, null) catch s.cx.free(wait.f);
+    }
+}
 
 /// The length of a WAV file (RIFF/WAVE with fmt and data chunks), in ms; null if it is not one.
 pub fn wavDurationMs(data: []const u8) ?u64 {
@@ -1972,15 +2036,19 @@ const GP = struct {
     fn availableNumber(s: *Script) u32 {
         return @intCast(max - modelOf(s).general.count());
     }
+    /// Lengths in characters, not bytes (the strings are UTF-8 here).
+    fn chars(str: []const u8) usize {
+        return std.unicode.utf8CountCodepoints(str) catch str.len;
+    }
     fn getValue(s: *Script, key: []const u8) js.Error!Value {
-        if (key.len > 127) return error.Argument;
+        if (chars(key) > 127) return error.Argument;
         const v = modelOf(s).general.get(key) orelse return js.undefined;
         return s.cx.string(v);
     }
     /// setValue(key, value): undefined removes the key.
     fn setValue(s: *Script, key: []const u8, v: Value) js.Error!void {
         const m = modelOf(s);
-        if (key.len > 127) return error.Argument;
+        if (chars(key) > 127) return error.Argument;
         if (c.JS_IsUndefined(v)) {
             if (m.general.fetchSwapRemove(key)) |kv| {
                 s.gpa.free(kv.key);
@@ -1990,7 +2058,7 @@ const GP = struct {
         }
         const value = try s.cx.toStringAlloc(s.gpa, v);
         errdefer s.gpa.free(value);
-        if (value.len > 255) return error.Argument;
+        if (chars(value) > 255) return error.Argument;
         if (m.general.getPtr(key)) |slot| {
             s.gpa.free(slot.*);
             slot.* = value;
@@ -2038,7 +2106,7 @@ pub fn timelineEvents(w: *World, jumped: bool) void {
     for (title.scheduled) |sc| {
         const reached = if (from) |p| sc.time > p and sc.time <= now else at_start and sc.time == now;
         if (!reached) continue;
-        if (sc.kind == .event) apps.sendSystem(.{ .kind = .scheduled, .type = "scheduled_event", .id = if (sc.id.len > 0) sc.id else null }, null);
+        if (sc.kind == .event) apps.sendSystem(.{ .kind = .scheduled, .type = "scheduled_event", .id = if (sc.id.len > 0) sc.id else null, .at = sc.time }, null);
         if (sc.kind == .pause_at) {
             m.play_state = PlayState.pause;
             if (w.eng) |e| e.command(.{ .pause = true });
@@ -2091,13 +2159,14 @@ pub fn timelineEvents(w: *World, jumped: bool) void {
 /// The title is left (it ended, or a jump left it): its playing clips end (§8.3.1 Case 2, before Application End).
 pub fn titleEnds(w: *World) void {
     const m = &w.model;
+    m.left_time = m.last_time;
     defer m.playing_clips.clearRetainingCapacity();
     const apps = w.apps orelse return;
     const title = curTitle(w) orelse return;
     for (m.playing_clips.items) |i| {
         if (i >= title.clips.len) continue;
         const cl = title.clips[i];
-        apps.sendSystem(.{ .kind = .clip, .type = "clip_end", .id = if (cl.id.len > 0) cl.id else null }, null);
+        apps.sendSystem(.{ .kind = .clip, .type = "clip_end", .id = if (cl.id.len > 0) cl.id else null, .at = m.left_time }, null);
     }
 }
 
@@ -2108,6 +2177,10 @@ pub fn titleBegins(w: *World) void {
     m.last_chapter = null;
     m.playing_clips.clearRetainingCapacity();
     m.first_tracks = true;
+    // The current tracks reset at a title change (Table W-3, "I"): the first selection reports a NaN oldValue.
+    m.tracks.cur_video = null;
+    m.tracks.cur_audio = null;
+    m.tracks.cur_sub = null;
     m.play_state = PlayState.play;
     m.play_speed = null;
     m.main = .{ .crop_w = w.aperture_w, .crop_h = w.aperture_h };
@@ -2118,6 +2191,7 @@ pub fn titleBegins(w: *World) void {
     if (m.effect_playing) {
         if (w.eng) |e| e.command(.effect_stop);
         m.effect_ended = true;
+        effectFinished(w, m.effect_serial);
     }
     m.effect_playing = false;
     m.capturing = false;
@@ -2405,6 +2479,8 @@ test "the Player API on a title" {
             \\function rec(e) { log.push(e.type + (e.id !== undefined ? ":" + e.id : "") + (e.newValue === e.newValue && e.newValue !== undefined ? ":" + e.oldValue + ">" + e.newValue : "")); }
             \\var types = ["title_begin", "scheduled_event", "chapter", "clip_begin", "clip_end", "audio_track", "subtitle_track", "video_track", "play_state"];
             \\for (var i = 0; i < types.length; i++) { addEventListener(types[i], rec, false); }
+            \\var evTime, gotKey; addEventListener("scheduled_event", function (e) { evTime = e.time; }, false);
+            \\addEventListener("controller_key_down", function (e) { gotKey = e.key + ":" + e.code; }, false);
         },
     } };
     var backend: files_mod.TestBackend = .init(gpa);
@@ -2489,6 +2565,12 @@ test "the Player API on a title" {
         \\Player.video.main.setOuterFrameColor(16, 128, 128); assertThrows(function () { Player.video.main.setOuterFrameColor(0, 0, 0); }, "HDDVD_E_ARGUMENT");
         \\assertThrows(function () { Player.audio.sub.setMixing(0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0); }, "HDDVD_E_ARGUMENT");
         \\Player.audio.main.setVolumes(255, 255, 0, 255, 255, 255, 255, 255); assertEq(Player.audio.main.channels.center, 0);
+        \\assertThrows(function () { Player.audio.main.setVolumes(1, 1, 1, 1, 1, 1, 1, 300); }, "HDDVD_E_ARGUMENT"); assertEq(Player.audio.main.channels.left, 255, "nothing applied");
+        \\// Objects keep their identity; attributes are the element's own.
+        \\assertEq(t1.audioTracks[0], t1.audioTracks[0]); assertEq(t1.attributes, t1.attributes); assertEq(pl.titles.t2.attributes.type, undefined);
+        \\assertEq(t1.chapters[1].attributes.displayName, "Two"); assertEq(t1.chapters[1].attributes, t1.chapters[1].attributes);
+        \\// A ControllerKeyEvent a script makes keeps its fields across applications.
+        \\var k = createEvent("ControllerKeyEvent"); k.initControllerKeyEvent("controller_key_down", true, true, 1, 0, 0, 0, 0, 0, 0, 13, "U+000D", 0, 0); dispatchEvent(k);
         \\Player.audio.sub.setMixing(0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         \\assertEq(Player.audio.sub.channels.left.mix.center, 255); assertEq(Player.audio.main.channels.left, 255);
         \\assertThrows(function () { Player.audio.main.setVolumes(255, 255, 255, 255, 255, 255, 255, 255); }, "HDDVD_E_ARGUMENT");
@@ -2496,6 +2578,7 @@ test "the Player API on a title" {
         \\assert(Player.audio.effect.playing); assertThrows(function () { Player.audio.effect.play("x", 0, null); }, "HDDVD_E_ARGUMENT");
         \\var gp = Player.generalParameters; assertEq(gp.availableNumber, 64); gp.setValue("k", "v"); assertEq(gp.getValue("k"), "v"); assertEq(gp.availableNumber, 63);
         \\gp.setValue("k", undefined); assertEq(gp.getValue("k"), undefined);
+        \\var longKey = new Array(128).join("\u00e9"); gp.setValue(longKey, "v"); assertEq(gp.getValue(longKey), "v", "127 characters (254 bytes)"); gp.setValue(longKey, undefined);
         \\var scp = Player.standardContentPlayer; scp.setGPRM(3, 7); assertEq(scp.getGPRM(3), 7); assertThrows(function () { scp.setSPRM(0, 1); }, "HDDVD_E_ARGUMENT");
         \\assertThrows(function () { pl.pause(); scp.play(1, 1); }, "HDDVD_E_INVALIDCALL"); pl.play();
         \\assertEq(Player.capabilities.audio.main.ddplus, 2); assertEq(Player.capabilities.playback.slowForward, false); assertEq(Player.capabilities.audio.hdmi, null);
@@ -2503,6 +2586,11 @@ test "the Player API on a title" {
         \\Player.subtitle.visible = false; assertEq(Player.subtitle.visible, false);
         \\Player.menuLanguage = "ja"; assertEq(Player.menuLanguage, "ja");
     , "player.js");
+    // The mixer plays the effect sound and reports its end (here, at once).
+    for (e.outbox.items) |cmd| switch (cmd) {
+        .effect_play => |fx| e.effect_done = fx.id,
+        else => {},
+    };
     while (t < 110) {
         now += 16_700;
         t += 1;
@@ -2510,6 +2598,7 @@ test "the Player API on a title" {
     }
     s.world.eng = &e;
     try js.testing.run(cx,
+        \\assertEq(evTime, "00:00:00:20", "a scheduled event's own time"); assertEq(gotKey, "13:U+000D");
         \\assertEq(fx, Player.FINISHED); assert(!Player.audio.effect.playing); assert(!Player.video.sub.changing); assertEq(Player.video.sub.x, 10);
         \\assertEq(log.slice(8).join(","), "audio_track:1>2,audio_track:2>1");
         \\Player.playlist.pause();

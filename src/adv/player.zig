@@ -153,6 +153,8 @@ pub const Player = struct {
     ref_ts: i64 = 0,
     next: Next = .none,
     stopped: bool = false,
+    /// The engine was told the playback stopped (title_end and stop_request for the applications).
+    stop_told: bool = false,
     wait_ticks: u32 = 0,
 
     // Reader.
@@ -362,6 +364,13 @@ fn startHost(demux: *vlc.demux_t, pr: *present.Presentation, kept: ?*player_api.
     };
 }
 
+/// A resource the File Cache could not load: Resource Not Found for the applications.
+fn resourceMissing(ctx: *anyopaque, u: []const u8) void {
+    const p: *Player = @ptrCast(@alignCast(ctx));
+    const h = p.host orelse return;
+    h.post(.{ .resource_not_found = gpa.dupe(u8, u) catch return });
+}
+
 /// Plays the FirstPlayTitle, else title 1.
 fn startPlaylist(demux: *vlc.demux_t) void {
     const p = playerOf(demux);
@@ -462,6 +471,7 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
         p.content_id_len = cid.len;
     }
     acc.configure(&p.pl);
+    acc.on_missing = .{ .ctx = p, .f = resourceMissing };
 }
 
 pub fn close(demux: *vlc.demux_t) void {
@@ -724,7 +734,13 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
         selectTracks(demux, p.audio_track);
     }
     p.access.disc_busy.store(!p.stopped and !p.paused and !p.held, .monotonic);
-    if (p.stopped) return 0;
+    if (p.stopped) {
+        if (!p.stop_told) if (p.host) |h| {
+            p.stop_told = true;
+            h.post(.title_end);
+        };
+        return 0;
+    }
     keepOverlay(demux);
     animateLayout(demux);
     if (p.held) {

@@ -9,6 +9,7 @@ const pstore = @import("../pstore.zig");
 const filecache = @import("../filecache.zig");
 const files_mod = @import("files.zig");
 const uri_mod = @import("../uri.zig");
+const player_api = @import("player_api.zig");
 
 const Value = js.Value;
 const Script = host.Script;
@@ -116,10 +117,11 @@ pub const Manager = struct {
         return v;
     }
 
-    /// callManagementMenu (Z.11.1.3): only while paused. The player has no management menu of its own (the
+    /// callManagementMenu (Z.11.1.3): only while Playlist.playState is PLAYSTATE_PAUSE (so a script's own
+    /// pause() counts at once, not at the next tick). The player has no management menu of its own (the
     /// storage is in memory): it returns at once.
     fn callManagementMenu(s: *Script) js.Error!void {
-        if (!s.world.paused) return error.InvalidCall;
+        if (s.world.model.play_state != player_api.PlayState.pause) return error.InvalidCall;
     }
 
     /// saveBasePath(uri): the Assignment Information File next to that playlist (§10.6).
@@ -362,4 +364,26 @@ test "DataCache and the persistent storage" {
         \\req.getProviderInformation("score", cb(function (res, key, value) { r.gone = res; }));
     , "storage3.js");
     try e.run("assertEq(r.gone, 2);", "storage4.js");
+}
+
+test "callManagementMenu after a script's pause; the File Cache room" {
+    const e = try testenv.Env.create();
+    defer e.destroy();
+    // 1 MB of File Cache: an available resource of 100 KB counts as room, a used one of 200 KB does not.
+    var cache = filecache.FileCache.init(std.testing.allocator, 1024 * 1024);
+    defer cache.deinit();
+    const avail = try cache.reserve("file:///dvddisc/ADV_OBJ/a.png", 100 * 1024, .app, 1);
+    avail.state = .available;
+    const used = try cache.reserve("file:///dvddisc/ADV_OBJ/u.png", 200 * 1024, .app, 1);
+    used.state = .used;
+    e.backend.cache = &cache;
+    try e.run(
+        \\assertEq(DataCache.availableFileCacheSize, 1024 - 200);
+        \\assertThrows(function () { PersistentStorageManager.callManagementMenu(); }, "HDDVD_E_INVALIDCALL");
+        \\Player.playlist.pause();
+        \\assertEq(Player.playlist.playState, Player.playlist.PLAYSTATE_PAUSE);
+        \\PersistentStorageManager.callManagementMenu();
+        \\Player.playlist.play();
+        \\assertThrows(function () { PersistentStorageManager.callManagementMenu(); }, "HDDVD_E_INVALIDCALL");
+    , "storage_menu.js");
 }

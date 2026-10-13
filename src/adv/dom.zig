@@ -149,6 +149,7 @@ pub const Node = struct {
             return;
         }
         c.detach();
+        parent.doc.version +%= 1;
         c.parent = parent;
         c.next = ref;
         c.prev = if (ref) |r| r.prev else parent.last;
@@ -158,6 +159,7 @@ pub const Node = struct {
 
     pub fn detach(n: *Node) void {
         const p = n.parent orelse return;
+        n.doc.version +%= 1;
         if (n.prev) |pr| pr.next = n.next else p.first = n.next;
         if (n.next) |nx| nx.prev = n.prev else p.last = n.prev;
         n.parent = null;
@@ -253,6 +255,9 @@ pub const Document = struct {
     /// Where the document was loaded from (for relative URIs), owned.
     uri: []u8 = &.{},
     host: ?*anyopaque = null,
+    /// Bumped by every change of the tree (a node inserted or removed) and of names, so that a cache of what
+    /// the tree holds (the script's live node lists) can tell it is stale.
+    version: u64 = 0,
 
     pub fn create(gpa: std.mem.Allocator) !*Document {
         const d = try gpa.create(Document);
@@ -476,7 +481,7 @@ const Parser = struct {
                 p.i = j;
                 if (cur.type != .document) {
                     pending_text.clearRetainingCapacity();
-                    try decodeText(p.gpa, p.s[text_start..j], &pending_text);
+                    try decodeText(p.gpa, p.s[text_start..j], false, &pending_text);
                     const t = try p.doc.createText(.text, pending_text.items);
                     cur.appendChild(t);
                 }
@@ -576,11 +581,7 @@ const Parser = struct {
             const end = std.mem.indexOfScalarPos(u8, p.s, p.i, q) orelse return p.fail("unterminated value");
             var v: std.ArrayList(u8) = .empty;
             errdefer v.deinit(p.gpa);
-            try decodeText(p.gpa, p.s[p.i..end], &v);
-            // Attribute-value normalisation: whitespace characters become spaces.
-            for (v.items) |*c| if (c.* == '\t' or c.* == '\n' or c.* == '\r') {
-                c.* = ' ';
-            };
+            try decodeText(p.gpa, p.s[p.i..end], true, &v);
             p.i = end + 1;
             try raw.append(p.gpa, .{ .qn = an, .value = try v.toOwnedSlice(p.gpa) });
         }
@@ -628,14 +629,21 @@ fn isNameChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == ':' or c == '-' or c == '.' or c >= 0x80;
 }
 
-/// Character data with entity and character references resolved.
-fn decodeText(gpa: std.mem.Allocator, raw: []const u8, out: *std.ArrayList(u8)) !void {
+/// Character data with entity and character references resolved. In an attribute value, white space
+/// characters written as such become spaces (attribute-value normalisation), while character references to
+/// them (`&#10;`) are kept.
+fn decodeText(gpa: std.mem.Allocator, raw: []const u8, in_attr: bool, out: *std.ArrayList(u8)) !void {
     var i: usize = 0;
     while (i < raw.len) {
         const c = raw[i];
         if (c == '\r') { // line-end normalisation
-            try out.append(gpa, '\n');
+            try out.append(gpa, if (in_attr) ' ' else '\n');
             i += if (i + 1 < raw.len and raw[i + 1] == '\n') 2 else 1;
+            continue;
+        }
+        if (in_attr and (c == '\n' or c == '\t')) {
+            try out.append(gpa, ' ');
+            i += 1;
             continue;
         }
         if (c != '&') {
@@ -675,66 +683,169 @@ fn decodeText(gpa: std.mem.Allocator, raw: []const u8, out: *std.ArrayList(u8)) 
 
 // ---- serializer ----------------------------------------------------------------------------------------------
 
-/// Writes `n` and its descendants as XML (UTF-8), with an XML declaration for a document.
+/// Writes `n` and its descendants as XML (UTF-8), with an XML declaration for a document. Namespaces are fixed
+/// up: an element or attribute whose namespace is not bound to its prefix where it is written gets an `xmlns` or
+/// `xmlns:p` declaration (or a new prefix), so that a tree built or changed by script parses back the same.
+/// Names that have a prefix but no namespace (`setAttribute("p:x", …)` outside the tree) are written as they are.
 pub fn serialize(gpa: std.mem.Allocator, n: *const Node, out: *std.ArrayList(u8)) !void {
-    switch (n.type) {
-        .document, .fragment => {
-            if (n.type == .document) try out.appendSlice(gpa, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-            var c = n.first;
-            while (c) |x| : (c = x.next) try serialize(gpa, x, out);
-        },
-        .element => {
-            try out.append(gpa, '<');
-            try out.appendSlice(gpa, n.qname());
-            for (n.attrs.items) |a| {
-                try out.append(gpa, ' ');
-                if (a.prefix.len > 0) {
-                    try out.appendSlice(gpa, a.prefix);
-                    try out.append(gpa, ':');
-                }
-                try out.appendSlice(gpa, a.local);
-                try out.appendSlice(gpa, "=\"");
-                try escape(gpa, a.value, true, out);
-                try out.append(gpa, '"');
-            }
-            if (n.first == null) {
-                try out.appendSlice(gpa, "/>");
-                return;
-            }
-            try out.append(gpa, '>');
-            var c = n.first;
-            while (c) |x| : (c = x.next) try serialize(gpa, x, out);
-            try out.appendSlice(gpa, "</");
-            try out.appendSlice(gpa, n.qname());
-            try out.append(gpa, '>');
-        },
-        .text => try escape(gpa, n.data, false, out),
-        .cdata => {
-            try out.appendSlice(gpa, "<![CDATA[");
-            try out.appendSlice(gpa, n.data);
-            try out.appendSlice(gpa, "]]>");
-        },
-        .comment => {
-            try out.appendSlice(gpa, "<!--");
-            try out.appendSlice(gpa, n.data);
-            try out.appendSlice(gpa, "-->");
-        },
-        .pi => {
-            try out.appendSlice(gpa, "<?");
-            try out.appendSlice(gpa, n.local);
-            try out.append(gpa, ' ');
-            try out.appendSlice(gpa, n.data);
-            try out.appendSlice(gpa, "?>");
-        },
-    }
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var w: Writer = .{ .gpa = gpa, .arena = arena.allocator(), .out = out };
+    defer w.scope.deinit(gpa);
+    try w.node(n);
 }
 
+const NsBinding = struct { prefix: []const u8, uri: []const u8 };
+
+const Writer = struct {
+    gpa: std.mem.Allocator,
+    /// Generated prefixes.
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    /// The namespace bindings in scope, innermost last.
+    scope: std.ArrayList(NsBinding) = .empty,
+
+    fn lookup(w: *const Writer, prefix: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, prefix, "xml")) return xml_ns;
+        var k = w.scope.items.len;
+        while (k > 0) {
+            k -= 1;
+            if (std.mem.eql(u8, w.scope.items[k].prefix, prefix)) return w.scope.items[k].uri;
+        }
+        return if (prefix.len == 0) "" else null;
+    }
+
+    /// A prefix (not the default namespace) bound to `uri` in scope, or null.
+    fn prefixFor(w: *const Writer, uri: []const u8) ?[]const u8 {
+        var k = w.scope.items.len;
+        while (k > 0) {
+            k -= 1;
+            const b = w.scope.items[k];
+            if (b.prefix.len > 0 and std.mem.eql(u8, b.uri, uri) and std.mem.eql(u8, w.lookup(b.prefix).?, uri)) return b.prefix;
+        }
+        return null;
+    }
+
+    /// The prefix an attribute is written with: its own if it is bound to its namespace, else another one bound
+    /// to it.
+    fn attrPrefix(w: *const Writer, a: Attr) []const u8 {
+        if (a.ns.len == 0) return a.prefix;
+        if (std.mem.eql(u8, a.ns, xml_ns)) return "xml";
+        if (a.prefix.len > 0) if (w.lookup(a.prefix)) |u| if (std.mem.eql(u8, u, a.ns)) return a.prefix;
+        return w.prefixFor(a.ns) orelse a.prefix;
+    }
+
+    /// The prefix a namespace declaration attribute declares ("" for `xmlns`), or null if it is not one.
+    fn declared(a: Attr) ?[]const u8 {
+        if (!std.mem.eql(u8, a.ns, xmlns_ns)) return null;
+        if (std.mem.eql(u8, a.prefix, "xmlns")) return a.local;
+        if (a.prefix.len == 0 and std.mem.eql(u8, a.local, "xmlns")) return "";
+        return null;
+    }
+
+    fn put(w: *Writer, s: []const u8) !void {
+        try w.out.appendSlice(w.gpa, s);
+    }
+
+    fn node(w: *Writer, n: *const Node) !void {
+        const gpa = w.gpa;
+        switch (n.type) {
+            .document, .fragment => {
+                if (n.type == .document) try w.put("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+                var c = n.first;
+                while (c) |x| : (c = x.next) try w.node(x);
+            },
+            .element => {
+                const mark = w.scope.items.len;
+                defer w.scope.shrinkRetainingCapacity(mark);
+                // The element's own declarations, then those it needs: they come after, so they win.
+                for (n.attrs.items) |a| if (declared(a)) |p| try w.scope.append(gpa, .{ .prefix = p, .uri = a.value });
+                const own = w.scope.items.len;
+                if (n.ns.len > 0 or n.prefix.len == 0) {
+                    const bound = w.lookup(n.prefix);
+                    if (bound == null or !std.mem.eql(u8, bound.?, n.ns)) try w.scope.append(gpa, .{ .prefix = n.prefix, .uri = n.ns });
+                }
+                for (n.attrs.items) |a| {
+                    if (declared(a) != null or a.ns.len == 0 or std.mem.eql(u8, a.ns, xml_ns)) continue;
+                    if (a.prefix.len > 0 and !std.mem.eql(u8, a.prefix, "xmlns")) {
+                        const bound = w.lookup(a.prefix);
+                        if (bound == null) {
+                            try w.scope.append(gpa, .{ .prefix = a.prefix, .uri = a.ns });
+                            continue;
+                        }
+                        if (std.mem.eql(u8, bound.?, a.ns)) continue;
+                    }
+                    if (w.prefixFor(a.ns) != null) continue;
+                    var i: u32 = 1;
+                    var p = try std.fmt.allocPrint(w.arena, "ns{d}", .{i});
+                    while (w.lookup(p) != null) : (i += 1) p = try std.fmt.allocPrint(w.arena, "ns{d}", .{i + 1});
+                    try w.scope.append(gpa, .{ .prefix = p, .uri = a.ns });
+                }
+
+                try w.out.append(gpa, '<');
+                try w.put(n.qname());
+                for (w.scope.items[own..]) |b| {
+                    try w.put(if (b.prefix.len == 0) " xmlns" else " xmlns:");
+                    try w.put(b.prefix);
+                    try w.put("=\"");
+                    try escape(gpa, b.uri, true, w.out);
+                    try w.out.append(gpa, '"');
+                }
+                for (n.attrs.items) |a| {
+                    // A declaration the element's own names override is left out.
+                    if (declared(a)) |p| if (!std.mem.eql(u8, w.lookup(p).?, a.value)) continue;
+                    try w.out.append(gpa, ' ');
+                    const prefix = if (declared(a) != null) a.prefix else w.attrPrefix(a);
+                    if (prefix.len > 0) {
+                        try w.put(prefix);
+                        try w.out.append(gpa, ':');
+                    }
+                    try w.put(a.local);
+                    try w.put("=\"");
+                    try escape(gpa, a.value, true, w.out);
+                    try w.out.append(gpa, '"');
+                }
+                if (n.first == null) return w.put("/>");
+                try w.out.append(gpa, '>');
+                var c = n.first;
+                while (c) |x| : (c = x.next) try w.node(x);
+                try w.put("</");
+                try w.put(n.qname());
+                try w.out.append(gpa, '>');
+            },
+            .text => try escape(gpa, n.data, false, w.out),
+            .cdata => {
+                try w.put("<![CDATA[");
+                try w.put(n.data);
+                try w.put("]]>");
+            },
+            .comment => {
+                try w.put("<!--");
+                try w.put(n.data);
+                try w.put("-->");
+            },
+            .pi => {
+                try w.put("<?");
+                try w.put(n.local);
+                try w.out.append(gpa, ' ');
+                try w.put(n.data);
+                try w.put("?>");
+            },
+        }
+    }
+};
+
+/// Character data or an attribute value as XML. White space that the parser would normalise is written as
+/// character references: CR anywhere, TAB and LF in attribute values.
 fn escape(gpa: std.mem.Allocator, s: []const u8, in_attr: bool, out: *std.ArrayList(u8)) !void {
     for (s) |c| switch (c) {
         '<' => try out.appendSlice(gpa, "&lt;"),
         '>' => try out.appendSlice(gpa, "&gt;"),
         '&' => try out.appendSlice(gpa, "&amp;"),
         '"' => try out.appendSlice(gpa, if (in_attr) "&quot;" else "\""),
+        '\r' => try out.appendSlice(gpa, "&#13;"),
+        '\t' => try out.appendSlice(gpa, if (in_attr) "&#9;" else "\t"),
+        '\n' => try out.appendSlice(gpa, if (in_attr) "&#10;" else "\n"),
         else => try out.append(gpa, c),
     };
 }
@@ -811,4 +922,34 @@ test "tree mutation, attributes and serialisation" {
     e.detach();
     try testing.expect(!a.contains(e));
     try testing.expectEqualStrings("urn:s", b.lookupNamespace("s").?);
+}
+
+test "serialisation declares namespaces and keeps white space in attributes" {
+    const d = try Document.create(testing.allocator);
+    defer d.destroy();
+    const root = try d.createElementNS("urn:a", "p:root");
+    d.node.appendChild(root);
+    try root.setAttrNS("urn:c", "q", "k", "v");
+    const c = try d.createElementNS("urn:b", "c");
+    root.appendChild(c);
+    try c.setAttrNS("urn:d", "", "z", "w");
+    try c.setAttrNS("", "", "t", "a\tb\nc\r");
+    // A declaration that disagrees with the element's own namespace is overridden.
+    const e = try d.createElementNS("urn:e", "p:e");
+    try e.setAttrNS(xmlns_ns, "xmlns", "p", "urn:wrong");
+    c.appendChild(e);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try serialize(testing.allocator, root, &out);
+    try testing.expectEqualStrings("<p:root xmlns:p=\"urn:a\" xmlns:q=\"urn:c\" q:k=\"v\"><c xmlns=\"urn:b\" xmlns:ns1=\"urn:d\" ns1:z=\"w\" t=\"a&#9;b&#10;c&#13;\"><p:e xmlns:p=\"urn:e\"/></c></p:root>", out.items);
+    const back = try parse(testing.allocator, out.items, null);
+    defer back.destroy();
+    const r = back.root().?;
+    try testing.expect(r.is("urn:a", "root"));
+    try testing.expectEqualStrings("v", r.attrNS("urn:c", "k").?);
+    const c2 = r.firstElement().?;
+    try testing.expect(c2.is("urn:b", "c"));
+    try testing.expectEqualStrings("w", c2.attrNS("urn:d", "z").?);
+    try testing.expectEqualStrings("a\tb\nc\r", c2.attr("t").?);
+    try testing.expect(c2.firstElement().?.is("urn:e", "e"));
 }

@@ -75,6 +75,8 @@ const Sys = struct {
     sub_fifo: mix.Fifo = .{ .rate = 48000, .channels = 2 },
     sub_resampler: ?mix.Resampler = null,
     effects: mix.Effects = .{},
+    /// The id of the effect sound playing (reported when it ends).
+    effect_id: u64 = 0,
     /// Timestamp of the last block received.
     last_pts: i64 = 0,
     /// Something was output since the last flush. Before that VLC is buffering: it waits for every decoder's
@@ -283,7 +285,10 @@ fn output(s: *Sys, h: *Held, now: i64) void {
         m.scale(sub_gain);
         s.sub_fifo.mixInto(h.samples, s.out, h.pts, h.frames, &m, s.sub_in.layout);
     } else s.sub_fifo.mixInto(&.{}, s.out, h.pts, 0, &mix.Matrix{}, s.sub_in.layout); // keep the queue aligned
-    if (s.effects.playing()) s.effects.mixInto(h.samples, effect_gain);
+    if (s.effects.playing()) {
+        s.effects.mixInto(h.samples, effect_gain);
+        if (!s.effects.playing()) pres.effectDone(s.effect_id); // the script's callback gets FINISHED now
+    }
 
     const out = vlc.decoder_NewAudioBuffer(s.dec, @intCast(h.frames)) orelse return;
     @memcpy(out.*.p_buffer[0 .. h.samples.len * 4], std.mem.sliceAsBytes(h.samples));
@@ -296,9 +301,10 @@ fn output(s: *Sys, h: *Held, now: i64) void {
 fn startEffect(s: *Sys, e: present.Effect, now: i64, rows: ?[2][mix.hd_channels]u8) void {
     defer gpa.free(e.samples);
     // Requested while paused (nothing was being output): stale by now.
-    if (now - e.at > effect_stale) return;
-    const out = mix.convertEffect(gpa, e.samples, e.channels, e.rate, s.out, s.out_rate, rows) catch return;
+    if (now - e.at > effect_stale) return s.pres.effectDone(e.id);
+    const out = mix.convertEffect(gpa, e.samples, e.channels, e.rate, s.out, s.out_rate, rows) catch return s.pres.effectDone(e.id);
     s.effects.start(gpa, out, s.out.n);
+    s.effect_id = e.id;
 }
 
 // ---- nested decoder callbacks (codec_glue.c), for vdec.zig, pipdec.zig and this module ----------------------

@@ -90,6 +90,9 @@ pub const Spec = struct {
     uri: ?[]const u8 = null,
     /// The title time it occurred at, as a timecode (system events).
     time: ?[]const u8 = null,
+    /// The title time (frames) to stamp instead of the current one (a scheduled event's own time, the end of
+    /// the title being left).
+    at: ?u64 = null,
     /// StreamingBufferEvent: the Secondary Video's elapsed time.
     elapsed: ?[]const u8 = null,
     connect: bool = false,

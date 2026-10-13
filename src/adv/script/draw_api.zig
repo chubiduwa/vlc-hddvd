@@ -237,23 +237,21 @@ pub const Point = struct {
     };
 };
 
+/// A solid brush (`color`), a texture brush (`texture`), or neither (createSolidBrush was given no Color: it
+/// fills nothing).
 pub const Brush = struct {
     color: ?[4]u8,
     texture: ?[]u8,
-    color_obj: Value = js.null,
 
     fn finalize(ptr: *anyopaque, rt: *js.Runtime) void {
         const b: *Brush = @ptrCast(@alignCast(ptr));
-        c.JS_FreeValueRT(rt.rt, b.color_obj);
         if (b.texture) |t| rt.gpa.free(t);
         rt.gpa.destroy(b);
     }
-    fn mark(ptr: *anyopaque, rt: *c.JSRuntime, m: ?*const c.JS_MarkFunc) void {
-        const b: *Brush = @ptrCast(@alignCast(ptr));
-        c.JS_MarkValue(rt, b.color_obj, m);
-    }
-    fn getColor(b: *Brush, cx: *js.Context) Value {
-        return cx.dup(b.color_obj);
+    /// The colour the brush fills with (READONLY, Z.7.7.2): a new Color each time, so changing the script's
+    /// Color after createSolidBrush, or the one returned here, does not change the brush.
+    fn getColor(b: *Brush, cx: *js.Context) js.Error!Value {
+        return if (b.color) |rgba| Color.make(cx, rgba) else js.null;
     }
     fn getTexture(b: *Brush, cx: *js.Context) js.Error!Value {
         return if (b.texture) |t| cx.string(t) else js.null;
@@ -262,14 +260,12 @@ pub const Brush = struct {
     pub const js_class: js.Class = .{
         .name = "Brush",
         .finalize = finalize,
-        .mark = mark,
         .members = &.{ js.prop("color", getColor, null), js.prop("texture", getTexture, null) },
     };
 };
 
 pub const Pen = struct {
     color: [4]u8,
-    color_obj: Value,
     /// The footprint's corners (pixels, relative to the point).
     corners: [4][2]f64,
 
@@ -282,16 +278,11 @@ pub const Pen = struct {
     }
 
     fn finalize(ptr: *anyopaque, rt: *js.Runtime) void {
-        const p: *Pen = @ptrCast(@alignCast(ptr));
-        c.JS_FreeValueRT(rt.rt, p.color_obj);
-        rt.gpa.destroy(p);
+        rt.gpa.destroy(@as(*Pen, @ptrCast(@alignCast(ptr))));
     }
-    fn mark(ptr: *anyopaque, rt: *c.JSRuntime, m: ?*const c.JS_MarkFunc) void {
-        const p: *Pen = @ptrCast(@alignCast(ptr));
-        c.JS_MarkValue(rt, p.color_obj, m);
-    }
-    fn getColor(p: *Pen, cx: *js.Context) Value {
-        return cx.dup(p.color_obj);
+    /// The colour the pen draws with (READONLY, Z.7.4.2): a new Color each time, like Brush.color.
+    fn getColor(p: *Pen, cx: *js.Context) js.Error!Value {
+        return Color.make(cx, p.color);
     }
     fn rotateTransform(p: *Pen, angle: f64) void {
         const a = angle * std.math.pi / 180;
@@ -308,7 +299,6 @@ pub const Pen = struct {
     pub const js_class: js.Class = .{
         .name = "Pen",
         .finalize = finalize,
-        .mark = mark,
         .members = &.{
             js.prop("color", getColor, null),
             js.method("rotateTransform", rotateTransform),
@@ -326,8 +316,10 @@ pub const Drawing = struct {
         if (r > 255 or g > 255 or b > 255 or a > 255) return error.ArgumentOutOfRange;
         return Color.make(s.cx, .{ @intCast(r), @intCast(g), @intCast(b), @intCast(a) });
     }
-    fn createRectangle(s: *Script, x: i32, y: i32, w: u32, h: u32) js.Error!Value {
-        return Rect.make(s.cx, .{ .x = x, .y = y, .w = w, .h = h });
+    /// createRectangle(x, y, width, height): a width or height that is not an unsigned int is
+    /// HDDVD_E_ARGUMENT (Z.7.1.2 step 1).
+    fn createRectangle(s: *Script, x: i32, y: i32, w_v: Value, h_v: Value) js.Error!Value {
+        return Rect.make(s.cx, .{ .x = x, .y = y, .w = try uintArg(s.cx, w_v), .h = try uintArg(s.cx, h_v) });
     }
     fn createPoint(s: *Script, x: i32, y: i32) js.Error!Value {
         const p = try s.gpa.create(Point);
@@ -337,12 +329,12 @@ pub const Drawing = struct {
             return e;
         };
     }
+    /// createSolidBrush(color): no exceptions (Z.7.1.2); without a Color the brush fills nothing. The brush
+    /// keeps the colour the Color has now.
     fn createSolidBrush(s: *Script, color_v: Value) js.Error!Value {
-        const col = s.cx.unwrap(Color, color_v) orelse return error.Argument;
         const b = try s.gpa.create(Brush);
-        b.* = .{ .color = col.rgba, .texture = null, .color_obj = s.cx.dup(color_v) };
+        b.* = .{ .color = if (s.cx.unwrap(Color, color_v)) |col| col.rgba else null, .texture = null };
         return s.cx.wrap(Brush, b) catch |e| {
-            s.cx.free(b.color_obj);
             s.gpa.destroy(b);
             return e;
         };
@@ -360,12 +352,14 @@ pub const Drawing = struct {
             return e;
         };
     }
-    fn createPen(s: *Script, color_v: Value, width: u32) js.Error!Value {
+    /// createPen(color, width): a width that is not an unsigned int is HDDVD_E_ARGUMENT (Z.7.1.2 step 1). The
+    /// pen keeps the colour the Color has now.
+    fn createPen(s: *Script, color_v: Value, width_v: Value) js.Error!Value {
+        const width = try uintArg(s.cx, width_v);
         const col = s.cx.unwrap(Color, color_v) orelse return error.Argument;
         const p = try s.gpa.create(Pen);
-        p.* = .{ .color = col.rgba, .color_obj = s.cx.dup(color_v), .corners = Pen.init(width) };
+        p.* = .{ .color = col.rgba, .corners = Pen.init(width) };
         return s.cx.wrap(Pen, p) catch |e| {
-            s.cx.free(p.color_obj);
             s.gpa.destroy(p);
             return e;
         };
@@ -383,6 +377,14 @@ pub const Drawing = struct {
         },
     };
 };
+
+/// An "unsigned int" argument whose check is HDDVD_E_ARGUMENT rather than Table Z-2's TypeError and RangeError
+/// (createRectangle, createPen): not a number, NaN, negative or too large. Fractions are truncated (Table Z-2).
+fn uintArg(cx: *js.Context, v: Value) js.Error!u32 {
+    const d = js.toNumberArg(cx, v) catch |e| return if (e == error.TypeError) error.Argument else e;
+    if (std.math.isNan(d) or d < 0 or d >= 4294967296.0) return error.Argument;
+    return @intFromFloat(@trunc(d));
+}
 
 // ---- rasterization ------------------------------------------------------------------------------------------------
 
@@ -415,8 +417,9 @@ fn fillPolygon(cv: *Canvas, pts: []const Vec, paint: Paint) void {
         min_y = @min(min_y, p[1]);
         max_y = @max(max_y, p[1]);
     }
-    const y0: i32 = @max(0, @as(i32, @intFromFloat(@floor(min_y))));
-    const y1: i32 = @min(@as(i32, @intCast(cv.h)) - 1, @as(i32, @intFromFloat(@ceil(max_y))));
+    const ylim: f64 = @floatFromInt(cv.h + 1);
+    const y0: i32 = @max(0, @as(i32, @intFromFloat(@floor(std.math.clamp(min_y, -1, ylim)))));
+    const y1: i32 = @min(@as(i32, @intCast(cv.h)) - 1, @as(i32, @intFromFloat(@ceil(std.math.clamp(max_y, -1, ylim)))));
     var xs: [256]struct { x: f64, dir: i8 } = undefined;
     var y = y0;
     while (y <= y1) : (y += 1) {
@@ -442,8 +445,10 @@ fn fillPolygon(cv: *Canvas, pts: []const Vec, paint: Paint) void {
         while (i < n) : (i += 1) {
             wind += xs[i].dir;
             if (wind == 0 or i + 1 >= n) continue;
-            const xa: i32 = @max(0, @as(i32, @intFromFloat(@ceil(xs[i].x - 0.5))));
-            const xb: i32 = @min(@as(i32, @intCast(cv.w)) - 1, @as(i32, @intFromFloat(@ceil(xs[i + 1].x - 0.5))) - 1);
+            // Shapes can reach far outside the canvas (any int coordinates, any unsigned sizes).
+            const lim: f64 = @floatFromInt(cv.w + 1);
+            const xa: i32 = @max(0, @as(i32, @intFromFloat(@ceil(std.math.clamp(xs[i].x, -1, lim) - 0.5))));
+            const xb: i32 = @min(@as(i32, @intCast(cv.w)) - 1, @as(i32, @intFromFloat(@ceil(std.math.clamp(xs[i + 1].x, -1, lim) - 0.5))) - 1);
             var x = xa;
             const row = cv.row(@intCast(y));
             while (x <= xb) : (x += 1) row[@intCast(x)] = raster.over(row[@intCast(x)], paint.at(x, y));
@@ -468,8 +473,8 @@ fn strokeSegment(cv: *Canvas, pen: *const Pen, a: Vec, b: Vec) void {
         const steps: usize = @intFromFloat(@max(@abs(b[0] - a[0]), @abs(b[1] - a[1])) + 1);
         for (0..steps + 1) |i| {
             const t = if (steps == 0) 0 else @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps));
-            const x: i32 = @intFromFloat(@round(a[0] + (b[0] - a[0]) * t));
-            const y: i32 = @intFromFloat(@round(a[1] + (b[1] - a[1]) * t));
+            const x: i64 = @intFromFloat(@round(a[0] + (b[0] - a[0]) * t));
+            const y: i64 = @intFromFloat(@round(a[1] + (b[1] - a[1]) * t));
             if (x < 0 or y < 0 or x >= cv.w or y >= cv.h) continue;
             const row = cv.row(@intCast(y));
             row[@intCast(x)] = raster.over(row[@intCast(x)], col);
@@ -553,15 +558,15 @@ pub const Area = struct {
         a.obj = null;
     }
 
-    fn penOf(cx: *js.Context, v: Value) js.Error!?*Pen {
-        if (c.JS_IsNull(v) or c.JS_IsUndefined(v)) return null;
-        return cx.unwrap(Pen, v) orelse error.Argument;
+    /// The drawing calls have no exceptions (Z.7.5.2): anything but a Pen draws no outline.
+    fn penOf(cx: *js.Context, v: Value) ?*Pen {
+        return cx.unwrap(Pen, v);
     }
 
+    /// Likewise, anything but a Brush fills nothing.
     fn paintOf(a: *Area, cx: *js.Context, v: Value, origin: [2]i32, tex: *?Canvas) js.Error!?Paint {
         _ = a;
-        if (c.JS_IsNull(v) or c.JS_IsUndefined(v)) return null;
-        const b = cx.unwrap(Brush, v) orelse return error.Argument;
+        const b = cx.unwrap(Brush, v) orelse return null;
         if (b.texture) |u| {
             const s = Script.of(cx);
             const f = s.world.files orelse return null;
@@ -570,23 +575,26 @@ pub const Area = struct {
             tex.* = image.decode(s.gpa, bytes) catch return null;
             return .{ .texture = .{ .img = &tex.*.?, .origin = origin } };
         }
-        return .{ .color = (Color{ .rgba = b.color.? }).px() };
+        const rgba = b.color orelse return null;
+        return .{ .color = (Color{ .rgba = rgba }).px() };
     }
 
-    fn pointOf(cx: *js.Context, v: Value) js.Error!Vec {
-        const p = cx.unwrap(Point, v) orelse return error.Argument;
+    /// A Point, else null (the call then draws nothing).
+    fn pointOf(cx: *js.Context, v: Value) ?Vec {
+        const p = cx.unwrap(Point, v) orelse return null;
         return .{ @floatFromInt(p.x), @floatFromInt(p.y) };
     }
 
-    /// The Points of a script Array.
-    fn points(cx: *js.Context, arr: Value, out: *std.ArrayList(Vec)) js.Error!void {
+    /// The Points of a script Array; false if an item is not a Point (the call then draws nothing).
+    fn points(cx: *js.Context, arr: Value, out: *std.ArrayList(Vec)) js.Error!bool {
         var len: i64 = 0;
         if (c.JS_GetLength(cx.ctx, arr, &len) < 0) return error.Thrown;
         for (0..@intCast(@max(0, len))) |i| {
             const v = c.JS_GetPropertyUint32(cx.ctx, arr, @intCast(i));
             defer cx.free(v);
-            try out.append(cx.gpa, try pointOf(cx, v));
+            try out.append(cx.gpa, pointOf(cx, v) orelse return false);
         }
+        return true;
     }
 
     fn clear(a: *Area) void {
@@ -595,28 +603,28 @@ pub const Area = struct {
     }
 
     fn drawLine(a: *Area, cx: *js.Context, pen_v: Value, p1: Value, p2: Value) js.Error!void {
-        const pen = try penOf(cx, pen_v) orelse return error.Argument;
-        strokeSegment(&a.canvas, pen, try pointOf(cx, p1), try pointOf(cx, p2));
+        const pen = penOf(cx, pen_v) orelse return;
+        strokeSegment(&a.canvas, pen, pointOf(cx, p1) orelse return, pointOf(cx, p2) orelse return);
         a.changed();
     }
 
     fn drawLineCoord(a: *Area, cx: *js.Context, pen_v: Value, x1: i32, y1: i32, x2: i32, y2: i32) js.Error!void {
-        const pen = try penOf(cx, pen_v) orelse return error.Argument;
+        const pen = penOf(cx, pen_v) orelse return;
         strokeSegment(&a.canvas, pen, .{ @floatFromInt(x1), @floatFromInt(y1) }, .{ @floatFromInt(x2), @floatFromInt(y2) });
         a.changed();
     }
 
     fn drawLines(a: *Area, cx: *js.Context, pen_v: Value, arr: Value) js.Error!void {
-        const pen = try penOf(cx, pen_v) orelse return error.Argument;
+        const pen = penOf(cx, pen_v) orelse return;
         var pts: std.ArrayList(Vec) = .empty;
         defer pts.deinit(cx.gpa);
-        try points(cx, arr, &pts);
+        if (!try points(cx, arr, &pts)) return;
         if (pts.items.len >= 2) for (pts.items[0 .. pts.items.len - 1], pts.items[1..]) |p, q| strokeSegment(&a.canvas, pen, p, q);
         a.changed();
     }
 
     fn shape(a: *Area, cx: *js.Context, pen_v: Value, brush_v: Value, outline: []const Vec, origin: [2]i32) js.Error!void {
-        const pen = try penOf(cx, pen_v);
+        const pen = penOf(cx, pen_v);
         var tex: ?Canvas = null;
         defer if (tex) |*t| t.deinit(cx.gpa);
         if (try a.paintOf(cx, brush_v, origin, &tex)) |p| fillPolygon(&a.canvas, outline, p);
@@ -634,7 +642,7 @@ pub const Area = struct {
 
     fn drawRectangleCoord(a: *Area, cx: *js.Context, pen_v: Value, brush_v: Value, x: i32, y: i32, w: u32, h: u32) js.Error!void {
         // The outline goes through the corner pixels' centres; the fill covers the w × h pixels.
-        const pen = try penOf(cx, pen_v);
+        const pen = penOf(cx, pen_v);
         var tex: ?Canvas = null;
         defer if (tex) |*t| t.deinit(cx.gpa);
         if (try a.paintOf(cx, brush_v, .{ x, y }, &tex)) |p| {
@@ -642,10 +650,10 @@ pub const Area = struct {
             fillPolygon(&a.canvas, &o, p);
         }
         if (pen) |pn| if (w > 0 and h > 0) {
-            const x2: f64 = @floatFromInt(x + @as(i32, @intCast(w)) - 1);
-            const y2: f64 = @floatFromInt(y + @as(i32, @intCast(h)) - 1);
             const fx: f64 = @floatFromInt(x);
             const fy: f64 = @floatFromInt(y);
+            const x2 = fx + @as(f64, @floatFromInt(w)) - 1;
+            const y2 = fy + @as(f64, @floatFromInt(h)) - 1;
             const corners = [_]Vec{ .{ fx, fy }, .{ x2, fy }, .{ x2, y2 }, .{ fx, y2 } };
             for (corners, 0..) |p, i| strokeSegment(&a.canvas, pn, p, corners[(i + 1) % 4]);
         };
@@ -653,7 +661,7 @@ pub const Area = struct {
     }
 
     fn drawRectangle(a: *Area, cx: *js.Context, pen_v: Value, brush_v: Value, r_v: Value) js.Error!void {
-        const r = cx.unwrap(Rect, r_v) orelse return error.Argument;
+        const r = cx.unwrap(Rect, r_v) orelse return;
         return a.drawRectangleCoord(cx, pen_v, brush_v, r.x, r.y, r.w, r.h);
     }
 
@@ -673,15 +681,14 @@ pub const Area = struct {
     }
 
     fn drawEllipse(a: *Area, cx: *js.Context, pen_v: Value, brush_v: Value, r_v: Value) js.Error!void {
-        const r = cx.unwrap(Rect, r_v) orelse return error.Argument;
+        const r = cx.unwrap(Rect, r_v) orelse return;
         return a.drawEllipseCoord(cx, pen_v, brush_v, r.x, r.y, r.w, r.h);
     }
 
     fn drawPolygon(a: *Area, cx: *js.Context, pen_v: Value, brush_v: Value, arr: Value) js.Error!void {
         var pts: std.ArrayList(Vec) = .empty;
         defer pts.deinit(cx.gpa);
-        try points(cx, arr, &pts);
-        if (pts.items.len == 0) return;
+        if (!try points(cx, arr, &pts) or pts.items.len == 0) return;
         var min: [2]i32 = .{ std.math.maxInt(i32), std.math.maxInt(i32) };
         for (pts.items) |p| min = .{ @min(min[0], @as(i32, @intFromFloat(p[0]))), @min(min[1], @as(i32, @intFromFloat(p[1]))) };
         return a.shape(cx, pen_v, brush_v, pts.items, min);
@@ -696,12 +703,11 @@ pub const Area = struct {
         if (image.kindOf(bytes) == .mng) return error.FileNotFound;
         var img = image.decode(s.gpa, bytes) catch return error.FileNotFound;
         defer img.deinit(s.gpa);
-        const dst = cx.unwrap(Rect, dst_v) orelse return error.Argument;
-        const sr: raster.Rect = if (c.JS_IsNull(src_v) or c.JS_IsUndefined(src_v)) img.bounds() else blk: {
-            const r = cx.unwrap(Rect, src_v) orelse return error.Argument;
-            break :blk .{ .x = r.x, .y = r.y, .w = @intCast(r.w), .h = @intCast(r.h) };
-        };
-        const to: raster.Rect = .{ .x = dst.x, .y = dst.y, .w = @intCast(dst.w), .h = @intCast(dst.h) };
+        // Its only exception is HDDVD_E_FILENOTFOUND: no destination draws nothing, and a srcRect that is not
+        // a Rectangle is the whole image, like null.
+        const dst = cx.unwrap(Rect, dst_v) orelse return;
+        const sr: raster.Rect = if (cx.unwrap(Rect, src_v)) |r| .{ .x = r.x, .y = r.y, .w = side(r.w), .h = side(r.h) } else img.bounds();
+        const to: raster.Rect = .{ .x = dst.x, .y = dst.y, .w = side(dst.w), .h = side(dst.h) };
         // Parts of the source outside the image are transparent: the crop maps onto its share of `to`.
         const inside = sr.intersect(img.bounds()) orelse return a.changed();
         const sx = @as(f64, @floatFromInt(to.w)) / @as(f64, @floatFromInt(@max(1, sr.w)));
@@ -716,7 +722,15 @@ pub const Area = struct {
         a.changed();
     }
 
-    /// capture(uri): the canvas as a Capture Drawing Format file (§6.5.1.4.2) in the API Managed Area.
+    /// A Rectangle's side for raster: a script can set any unsigned int.
+    fn side(v: u32) i32 {
+        return @intCast(@min(v, 1 << 20));
+    }
+
+    /// capture(uri): the canvas as a Capture Drawing Format file (§6.5.1.4.2) in the API Managed Area. The file
+    /// must be one that "is able to be created": a URI outside the API Managed Area, or a file that already
+    /// exists, is HDDVD_E_ARGUMENT (Z.7.5.2 step 1; Player.video.main.capture words it the same way, and a copy
+    /// onto an API Managed Area file of the same name fails too, Z.3.1.2). Scripts remove the old file first.
     fn capture(a: *Area, cx: *js.Context, u: []const u8) js.Error!void {
         const s = Script.of(cx);
         const f = s.world.files orelse return error.Argument;
@@ -781,13 +795,13 @@ test "fills and strokes" {
     // A 1-pixel pen draws the pixels it passes.
     var cv2 = try Canvas.init(tt.allocator, 10, 10);
     defer cv2.deinit(tt.allocator);
-    const pen: Pen = .{ .color = .{ 0, 255, 0, 255 }, .color_obj = js.null, .corners = Pen.init(1) };
+    const pen: Pen = .{ .color = .{ 0, 255, 0, 255 }, .corners = Pen.init(1) };
     strokeSegment(&cv2, &pen, .{ 0, 5 }, .{ 9, 5 });
     try tt.expectEqual(@as(u8, 255), cv2.at(0, 5)[1]);
     try tt.expectEqual(@as(u8, 255), cv2.at(9, 5)[1]);
     try tt.expectEqual(@as(u8, 0), cv2.at(5, 4)[3]);
     // A 3-pixel pen covers one more each side.
-    const pen3: Pen = .{ .color = .{ 0, 0, 255, 255 }, .color_obj = js.null, .corners = Pen.init(3) };
+    const pen3: Pen = .{ .color = .{ 0, 0, 255, 255 }, .corners = Pen.init(3) };
     strokeSegment(&cv2, &pen3, .{ 5, 1 }, .{ 5, 1 });
     try tt.expectEqual(@as(u8, 255), cv2.at(4, 0)[2]);
     try tt.expectEqual(@as(u8, 255), cv2.at(6, 2)[2]);
@@ -805,4 +819,70 @@ test "fills and strokes" {
     var back = try image.decode(tt.allocator, cap1);
     defer back.deinit(tt.allocator);
     try tt.expectEqual(one.px[0], back.px[0]);
+}
+
+const testenv = @import("testenv.zig");
+
+test "Drawing and DrawingArea from script" {
+    const doc = try dom.parse(tt.allocator,
+        \\<root xmlns="http://www.dvdforum.org/2005/ihd"><object id="g" type="application/x-graphic"><param name="width" value="8"/><param name="height" value="8"/></object></root>
+    , null);
+    defer doc.destroy();
+    const e = try testenv.Env.create();
+    defer e.destroy();
+    const s = e.script;
+    s.page_doc = doc;
+    const area = try drawingAreaOf(s, doc.root().?.firstElement().?);
+    const g = s.cx.global();
+    defer s.cx.free(g);
+    try s.cx.set(g, "area", area);
+    const png = try image.testPng(tt.allocator, 1, 1, &.{.{ 0, 255, 0, 255 }});
+    defer tt.allocator.free(png);
+    try e.temp.write("dot.png", png, 0, true);
+    try e.run(
+        \\var D = Drawing;
+        \\// Argument checks: HDDVD_E_ARGUMENT for a size that is not an unsigned int (Z.7.1.2).
+        \\assertEq(D.createRectangle(1, 2, 3.7, 4).width, 3);
+        \\assertThrows(function () { D.createRectangle(0, 0, -1, 4); }, "HDDVD_E_ARGUMENT");
+        \\assertThrows(function () { D.createRectangle(0, 0, 1, NaN); }, "HDDVD_E_ARGUMENT");
+        \\assertThrows(function () { D.createRectangle(0, 0, undefined, 1); }, "HDDVD_E_ARGUMENT");
+        \\assertThrows(function () { D.createRectangle(0, 0, 4294967296, 1); }, "HDDVD_E_ARGUMENT");
+        \\var red = D.createColor(255, 0, 0, 255);
+        \\assertThrows(function () { D.createPen(red, -2); }, "HDDVD_E_ARGUMENT");
+        \\assertThrows(function () { D.createPen(red, NaN); }, "HDDVD_E_ARGUMENT");
+        \\// color is the colour the pen or brush draws with, not the script's Color.
+        \\var pen = D.createPen(red, 1), brush = D.createSolidBrush(red);
+        \\red.setRGBA(0, 0, 255, 255);
+        \\assertEq(pen.color.red, 255); assertEq(pen.color.blue, 0); assertEq(brush.color.red, 255);
+        \\pen.color.green = 7; assertEq(pen.color.green, 0, "a copy each time");
+        \\assert(pen.color.equal(D.createColor(255, 0, 0, 255)));
+        \\// No exceptions: a brush without a Color fills nothing; a missing pen or shape draws nothing.
+        \\var none = D.createSolidBrush(null); assertEq(none.color, null);
+        \\area.drawRectangleCoord(null, none, 0, 0, 8, 8);
+        \\area.drawLine(null, D.createPoint(0, 0), D.createPoint(7, 7));
+        \\area.drawLineCoord(undefined, 0, 0, 7, 7);
+        \\area.drawLines(null, [D.createPoint(0, 0), D.createPoint(7, 7)]);
+        \\area.drawLines(pen, [D.createPoint(0, 0), 5]);
+        \\area.drawRectangle(pen, brush, null);
+        \\area.drawEllipse(pen, brush, {});
+        \\area.drawPolygon("pen", 3, [D.createPoint(0, 0), D.createPoint(7, 0), D.createPoint(7, 7)]);
+        \\assertThrows(function () { area.drawImage("file:///filecache/none.png", null, null); }, "HDDVD_E_FILENOTFOUND");
+        \\area.drawImage("file:///filecache/dot.png", null, null);
+        \\area.drawImage("file:///filecache/dot.png", "src", "dest");
+    , "draw.js");
+    const cv = s.apis.draw.areas.items[0].canvas;
+    for (cv.px) |p| try tt.expectEqual(@as(u8, 0), p[3]);
+    try e.run(
+        \\// The drawing uses the pen's colour; a huge rectangle is clipped (no overflow).
+        \\area.drawLineCoord(pen, 0, 0, 7, 0);
+        \\area.drawRectangleCoord(null, brush, 0, 4, 4294967295, 4294967295);
+        \\area.capture("file:///filecache/cap.cdw");
+        \\// An existing file cannot be created again (Z.7.5.2 step 1); nor outside the API Managed Area.
+        \\assertThrows(function () { area.capture("file:///filecache/cap.cdw"); }, "HDDVD_E_ARGUMENT");
+        \\assertThrows(function () { area.capture("file:///dvddisc/cap.cdw"); }, "HDDVD_E_ARGUMENT");
+    , "draw2.js");
+    try tt.expectEqual(Px{ 255, 0, 0, 255 }, cv.at(3, 0));
+    try tt.expectEqual(Px{ 255, 0, 0, 255 }, cv.at(7, 7));
+    try tt.expectEqual(@as(u8, 0), cv.at(3, 2)[3]);
+    try tt.expect(e.temp.exists("cap.cdw"));
 }
