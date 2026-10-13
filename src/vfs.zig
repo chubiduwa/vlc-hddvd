@@ -83,6 +83,14 @@ pub const Fs = struct {
         return img.file.pread(offset, buf) catch error.ReadFailed;
     }
 
+    /// The disc's label: an image's UDF volume identifier; empty for a folder.
+    pub fn label(fs: *const Fs) []const u8 {
+        return switch (fs.backend) {
+            .image => |*img| img.volume.label(),
+            .dir => "",
+        };
+    }
+
     pub fn isImage(fs: *const Fs) bool {
         return fs.backend == .image;
     }

@@ -668,7 +668,35 @@ fn updateTitleInfo(demux: *vlc.demux_t) void {
     if (flags == 0) return;
     p.cur_title = t;
     p.cur_seekpoint = sp;
-    hddvd_set_update(demux, flags, t, sp);
+    hddvd_set_update(demux, flags | vlc.INPUT_UPDATE_META, t, sp); // the media title names the chapter
+}
+
+/// The media's title: the disc's name (the playlist's, else the volume label), then the title playing and
+/// its chapter ("Disc – feature – Chapter 3"; a chapter's own name when it has one). Null without a name.
+pub fn mediaTitle(demux: *vlc.demux_t, buf: []u8) ?[*:0]const u8 {
+    const p = playerOf(demux);
+    const disc = if (p.pl.display_name.len > 0) p.pl.display_name else p.fs.label();
+    var w: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
+    w.writeAll(disc) catch {};
+    if (p.title) |i| {
+        const t = &p.pl.titles[i];
+        const name = titleLabel(t);
+        if (w.end > 0) w.writeAll(" \u{2013} ") catch {};
+        w.writeAll(name) catch {};
+        if (t.chapters.len > 1) {
+            const ch = t.chapterAt(titleNow(p));
+            const c = if (ch > 0 and ch <= t.chapters.len) &t.chapters[ch - 1] else null;
+            if (c != null and c.?.name.len > 0) w.print(" \u{2013} {s}", .{c.?.name}) catch {} else if (ch > 0) w.print(" \u{2013} Chapter {d}", .{ch}) catch {};
+        }
+    }
+    if (w.end == 0) return null;
+    buf[w.end] = 0;
+    return @ptrCast(buf.ptr);
+}
+
+/// What VLC's title menu calls a playlist title.
+fn titleLabel(t: *const xpl.Title) []const u8 {
+    return if (t.display_name.len > 0) t.display_name else if (t.description.len > 0) t.description else t.id;
 }
 
 // ---- demux loop ---------------------------------------------------------------------------------------------
@@ -1114,7 +1142,7 @@ pub fn getTitleInfo(demux: *vlc.demux_t, out_titles: *[*c][*c]vlc.input_title_t,
     for (titles, 1..) |t, i| {
         const it = vlc.vlc_input_title_New();
         it.*.i_length = p.tb().us(t.duration);
-        const label = if (t.display_name.len > 0) t.display_name else if (t.description.len > 0) t.description else t.id;
+        const label = titleLabel(&t);
         hddvd_input_title_set_flags(it, 0, z(&name_buf, label));
         const points: [*c][*c]vlc.seekpoint_t = @ptrCast(@alignCast(std.c.malloc(@max(1, t.chapters.len) * @sizeOf(*vlc.seekpoint_t)) orelse return vlc.VLC_ENOMEM));
         for (t.chapters, 0..) |c, k| {

@@ -777,6 +777,22 @@ fn setPosition(demux: *vlc.demux_t, f: f64) callconv(.c) c_int {
 
 const menu_points = [_][*:0]const u8{ "Resume", "Title", "Root", "Sub-picture", "Audio", "Angle", "Chapter" };
 
+extern fn hddvd_meta_set_title(meta: *anyopaque, title: [*:0]const u8) void;
+
+/// The media's title (VLC's window title): Advanced Content names the disc and what plays, Standard
+/// Content has only the image's volume label (a folder has none: VLC keeps the folder name).
+fn getMeta(demux: *vlc.demux_t, meta: *anyopaque) callconv(.c) c_int {
+    var buf: [512]u8 = undefined;
+    const title: ?[*:0]const u8 = if (adv.owns(demux)) adv.mediaTitle(demux, &buf) else blk: {
+        const l = sysOf(demux).fs.label();
+        if (l.len == 0) break :blk null;
+        const s = std.fmt.bufPrintSentinel(&buf, "{s}", .{l[0..@min(l.len, buf.len - 1)]}, 0) catch break :blk null;
+        break :blk s.ptr;
+    };
+    hddvd_meta_set_title(meta, title orelse return vlc.VLC_EGENERIC);
+    return vlc.VLC_SUCCESS;
+}
+
 /// VLC's title list: "HD DVD Menu" (interactive, one entry per menu) then the disc's titles and chapters.
 /// NOTE (Windows): VLC frees these with its own C runtime's free(); fine on macOS/Linux.
 fn getTitleInfo(demux: *vlc.demux_t, out_titles: *[*c][*c]vlc.input_title_t, out_count: *c_int) callconv(.c) c_int {
@@ -1041,6 +1057,7 @@ comptime {
     @export(&getTime, .{ .name = "hddvd_get_time", .visibility = hidden });
     @export(&setTime, .{ .name = "hddvd_set_time", .visibility = hidden });
     @export(&getTitleInfo, .{ .name = "hddvd_get_title_info", .visibility = hidden });
+    @export(&getMeta, .{ .name = "hddvd_get_meta", .visibility = hidden });
     @export(&setTitle, .{ .name = "hddvd_set_title", .visibility = hidden });
     @export(&setSeekpoint, .{ .name = "hddvd_set_seekpoint", .visibility = hidden });
     @export(&navControl, .{ .name = "hddvd_nav", .visibility = hidden });

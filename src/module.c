@@ -20,6 +20,7 @@
 #include <vlc_input.h>
 #include <vlc_stream.h>
 #include <vlc_dialog.h>
+#include <vlc_meta.h>
 
 /* Implemented in Zig (hddvd.zig). */
 int HddvdOpen(vlc_object_t *);
@@ -40,6 +41,7 @@ int hddvd_get_length(demux_t *, int64_t *);
 int hddvd_get_time(demux_t *, int64_t *);
 int hddvd_set_time(demux_t *, int64_t);
 int hddvd_get_title_info(demux_t *, input_title_t ***, int *);
+int hddvd_get_meta(demux_t *, vlc_meta_t *);
 int hddvd_set_title(demux_t *, int);
 int hddvd_set_seekpoint(demux_t *, int);
 int hddvd_nav(demux_t *, int action);
@@ -160,6 +162,9 @@ int HddvdDemuxControl(demux_t *demux, int query, va_list args)
             return hddvd_get_title_info(demux, titles, count);
         }
 
+        case DEMUX_GET_META:
+            return hddvd_get_meta(demux, va_arg(args, vlc_meta_t *));
+
         case DEMUX_SET_TITLE:
             return hddvd_set_title(demux, va_arg(args, int));
 
@@ -243,6 +248,12 @@ char *hddvd_inherit_string(vlc_object_t *obj, const char *name)
 void hddvd_free(void *p)
 {
     free(p);
+}
+
+/* The title VLC shows for the media (the window title). */
+void hddvd_meta_set_title(vlc_meta_t *meta, const char *title)
+{
+    vlc_meta_Set(meta, vlc_meta_Title, title);
 }
 
 /* An error dialog (the interface's, or only the log without one); the text is shown as is. */

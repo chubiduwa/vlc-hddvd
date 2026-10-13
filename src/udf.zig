@@ -63,6 +63,9 @@ pub const Volume = struct {
     /// Extents (absolute sectors) of the Metadata File, per partition reference that is a metadata map.
     meta_extents: [4][]Extent = .{ &.{}, &.{}, &.{}, &.{} },
     root: LongAd = undefined,
+    /// The Logical Volume Identifier (the disc's label), UTF-8.
+    label_buf: [3 * 127]u8 = undefined,
+    label_len: usize = 0,
 
     pub fn open(gpa: std.mem.Allocator, ctx: *anyopaque, readFn: ReadFn) Error!Volume {
         var v: Volume = .{ .gpa = gpa, .ctx = ctx, .readFn = readFn };
@@ -94,6 +97,7 @@ pub const Volume = struct {
             }
         }
         if (!have_lvd) return error.BadUdf;
+        v.label_len = decodeDstring(lvd[84..][0..128], &v.label_buf).len;
         if (try le32(&lvd, 212) != block_size) return error.Unsupported;
         const fsd = LongAd{ .lbn = try le32(&lvd, 252), .part_ref = try le16(&lvd, 256) };
 
@@ -133,6 +137,11 @@ pub const Volume = struct {
         if (try tagId(&blk) != 256) return error.BadUdf;
         v.root = .{ .lbn = try le32(&blk, 404), .part_ref = try le16(&blk, 408) };
         return v;
+    }
+
+    /// The disc's label (the Logical Volume Identifier), UTF-8; empty when there is none.
+    pub fn label(v: *const Volume) []const u8 {
+        return v.label_buf[0..v.label_len];
     }
 
     pub fn deinit(v: *Volume) void {
@@ -368,6 +377,29 @@ fn decodeName(raw: []const u8, out: *[255]u8) []const u8 {
     return out[0..n];
 }
 
+/// An OSTA CS0 d-string (its last byte is the length used, compression id included) as UTF-8: compression
+/// id 8 is Latin-1, 16 is UTF-16BE (unpaired surrogates become '?').
+fn decodeDstring(d: *const [128]u8, out: *[3 * 127]u8) []const u8 {
+    const used = @min(@as(usize, d[127]), 127);
+    if (used < 2) return out[0..0];
+    const raw = d[1..used];
+    var n: usize = 0;
+    switch (d[0]) {
+        8 => for (raw) |c| {
+            n += std.unicode.utf8Encode(c, out[n..]) catch unreachable;
+        },
+        16 => {
+            var i: usize = 0;
+            while (i + 1 < raw.len) : (i += 2) {
+                const c: u21 = @as(u21, raw[i]) << 8 | raw[i + 1];
+                n += std.unicode.utf8Encode(if (c >= 0xD800 and c < 0xE000) '?' else c, out[n..]) catch unreachable;
+            }
+        },
+        else => {},
+    }
+    return std.mem.trimEnd(u8, out[0..n], " ");
+}
+
 // ---- tests ------------------------------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -474,6 +506,9 @@ const TestImage = struct {
         put32(pd, 188, part_start);
         const lvd = img.block(33);
         put16(lvd, 0, 6);
+        lvd[84] = 8; // Logical Volume Identifier "TEST_DISC"
+        @memcpy(lvd[85..][0..9], "TEST_DISC");
+        lvd[84 + 127] = 10;
         put32(lvd, 212, block_size);
         const fs_ref: u16 = if (img.meta) 1 else 0; // partition reference of entries and directories
         put32(lvd, 252, 0); // File Set Descriptor at block 0
@@ -577,6 +612,8 @@ fn testReadFiles(meta: bool) !void {
     try testing.expectError(error.NotFound, v.lookup("HVDVD_TS/HV002I01.IFO"));
     try testing.expectError(error.NotFound, v.lookup("HVDVD_TS/TINY/X"));
 
+    try testing.expectEqualStrings("TEST_DISC", v.label());
+
     const names = try v.listDir(testing.allocator, "HVDVD_TS");
     defer freeNames(testing.allocator, names);
     try testing.expectEqual(2, names.len);
@@ -599,6 +636,22 @@ test "an image without a Volume Recognition Sequence is not UDF" {
     @memset(img.block(17), 0); // drop NSR03
     try testing.expect(!Volume.probe(&img, TestImage.read));
     try testing.expectError(error.NotUdf, Volume.open(testing.allocator, &img, TestImage.read));
+}
+
+test "CS0 d-strings: the volume label" {
+    var out: [3 * 127]u8 = undefined;
+    var d: [128]u8 = @splat(0);
+    d[0] = 8;
+    @memcpy(d[1..6], "CAF\xc9 ");
+    d[127] = 6;
+    try testing.expectEqualStrings("CAF\u{c9}", decodeDstring(&d, &out)); // Latin-1, trailing space trimmed
+    @memset(&d, 0);
+    d[0] = 16;
+    @memcpy(d[1..7], "\x00A\x00\xe9\xd8\x00");
+    d[127] = 7;
+    try testing.expectEqualStrings("A\u{e9}?", decodeDstring(&d, &out));
+    d[127] = 0;
+    try testing.expectEqualStrings("", decodeDstring(&d, &out));
 }
 
 test "CS0 names: 8-bit and 16-bit compression" {
