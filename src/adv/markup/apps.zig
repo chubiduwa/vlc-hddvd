@@ -460,11 +460,12 @@ pub const Apps = struct {
         return true;
     }
 
-    /// inactivate(): not the Playlist Application, and only while running.
+    /// inactivate(): not the Playlist Application, and only while running. The application stops being active at
+    /// once and unloads at the next tick (lifecycle): it may be the caller, whose script is still running.
     pub fn inactivate(s: *Apps, a: *App) bool {
+        _ = s;
         if (a.kind == .playlist or !a.active()) return false;
         a.ready = false;
-        s.shutdown(a, false);
         return true;
     }
 
@@ -497,11 +498,13 @@ pub const Apps = struct {
             s.sendEnd(a);
             return;
         }
-        a.ending = false;
         s.unload(a);
-        var any = false;
-        for (s.records.items) |b| any = any or b.ending;
-        if (!any) if (s.eng) |e| e.command(.{ .hold = false });
+    }
+
+    /// The title, held while applications handle Application End, goes on once none is left ending.
+    fn releaseHold(s: *Apps) void {
+        for (s.records.items) |b| if (b.ending) return;
+        if (s.eng) |e| e.command(.{ .hold = false });
     }
 
     /// Loads an application: manifest, scripts in order, then the first markup page (§8.4.5).
@@ -569,6 +572,7 @@ pub const Apps = struct {
     /// Unloads an application: its script context and page go; the record stays.
     fn unload(s: *Apps, a: *App) void {
         if (a.loaded) s.log("application {s} unloads", .{a.src});
+        const was_ending = a.ending;
         // Events the application had not handled yet go on to the others (an event goes to every application
         // in priority order, §8.3.5). A disc saves its settings to its playlist application right before a
         // title jump that unloads it; dropping the event lost them.
@@ -607,6 +611,8 @@ pub const Apps = struct {
         a.ending = false;
         a.numbered = false;
         a.look = 0;
+        // Ended or not (a title change unloads every title application), it no longer holds the title.
+        if (was_ending and !s.closing) s.releaseHold();
     }
 
     /// A copy of `begin_uids`, for sendSystem (which takes it).
@@ -769,6 +775,9 @@ pub const Apps = struct {
         var order: std.ArrayList(*App) = .empty;
         defer order.deinit(s.gpa);
         s.priority(&order);
+        // An application handling Application End is no longer active (it left its valid period) but its items
+        // still run, the Application End delivery among them: last, after the active applications.
+        for (s.records.items) |a| if (a.ending and a.script != null and std.mem.indexOfScalar(*App, order.items, a) == null) order.append(s.gpa, a) catch {};
         for (order.items) |a| {
             const sc = a.script orelse continue;
             sc.runTimers();
@@ -1646,6 +1655,87 @@ test "scripts: lifecycle, events, input and the Animated Property API" {
     try js_testing.run(sc.cx, "document.b.style.unsetProperty('x');", "unset.js");
     step(&e, &now, &t);
     try testing.expectEqual(@as(f32, 0), b.box.x);
+}
+
+test "applications: inactivating itself, Application End, queued DOM events" {
+    const gpa = testing.allocator;
+    var pl = try xpl.parse(gpa,
+        \\<Playlist xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Playlist" majorVersion="1" minorVersion="0">
+        \\ <Configuration><StreamingBuffer size="0"/><Aperture size="1920x1080"/><MainVideoDefaultColor color="108080"/></Configuration>
+        \\ <MediaAttributeList/>
+        \\ <TitleSet timeBase="60fps">
+        \\  <Title id="t1" titleNumber="1" titleDuration="00:01:00:00">
+        \\   <ApplicationSegment id="self" src="file:///dvddisc/ADV_OBJ/self.xmf" titleTimeBegin="00:00:00:00" titleTimeEnd="00:01:00:00" zOrder="0" autorun="true"/>
+        \\   <ApplicationSegment id="ending" src="file:///dvddisc/ADV_OBJ/end.xmf" titleTimeBegin="00:00:00:00" titleTimeEnd="00:00:01:00" zOrder="1" autorun="true"/>
+        \\   <ApplicationSegment id="late" src="file:///dvddisc/ADV_OBJ/late.xmf" titleTimeBegin="00:00:00:40" titleTimeEnd="00:01:00:00" zOrder="2" autorun="true"/>
+        \\  </Title>
+        \\ </TitleSet>
+        \\</Playlist>
+    );
+    defer pl.deinit();
+    const page = "<root xmlns=\"http://www.dvdforum.org/2005/ihd\"><body><button id=\"a\"/></body></root>";
+    var files: Files = .{
+        .files = &.{
+            .{ "file:///dvddisc/ADV_OBJ/self.xmf", "<Application xmlns=\"http://www.dvdforum.org/2005/HDDVDVideo/Manifest\"><Region x=\"0\" y=\"0\" width=\"10\" height=\"10\"/><Script src=\"self.js\"/><Markup src=\"p.xmu\"/></Application>" },
+            // It inactivates itself from a timer, then goes on: the script must not be freed under it.
+            .{
+                "file:///dvddisc/ADV_OBJ/self.js",
+                \\var after = 0;
+                \\var tm = createTimer("00:00:00:05", 1, function () { thisAdvancedApplication.inactivate(); after = 1; var s = "still running " + after; });
+                \\tm.enabled = true;
+            },
+            .{ "file:///dvddisc/ADV_OBJ/end.xmf", "<Application xmlns=\"http://www.dvdforum.org/2005/HDDVDVideo/Manifest\"><Region x=\"0\" y=\"0\" width=\"10\" height=\"10\"/><Script src=\"end.js\"/><Markup src=\"p.xmu\"/></Application>" },
+            .{ "file:///dvddisc/ADV_OBJ/end.js", "addEventListener(\"application_end\", function (e) {}, false);" },
+            .{ "file:///dvddisc/ADV_OBJ/late.xmf", "<Application xmlns=\"http://www.dvdforum.org/2005/HDDVDVideo/Manifest\"><Region x=\"0\" y=\"0\" width=\"10\" height=\"10\"/><Script src=\"late.js\"/><Markup src=\"p.xmu\"/></Application>" },
+            // Starts 40 ticks into the title: an event it dispatches is handled at once, on its own clock.
+            .{
+                "file:///dvddisc/ADV_OBJ/late.js",
+                \\var got = 0;
+                \\setMarkupLoadedHandler(function () {
+                \\  var a = document.getElementById("a");
+                \\  a.addEventListener("ping", function () { got += 1; }, false);
+                \\  var ev = document.createEvent("Events"); ev.initEvent("ping", true, true); a.dispatchEvent(ev);
+                \\});
+            },
+            .{ "file:///dvddisc/ADV_OBJ/p.xmu", page },
+        },
+    };
+    var e = engine.Engine.init(gpa, 1920, 1080, 60);
+    defer e.deinit();
+    e.setScene(try Apps.create(gpa, .{ .pl = &pl, .loader = .{ .ctx = &files, .read = Files.read }, .menu_language = "en" }, 1920, 1080), 0);
+    const s: *Apps = @ptrCast(@alignCast(e.scene.?.ctx));
+    var now: i64 = 0;
+    var t: u64 = 0;
+    try e.post(.{ .title_begin = .{ .title = 0, .duration = 3600 } });
+    _ = e.step(now, 0);
+    const self_app = s.records.items[0];
+    const ending = s.records.items[1];
+    const late = s.records.items[2];
+    try testing.expect(self_app.active() and ending.active() and !late.valid);
+    while (t < 44) {
+        now += 16_700;
+        t += 1;
+        _ = e.step(now, t);
+    }
+    // Inactivated by its own timer: unloaded at the next tick, not during its call.
+    try testing.expect(!self_app.loaded and !self_app.active());
+    // The late application handled its own event within a tick of loading.
+    try testing.expect(late.active());
+    try js_testing.run(late.script.?.cx, "assertEq(got, 1, \"the event was handled\");", "late.js");
+    // The ending application leaves its valid period at 1 s: Application End runs, it unloads and the title
+    // is released.
+    while (t < 70) {
+        now += 16_700;
+        t += 1;
+        _ = e.step(now, t);
+    }
+    try testing.expect(!ending.loaded and !ending.ending);
+    var last_hold: ?bool = null;
+    for (e.outbox.items) |cmd| switch (cmd) {
+        .hold => |on| last_hold = on,
+        else => {},
+    };
+    try testing.expectEqual(@as(?bool, false), last_hold);
 }
 
 const js_testing = @import("../script/js.zig").testing;

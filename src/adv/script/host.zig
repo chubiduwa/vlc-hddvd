@@ -639,7 +639,8 @@ pub const Script = struct {
             },
         }
         errdefer s.cx.free(hold);
-        try s.post(.{ .local = .{ .ev = s.cx.dup(ev), .path = try path.toOwnedSlice(s.gpa), .app_top = app_top, .hold = hold } }, .app, s.world.tick, null);
+        // Now on the application clock, which starts when the application loads.
+        try s.post(.{ .local = .{ .ev = s.cx.dup(ev), .path = try path.toOwnedSlice(s.gpa), .app_top = app_top, .hold = hold } }, .app, s.appTicks(), null);
     }
 
     /// Queues a work item (§8.5) on `clock` from `begin` until `end` (null: never dropped).
