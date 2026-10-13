@@ -375,7 +375,8 @@ fn removeChild(n: *Node, cx: *js.Context, old_v: Value) js.Error!Value {
     return cx.dup(old_v);
 }
 
-fn cloneNode(n: *Node, cx: *js.Context, deep: bool) js.Error!Value {
+fn cloneNode(n: *Node, cx: *js.Context, deep_arg: ?bool) js.Error!Value {
+    const deep = deep_arg orelse false; // DOM2 ECMAScript binding: a missing boolean is false
     if (n.type == .document) return events.throwDom(cx, .not_supported);
     return wrap(scriptOf(cx), try n.clone(deep));
 }
@@ -415,12 +416,14 @@ fn hasFeatureImpl(feature: []const u8, version: ?[]const u8) bool {
 
 // EventTarget (DOM2 Events §1.3.1).
 
-fn addEventListener(n: *Node, cx: *js.Context, type_: []const u8, f: Value, capture: bool) js.Error!void {
+fn addEventListener(n: *Node, cx: *js.Context, type_: []const u8, f: Value, capture_arg: ?bool) js.Error!void {
+    const capture = capture_arg orelse false; // DOM2 ECMAScript binding: a missing boolean is false
     if (c.JS_IsNull(f) or c.JS_IsUndefined(f)) return;
     try scriptOf(cx).reg.add(cx, n, type_, f, capture);
 }
 
-fn removeEventListener(n: *Node, cx: *js.Context, type_: []const u8, f: Value, capture: bool) void {
+fn removeEventListener(n: *Node, cx: *js.Context, type_: []const u8, f: Value, capture_arg: ?bool) void {
+    const capture = capture_arg orelse false; // DOM2 ECMAScript binding: a missing boolean is false
     scriptOf(cx).reg.remove(cx, n, type_, f, capture);
 }
 
@@ -767,8 +770,12 @@ fn getDocumentElement(n: *Node, cx: *js.Context) js.Error!Value {
 
 fn createElement(n: *Node, cx: *js.Context, name: []const u8) js.Error!Value {
     if (!isXmlName(name)) return events.throwDom(cx, .invalid_character);
-    const e = try n.doc.createElementNS("", name);
-    return wrap(scriptOf(cx), e);
+    // DOM2 gives no namespace. On the application's page, an unprefixed name takes the namespace of the page's
+    // root element instead, so that `document.createElement("div")` makes an element the page lays out.
+    const s = scriptOf(cx);
+    const ns = if (s.isPageDoc(n.doc) and std.mem.indexOfScalar(u8, name, ':') == null) if (n.doc.node.firstElement()) |r| r.ns else "" else "";
+    const e = try n.doc.createElementNS(ns, name);
+    return wrap(s, e);
 }
 
 fn createElementNS(n: *Node, cx: *js.Context, ns_v: js.NullStr, qname: []const u8) js.Error!Value {
@@ -817,7 +824,8 @@ fn createEntityReference(_: *Node, cx: *js.Context, _: []const u8) js.Error!Valu
     return events.throwDom(cx, .not_supported);
 }
 
-fn importNode(n: *Node, cx: *js.Context, v: Value, deep: bool) js.Error!Value {
+fn importNode(n: *Node, cx: *js.Context, v: Value, deep_arg: ?bool) js.Error!Value {
+    const deep = deep_arg orelse false; // DOM2 ECMAScript binding: a missing boolean is false
     if (cx.unwrap(Attr, v)) |a| return Attr.detached(scriptOf(cx), n.doc, a.ns, a.prefix, a.local) catch |e| e;
     const src = nodeOf(cx, v) orelse return error.TypeError;
     if (src.type == .document) return events.throwDom(cx, .not_supported);

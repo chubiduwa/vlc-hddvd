@@ -14,6 +14,7 @@ const vlc = @import("vlc");
 const vfs = @import("../vfs.zig");
 const spudec = @import("../spudec.zig");
 const xpl = @import("xpl.zig");
+const player_api = @import("script/player_api.zig");
 const vti_mod = @import("vti.zig");
 const tmap = @import("tmap.zig");
 const aca = @import("aca.zig");
@@ -298,7 +299,8 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
     if (p.pres) |pr| {
         pr.setAperture(p.pl.aperture_w, p.pl.aperture_h);
         pr.time_base = p.pl.time_base;
-        pr.outer = .{ @intCast(p.pl.default_color >> 16), @intCast((p.pl.default_color >> 8) & 0xff), @intCast(p.pl.default_color & 0xff) };
+        // MainVideoDefaultColor is Y, Cr, Cb; the presentation's colour is Y, Cb, Cr.
+        pr.outer = .{ @intCast(p.pl.default_color >> 16), @intCast(p.pl.default_color & 0xff), @intCast((p.pl.default_color >> 8) & 0xff) };
         debugOptions(o, pr);
     }
     demux.p_sys = @ptrCast(p);
@@ -324,7 +326,7 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
             defer hddvd_free(str);
             p.markup_show = gpa.dupe(u8, std.mem.span(str)) catch &.{};
         }
-        startHost(demux, pr);
+        startHost(demux, pr, null);
     }
     startPlaylist(demux);
     if (p.ps == null and !p.stopped) {
@@ -335,7 +337,7 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
 }
 
 /// Starts the application engine for the current playlist.
-fn startHost(demux: *vlc.demux_t, pr: *present.Presentation) void {
+fn startHost(demux: *vlc.demux_t, pr: *present.Presentation, kept: ?*player_api.Kept) void {
     const p = playerOf(demux);
     const o = asObj(demux);
     p.host = host_mod.Host.create(o, pr, p.mouse, .{
@@ -352,6 +354,7 @@ fn startHost(demux: *vlc.demux_t, pr: *present.Presentation) void {
             .content_id = p.content_id[0..p.content_id_len],
             .has_standard_content = p.has_standard_content,
             .script_trace = hddvd_inherit_bool(o, "hddvd-script-trace"),
+            .kept = kept,
         },
     }) catch |err| blk: {
         log(o, vlc.VLC_MSG_ERR, @src(), "cannot start the application engine (%s)", .{@errorName(err).ptr});
@@ -820,7 +823,7 @@ fn runCommands(demux: *vlc.demux_t) void {
         .layout => |l| setLayout(demux, l),
         .outer_color => |col| if (p.pres) |pr| {
             pr.lockIt();
-            pr.outer = col;
+            pr.outer = .{ col[0], col[2], col[1] }; // setOuterFrameColor(y, cr, cb) to Y, Cb, Cr
             pr.unlock();
         },
         .sub_alpha => |a| if (p.pres) |pr| pr.setSubAlpha(a),
@@ -974,7 +977,10 @@ fn loadPlaylist(demux: *vlc.demux_t, u: []const u8) !void {
     var pl = try xpl.parse(gpa, aca.unwrap(bytes));
     errdefer pl.deinit();
     const new_uri = try gpa.dupe(u8, u);
-    if (p.host) |h| h.destroy();
+    // A soft reset (§4.3.22.3): what Annex W keeps goes to the new playlist's applications.
+    var kept: player_api.Kept = .{};
+    defer kept.deinit(gpa);
+    if (p.host) |h| h.destroyKeeping(&kept);
     p.host = null;
     p.pl.deinit();
     p.pl = pl;
@@ -993,7 +999,7 @@ fn loadPlaylist(demux: *vlc.demux_t, u: []const u8) !void {
         pr.time_base = p.pl.time_base;
         pr.setSubLayout(null, 0);
         pr.setMainPlace(.fit);
-        startHost(demux, pr);
+        startHost(demux, pr, &kept);
     }
     p.cur_title = -1;
     hddvd_set_update(demux, vlc.INPUT_UPDATE_TITLE_LIST, 0, 0);

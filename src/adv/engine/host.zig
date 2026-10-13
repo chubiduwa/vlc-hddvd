@@ -9,6 +9,7 @@ const vlc = @import("vlc");
 const engine = @import("engine.zig");
 const testpage = @import("testpage.zig");
 const apps = @import("../markup/apps.zig");
+const player_api = @import("../script/player_api.zig");
 const planes = @import("../planes.zig");
 const present = @import("../present.zig");
 const mix = @import("../mix.zig");
@@ -42,6 +43,8 @@ pub const Host = struct {
     /// The demux's mouse handle (nav_glue.c), or null.
     mouse: ?*anyopaque,
     thread: vlc.vlc_thread_t = undefined,
+    /// The scene is the disc's applications (not the test page).
+    has_apps: bool = false,
     lock: vlc.vlc_mutex_t = undefined,
     wake: vlc.vlc_cond_t = undefined,
 
@@ -77,6 +80,7 @@ pub const Host = struct {
             c.log = logApps;
             c.log_ctx = obj;
             h.eng.setScene(try apps.Apps.create(gpa, c, pres.aperture_w, pres.aperture_h), hddvd_now_us());
+            h.has_apps = true;
         }
         pres.ref();
         vlc.vlc_mutex_init(&h.lock);
@@ -91,11 +95,20 @@ pub const Host = struct {
     }
 
     pub fn destroy(h: *Host) void {
+        h.destroyKeeping(null);
+    }
+
+    /// `destroy`, first taking what a soft reset keeps into `kept` (Playlist.load: the next playlist's World gets
+    /// it).
+    pub fn destroyKeeping(h: *Host, kept: ?*player_api.Kept) void {
         vlc.vlc_mutex_lock(&h.lock);
         h.stop = true;
         vlc.vlc_cond_signal(&h.wake);
         vlc.vlc_mutex_unlock(&h.lock);
         vlc.vlc_join(h.thread, null);
+        if (kept) |k| if (h.has_apps) if (h.eng.scene) |sc| {
+            k.* = apps.Apps.takeKept(sc.ctx);
+        };
         h.fx.deinit();
         vlc.vlc_cond_destroy(&h.wake);
         vlc.vlc_mutex_destroy(&h.lock);

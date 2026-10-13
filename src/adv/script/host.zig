@@ -956,12 +956,14 @@ fn computeImplicitNav(s: *Script) js.Error!void {
     a.renumber = true;
 }
 
-fn addEventListener(s: *Script, type_: []const u8, f: Value, capture: bool) js.Error!void {
+fn addEventListener(s: *Script, type_: []const u8, f: Value, capture_arg: ?bool) js.Error!void {
+    const capture = capture_arg orelse false; // DOM2 ECMAScript binding: a missing boolean is false
     if (c.JS_IsNull(f) or c.JS_IsUndefined(f)) return;
     try s.reg.add(s.cx, s, type_, f, capture);
 }
 
-fn removeEventListener(s: *Script, type_: []const u8, f: Value, capture: bool) void {
+fn removeEventListener(s: *Script, type_: []const u8, f: Value, capture_arg: ?bool) void {
+    const capture = capture_arg orelse false; // DOM2 ECMAScript binding: a missing boolean is false
     s.reg.remove(s.cx, s, type_, f, capture);
 }
 
@@ -1209,8 +1211,6 @@ pub const Timer = struct {
     referenced: bool = true,
     queued: bool = false,
     discard: bool = false,
-    /// The Title Timeline was not at normal speed at the last count (trick play resets the count).
-    was_trick: bool = false,
     owner: *Script,
 
     fn make(s: *Script, kind: @FieldType(Timer, "kind"), interval_str: []const u8, interval_frames: u64, f: Value) js.Error!Value {
@@ -1262,19 +1262,9 @@ pub const Timer = struct {
         const now = tm.clock(s);
         defer tm.last = now;
         if (!tm.enabled) return;
-        if (tm.kind == .title) {
-            // Title timers stop while the title is held and do not fire in trick play; the count restarts
-            // when playback resumes.
-            if (!s.world.title_running) {
-                tm.was_trick = true;
-                return;
-            }
-            if (tm.was_trick) {
-                tm.was_trick = false;
-                tm.count = 0;
-                return;
-            }
-        }
+        // Title timers stop while the title is held (paused) and keep their count (Z.2.2). Only trick play would
+        // restart it, and this player has none.
+        if (tm.kind == .title and !s.world.title_running) return;
         const last = tm.last orelse now;
         tm.count += now -| last;
         if (tm.count < tm.interval or tm.queued) return;

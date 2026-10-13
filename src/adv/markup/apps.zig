@@ -66,6 +66,8 @@ pub const Config = struct {
     has_standard_content: bool = false,
     /// Log every exception scripts throw, caught or not (debugging).
     script_trace: bool = false,
+    /// What the previous playlist's World kept through a soft reset (taken: left empty).
+    kept: ?*player_api.Kept = null,
 };
 
 /// Decoded images and fonts of one application, by absolute URI (null: could not be loaded).
@@ -294,6 +296,10 @@ pub const Apps = struct {
         if (cfg.menu_language.len >= 2) world.model.menu_language = .{ std.ascii.toLower(cfg.menu_language[0]), std.ascii.toLower(cfg.menu_language[1]) };
         world.model.sprm[0] = (@as(u16, world.model.menu_language[0]) << 8) | world.model.menu_language[1];
         player_api.titleBegins(world);
+        if (cfg.kept) |k| {
+            k.give(&world.model);
+            s.app_group = k.app_group;
+        }
         return .{ .ctx = s, .vtable = &vtable };
     }
 
@@ -357,7 +363,8 @@ pub const Apps = struct {
     /// The title changed: its applications replace the last title's; the Playlist Application stays
     /// (outside the First Play title). Title End goes to what remains, Title Begin to what is loaded then
     /// (§8.3.1 cases 1 and 2).
-    fn titleChanged(s: *Apps, e: *engine.Engine) void {
+    fn titleChanged(s: *Apps, e: *engine.Engine, c: engine.Clocks) void {
+        for (s.records.items) |a| if (!(a.kind == .playlist and e.title != null)) s.endForTitle(a, c);
         var i: usize = 0;
         while (i < s.records.items.len) {
             const a = s.records.items[i];
@@ -493,6 +500,29 @@ pub const Apps = struct {
     }
 
     /// Application End was delivered: unless cancelled, the application unloads and the title goes on.
+    /// A title application whose title ends (§8.3.1 Case 2): the work already queued for it runs (the Clip End
+    /// events among them), then Application End if it listens for it, before it unloads. The title has already
+    /// changed, so Application End cannot be cancelled here.
+    fn endForTitle(s: *Apps, a: *App, c: engine.Clocks) void {
+        const sc = a.script orelse return;
+        if (!a.active() and !a.ending) return;
+        const now = s.nowFor(a, c);
+        sc.queue.mark(s.gpa, now) catch {};
+        while (a.script == sc) {
+            const job = sc.queue.next(now, sc, dropJob) orelse break;
+            switch (job) {
+                .delivery => |d| s.processDelivery(a, d),
+                else => sc.run(job),
+            }
+        }
+        if (a.script != sc or a.end_sent or !sc.listens("application_end")) return;
+        const d = host.Delivery.create(s.gpa, s.world.rt, .system, .{ .kind = .application, .type = "application_end", .id = if (a.id.len > 0) a.id else null }) catch return;
+        d.recipients = d.arena.allocator().dupe(u64, &.{sc.uid}) catch null;
+        s.timeOf(d);
+        a.end_sent = true;
+        s.processDelivery(a, d);
+    }
+
     fn endDelivered(s: *Apps, a: *App, prevented: bool) void {
         if (prevented) {
             s.sendEnd(a);
@@ -615,6 +645,12 @@ pub const Apps = struct {
         if (was_ending and !s.closing) s.releaseHold();
     }
 
+    /// The values a soft reset keeps (the scene is about to go; the engine thread has stopped).
+    pub fn takeKept(ctx: *anyopaque) player_api.Kept {
+        const s: *Apps = @ptrCast(@alignCast(ctx));
+        return player_api.Kept.take(&s.world.model, s.app_group);
+    }
+
     /// A copy of `begin_uids`, for sendSystem (which takes it).
     pub fn beginUids(s: *Apps) ?[]const u64 {
         const u = s.begin_uids orelse return null;
@@ -702,12 +738,14 @@ pub const Apps = struct {
         if (!e.in_title) return false;
         var changed = false;
         if (e.title_serial != s.title_serial) {
+            // The title being left first (§8.3.1 Case 2): its clips end, then its applications.
+            if (s.title_serial > 0) player_api.titleEnds(w);
             w.title_index = e.title;
             player_api.titleBegins(w);
             s.jump_serial = e.jump_serial;
             s.engine_state = e.play_state;
             s.reported_state = player_api.PlayState.play;
-            s.titleChanged(e);
+            s.titleChanged(e, c);
             changed = true;
         }
         // The player's own pauses (VLC's pause key) change the play state too.
@@ -1638,6 +1676,9 @@ test "scripts: lifecycle, events, input and the Animated Property API" {
         \\assertEq(b.core.id, "b"); assertEq(document.getProperties(b, "http://www.dvdforum.org/2005/ihd#style").namespace, "http://www.dvdforum.org/2005/ihd#style");
         \\// A variable the script sets starts the markup's timing (Z.12.7.2).
         \\document.setXPathVariable("Mode", "on"); assertEq(document.getXPathVariable("Mode"), "on");
+        \\// createElement on the page takes its namespace; cloneNode() without its boolean; a new element's style.
+        \\var dv = document.createElement("div"); assertEq(dv.namespaceURI, "http://www.dvdforum.org/2005/ihd");
+        \\assert(b.cloneNode() !== null); b.parentNode.appendChild(dv); assertEq(dv.style.getProperty("opacity"), "1");
     , "check.js");
     step(&e, &now, &t);
     step(&e, &now, &t);

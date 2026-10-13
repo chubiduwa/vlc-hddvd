@@ -135,6 +135,7 @@ pub const Overrides = struct {
         _ = o.arena.reset(.retain_capacity);
         const a = o.arena.allocator();
         p.script.clearRetainingCapacity();
+        p.core_values.clearRetainingCapacity();
         o.applied = o.list.items.len > 0;
         for (o.list.items) |*x| {
             const el = page_mod.Page.elemOf(x.node) orelse continue;
@@ -145,7 +146,8 @@ pub const Overrides = struct {
                     p.script.put(p.gpa, .{ .elem = el, .prop = prop }, v) catch {};
                 },
                 .state => s.applyState(p, el, std.meta.stringToEnum(StateName, x.name) orelse continue, v),
-                .core => {},
+                // A <param>'s value: what the object reads (paint.param).
+                .core => if (std.mem.eql(u8, x.name, "value")) p.core_values.put(p.gpa, x.node, v) catch {},
             }
         }
     }
@@ -198,8 +200,16 @@ pub const Prop = struct {
             .style => {
                 const prop = style.Prop.byName(name) orelse return error.Argument;
                 if (s.overrides.valueOf(a, p.node, .style, name, s.appTicks())) |v| return cx.string(v);
-                const el = page_mod.Page.elemOf(p.node) orelse return cx.string("");
                 const pg = s.page() orelse return cx.string("");
+                // An element the script added this tick is not in the page yet: sync it now (the engine does
+                // after the scripts). One outside the page reads the property's initial value (§7.5.2.4.3.2).
+                if (page_mod.Page.elemOf(p.node) == null) pg.sync() catch {};
+                const el = page_mod.Page.elemOf(p.node) orelse {
+                    var w: std.Io.Writer.Allocating = .init(a);
+                    const init = style.Style.initial(pg.aperture_h);
+                    style.format(&w.writer, &init, prop, 0) catch return cx.string("");
+                    return cx.string(w.written());
+                };
                 // backgroundImage with absolute URIs: §7.5.2.4.3.2 says the specified URI, but discs
                 // rebuild image names by cutting the value at its last "/", which only works with resolved
                 // URIs (what the players it was made for must have returned) [disc].
@@ -231,6 +241,11 @@ pub const Prop = struct {
             .core => {
                 if (!isCore(name)) return error.Argument;
                 if (s.overrides.valueOf(a, p.node, .core, name, s.appTicks())) |v| return cx.string(v);
+                // A <param>'s content wins over its value attribute (§7.5.3.1.13).
+                if (std.mem.eql(u8, name, "value") and p.node.is(page_mod.core_ns, "param")) if (p.node.first) |t| {
+                    const txt = std.mem.trim(u8, t.data, " \t\r\n");
+                    if (t.type == .text and txt.len > 0) return cx.string(txt);
+                };
                 return cx.string(coreAttr(p.node, name) orelse "");
             },
         }

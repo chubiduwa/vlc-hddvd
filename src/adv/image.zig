@@ -12,19 +12,21 @@ pub const Error = error{ BadImage, OutOfMemory };
 /// Largest side accepted (the aperture is at most 1920×1080; images may be bigger and cropped, within reason).
 pub const max_side = 8192;
 
-pub const Kind = enum { png, jpeg, mng, unknown };
+pub const Kind = enum { png, jpeg, mng, cif, unknown };
 
 pub fn kindOf(bytes: []const u8) Kind {
     if (std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n")) return .png;
     if (std.mem.startsWith(u8, bytes, "\x8aMNG\r\n\x1a\n")) return .mng;
     if (std.mem.startsWith(u8, bytes, "\xff\xd8\xff")) return .jpeg;
+    if (std.mem.startsWith(u8, bytes, "HDDVDCIF")) return .cif;
     return .unknown;
 }
 
-/// Decodes a PNG or JPEG into a premultiplied canvas (caller frees it).
+/// Decodes a PNG, a JPEG or a captured drawing into a premultiplied canvas (caller frees it).
 pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!raster.Canvas {
     switch (kindOf(bytes)) {
         .png, .jpeg => {},
+        .cif => return decodeCapture(gpa, bytes),
         else => return error.BadImage,
     }
     if (bytes.len > std.math.maxInt(c_int)) return error.BadImage;
@@ -37,6 +39,26 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!raster.Canvas {
     const c = try raster.Canvas.init(gpa, @intCast(w), @intCast(h));
     const src: [*]const [4]u8 = @ptrCast(px);
     for (c.px, src[0..c.px.len]) |*d, s| d.* = (raster.Color{ .r = s[0], .g = s[1], .b = s[2], .a = s[3] }).premultiplied();
+    return c;
+}
+
+/// The size of the Capture Drawing Format's header (§6.5.1.4.1).
+pub const capture_header = 8 + 2 + 1 + 2 + 2 + 49;
+
+/// The Capture Drawing Format (§6.5.1.4): "HDDVDCIF", the version, ENC_TY 02h (RGBA), the width and height
+/// (big-endian), then each pixel as B, G, R, A (a big-endian word with B in its top byte, §6.5.1.4.2), unpremultiplied.
+fn decodeCapture(gpa: std.mem.Allocator, bytes: []const u8) Error!raster.Canvas {
+    if (bytes.len < capture_header or bytes[10] != 0x02) return error.BadImage;
+    const w = std.mem.readInt(u16, bytes[11..13], .big);
+    const h = std.mem.readInt(u16, bytes[13..15], .big);
+    if (w == 0 or h == 0 or w > max_side or h > max_side) return error.BadImage;
+    const n = @as(usize, w) * h;
+    if (bytes.len < capture_header + n * 4) return error.BadImage;
+    const c = try raster.Canvas.init(gpa, w, h);
+    for (c.px, 0..) |*d, i| {
+        const q = bytes[capture_header + i * 4 ..][0..4];
+        d.* = (raster.Color{ .r = q[2], .g = q[1], .b = q[0], .a = q[3] }).premultiplied();
+    }
     return c;
 }
 

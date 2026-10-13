@@ -252,27 +252,33 @@ fn hdOf(dst: Layout, c: u32) []const usize {
 }
 
 /// Per-channel gains for `dst` (in its order) from HD DVD volumes (0–255 each).
+/// An HD DVD level (Z.10.23): 255 is 0 dB and each step below is -0.5 dB; 0 is silence.
+pub fn levelGain(p: u8) f32 {
+    if (p == 0) return 0;
+    return std.math.pow(f32, 10, (@as(f32, @floatFromInt(p)) - 255) / 40);
+}
+
 pub fn hdGains(dst: Layout, vol: [hd_channels]u8) [max_channels]f32 {
     var g: [max_channels]f32 = @splat(1);
     for (dst.ch[0..dst.n], 0..) |c, i| {
         const hd = hdOf(dst, c);
         if (hd.len == 0) continue;
         var sum: f32 = 0;
-        for (hd) |k| sum += @floatFromInt(vol[k]);
-        g[i] = sum / @as(f32, @floatFromInt(hd.len)) / 255;
+        for (hd) |k| sum += levelGain(vol[k]);
+        g[i] = sum / @as(f32, @floatFromInt(hd.len));
     }
     return g;
 }
 
-/// A mix-down of a mono or stereo source into `dst` from HD DVD gains (`rows[0]` from the left input, `rows[1]`
-/// from the right, 0–255 per output channel). A mono source feeds both rows at -3 dB; other source channels fold
-/// into left and right first.
+/// A mix-down of a mono or stereo source into `dst` from HD DVD levels (`rows[0]` from the left input, `rows[1]`
+/// from the right, 0–255 per output channel, see `levelGain`). A mono source is the left input (Z.10.25.3,
+/// Z.10.26.3); other source channels fold into left and right first.
 pub fn hdMatrix(src: Layout, dst: Layout, rows: [2][hd_channels]u8) Matrix {
     var m: Matrix = .{};
     // Source channels into the two HD DVD inputs.
     var into: [max_channels][2]f32 = @splat(.{ 0, 0 });
     if (src.n == 1) {
-        into[0] = .{ std.math.sqrt1_2, std.math.sqrt1_2 };
+        into[0] = .{ 1, 0 };
     } else {
         const stereo = Layout.of(chan.left | chan.right);
         const fold = Matrix.default(src, stereo);
@@ -282,7 +288,7 @@ pub fn hdMatrix(src: Layout, dst: Layout, rows: [2][hd_channels]u8) Matrix {
         const hd = hdOf(dst, c);
         for (0..src.n) |si| {
             var acc: f32 = 0;
-            for (hd) |k| acc += (into[si][0] * @as(f32, @floatFromInt(rows[0][k])) + into[si][1] * @as(f32, @floatFromInt(rows[1][k]))) / 255;
+            for (hd) |k| acc += into[si][0] * levelGain(rows[0][k]) + into[si][1] * levelGain(rows[1][k]);
             m.g[di][si] = if (hd.len > 0) acc / @as(f32, @floatFromInt(hd.len)) else 0;
         }
     }
@@ -491,10 +497,12 @@ test "HD DVD volumes and mix-downs" {
     const l51 = Layout.of(chan.left | chan.right | chan.center | chan.lfe | chan.rear_left | chan.rear_right);
     var vol: [hd_channels]u8 = @splat(255);
     vol[2] = 0; // centre
-    vol[3] = 51; // Ls: VLC's rear left in 5.1
+    vol[3] = 233; // Ls: VLC's rear left in 5.1; 22 steps of -0.5 dB
     const g = hdGains(l51, vol);
     try testing.expectEqual(@as(f32, 0), g[l51.index(chan.center).?]);
-    try testing.expectApproxEqAbs(@as(f32, 0.2), g[l51.index(chan.rear_left).?], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.2818), g[l51.index(chan.rear_left).?], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.5012), levelGain(243), 1e-4); // -6 dB
+    try testing.expectEqual(@as(f32, 0), levelGain(0));
     try testing.expectEqual(@as(f32, 1), g[l51.index(chan.left).?]);
 
     // Stereo sub audio: left into the centre only, right into the right only.
@@ -506,10 +514,10 @@ test "HD DVD volumes and mix-downs" {
     try testing.expectEqual(@as(f32, 1), m.g[l51.index(chan.center).?][0]);
     try testing.expectEqual(@as(f32, 0), m.g[l51.index(chan.left).?][0]);
     try testing.expectEqual(@as(f32, 1), m.g[l51.index(chan.right).?][1]);
-    // Mono: both rows at -3 dB.
+    // Mono: the left input, so only the left row applies.
     const mono = hdMatrix(Layout.of(chan.center), l51, rows);
-    try testing.expectApproxEqAbs(std.math.sqrt1_2, mono.g[l51.index(chan.center).?][0], 1e-6);
-    try testing.expectApproxEqAbs(std.math.sqrt1_2, mono.g[l51.index(chan.right).?][0], 1e-6);
+    try testing.expectEqual(@as(f32, 1), mono.g[l51.index(chan.center).?][0]);
+    try testing.expectEqual(@as(f32, 0), mono.g[l51.index(chan.right).?][0]);
 }
 
 test "WAV decoding" {

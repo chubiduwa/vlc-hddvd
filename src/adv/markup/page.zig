@@ -129,6 +129,8 @@ pub const Page = struct {
     /// The timesheets (buildTiming).
     timing: ?*timing_mod.Timing = null,
     script: Overrides = .empty,
+    /// Script overrides of `<param>` values (the Animated Property API's core `value`), this tick.
+    core_values: std.AutoHashMapUnmanaged(*dom.Node, []const u8) = .empty,
     /// Variables, GPRM/SPRM: the host the application sets (property functions are the page's own).
     xpath_host: xpath.Host = .{},
 
@@ -167,6 +169,7 @@ pub const Page = struct {
         p.elems.deinit(p.gpa);
         if (p.timing) |t| t.destroy();
         p.script.deinit(p.gpa);
+        p.core_values.deinit(p.gpa);
         p.arena.deinit();
         p.doc.destroy();
         p.gpa.destroy(p);
@@ -195,6 +198,8 @@ pub const Page = struct {
         }
         try p.initialState();
         p.script.clearRetainingCapacity();
+        p.core_values.clearRetainingCapacity();
+        p.core_values.clearRetainingCapacity();
         p.snapshot();
         p.cascade();
     }

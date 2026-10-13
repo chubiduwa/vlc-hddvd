@@ -219,7 +219,9 @@ pub const Event = struct {
     fn preventDefault(e: *Event) void {
         if (e.cancelable) e.prevented = true;
     }
-    fn initEvent(e: *Event, type_: []const u8, can_bubble: bool, cancelable: bool) !void {
+    fn initEvent(e: *Event, type_: []const u8, can_bubble_arg: ?bool, cancelable_arg: ?bool) !void {
+        const can_bubble = can_bubble_arg orelse false; // DOM2 ECMAScript binding: a missing boolean is false
+        const cancelable = cancelable_arg orelse false;
         if (e.dispatching) return; // DOM2: no effect once dispatched
         e.type = try e.arena.allocator().dupe(u8, type_);
         e.bubbles = can_bubble;
@@ -244,7 +246,9 @@ pub const Event = struct {
     fn getAttrChange(e: *Event) u32 {
         return e.attr_change;
     }
-    fn initMutationEvent(e: *Event, cx: *js.Context, type_: []const u8, can_bubble: bool, cancelable: bool, related: js.Value, prev: js.NullStr, new: js.NullStr, attr: js.NullStr, change: u32) !void {
+    fn initMutationEvent(e: *Event, cx: *js.Context, type_: []const u8, can_bubble_arg: ?bool, cancelable_arg: ?bool, related: js.Value, prev: js.NullStr, new: js.NullStr, attr: js.NullStr, change: u32) !void {
+        const can_bubble = can_bubble_arg orelse false; // DOM2 ECMAScript binding: a missing boolean is false
+        const cancelable = cancelable_arg orelse false;
         try e.initEvent(type_, can_bubble, cancelable);
         const a = e.arena.allocator();
         setValue(cx, &e.related, related);
@@ -312,7 +316,9 @@ pub const Event = struct {
     fn getDy(e: *Event) i32 {
         return e.key.dy;
     }
-    fn initControllerKeyEvent(e: *Event, type_: []const u8, can_bubble: bool, cancelable: bool, id: u32, x: u32, y: u32, px: u32, py: u32, ox: u32, oy: u32, key: u32, code: []const u8, dx: i32, dy: i32) !void {
+    fn initControllerKeyEvent(e: *Event, type_: []const u8, can_bubble_arg: ?bool, cancelable_arg: ?bool, id: u32, x: u32, y: u32, px: u32, py: u32, ox: u32, oy: u32, key: u32, code: []const u8, dx: i32, dy: i32) !void {
+        const can_bubble = can_bubble_arg orelse false; // DOM2 ECMAScript binding: a missing boolean is false
+        const cancelable = cancelable_arg orelse false;
         try e.initEvent(type_, can_bubble, cancelable);
         e.key = .{
             .id = id,

@@ -177,7 +177,7 @@ const Painter = struct {
             return;
         }
         if (std.mem.eql(u8, ty, "application/x-clearrect")) {
-            const target: planes.Target = if (std.mem.eql(u8, param(e, "TargetPlane") orelse "main", "sub")) .sub else .main;
+            const target: planes.Target = if (std.mem.eql(u8, param(p.page, e, "TargetPlane") orelse "main", "sub")) .sub else .main;
             p.f.clearRect(p.clip, content, target) catch {};
             return;
         }
@@ -260,12 +260,13 @@ const Painter = struct {
     }
 };
 
-/// The value of an object's `param` (content, else the value attribute; §7.5.3.1.13).
-pub fn param(e: *const Elem, name: []const u8) ?[]const u8 {
+/// The value of an object's `param`: a script override, else its content, else its value attribute (§7.5.3.1.13).
+pub fn param(page: ?*const Page, e: *const Elem, name: []const u8) ?[]const u8 {
     var c = e.node.firstElement();
     while (c) |n| : (c = n.nextElement()) {
         if (!n.is(page_mod.core_ns, "param")) continue;
         if (!std.mem.eql(u8, n.attr("name") orelse "", name)) continue;
+        if (page) |pg| if (pg.core_values.get(n)) |v| return v;
         if (n.first) |t| if (t.type == .text and std.mem.trim(u8, t.data, " \t\r\n").len > 0) return std.mem.trim(u8, t.data, " \t\r\n");
         return n.attr("value");
     }

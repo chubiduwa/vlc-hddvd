@@ -64,6 +64,48 @@ pub const Tracks = struct {
     sel_sub_ext: ?u8 = null,
 };
 
+/// What a soft reset (Playlist.load) keeps (Annex W, Reset "K"): the selected tracks and languages, the
+/// Selected Application Group and the General Parameters (Z.10.32), from the old World to the new.
+pub const Kept = struct {
+    tracks: Tracks = .{},
+    app_group: ?u32 = null,
+    general: std.StringArrayHashMapUnmanaged([]u8) = .empty,
+
+    pub fn deinit(k: *Kept, gpa: std.mem.Allocator) void {
+        var it = k.general.iterator();
+        while (it.next()) |e| {
+            gpa.free(e.key_ptr.*);
+            gpa.free(e.value_ptr.*);
+        }
+        k.general.deinit(gpa);
+        k.* = .{};
+    }
+
+    /// Takes the kept values out of `m` (its General Parameters move).
+    pub fn take(m: *Model, app_group: ?u32) Kept {
+        const t = m.tracks;
+        defer m.general = .empty;
+        return .{
+            .tracks = .{ .sel_video = t.sel_video, .sel_audio = t.sel_audio, .sel_sub = t.sel_sub, .sel_audio_lang = t.sel_audio_lang, .sel_audio_ext = t.sel_audio_ext, .sel_sub_lang = t.sel_sub_lang, .sel_sub_ext = t.sel_sub_ext },
+            .app_group = app_group,
+            .general = m.general,
+        };
+    }
+
+    /// Puts them into a new model (the General Parameters move; `k` is left empty).
+    pub fn give(k: *Kept, m: *Model) void {
+        m.tracks.sel_video = k.tracks.sel_video;
+        m.tracks.sel_audio = k.tracks.sel_audio;
+        m.tracks.sel_sub = k.tracks.sel_sub;
+        m.tracks.sel_audio_lang = k.tracks.sel_audio_lang;
+        m.tracks.sel_audio_ext = k.tracks.sel_audio_ext;
+        m.tracks.sel_sub_lang = k.tracks.sel_sub_lang;
+        m.tracks.sel_sub_ext = k.tracks.sel_sub_ext;
+        m.general = k.general;
+        k.general = .empty;
+    }
+};
+
 pub const Layout = struct {
     x: i32 = 0,
     y: i32 = 0,
@@ -74,6 +116,9 @@ pub const Layout = struct {
     crop_w: u32 = 1920,
     crop_h: u32 = 1080,
     changing: bool = false,
+    /// A change made while paused (zero duration): `changing` and the new values come when playback resumes
+    /// (Z.10.19.3 steps 10–11); until then jumps are allowed.
+    pending: bool = false,
     /// The change in progress: done at this application tick.
     done_at: ?u64 = null,
     target: ?Target = null,
@@ -100,6 +145,8 @@ pub const Model = struct {
     tracks: Tracks = .{},
     effect_playing: bool = false,
     effect_serial: u64 = 0,
+    /// The effect sound was stopped by a title change: its callback still reports FINISHED.
+    effect_ended: bool = false,
     // Audio parameters (Table W-4): main volumes, sub and effect mix-downs (left/right channel to 8 outputs).
     main_volume: [8]u8 = @splat(255),
     sub_mix: [2][8]u8 = @splat(@splat(0)),
@@ -369,10 +416,13 @@ const player_class: js.Class = .{
 /// A TrackSelection: the Player's (its tracks are the model's) or a Bookmark's (`own`).
 pub const TrackSel = struct {
     player: bool,
+    /// Player.bookmark.track: the bookmark's own tracks, which its functions change (Z.10.3).
+    bookmark: bool = false,
     own: Tracks = .{},
-    /// The Bookmark's title, for its tracks (referenceTitle).
     fn tracksOf(t: *TrackSel, s: *Script) *Tracks {
-        return if (t.player) &modelOf(s).tracks else &t.own;
+        if (t.player) return &modelOf(s).tracks;
+        if (t.bookmark) if (modelOf(s).bm_tracks) |*b| return b;
+        return &t.own;
     }
 
     fn finalize(ptr: *anyopaque, rt: *js.Runtime) void {
@@ -445,9 +495,12 @@ pub const TrackSel = struct {
             },
             .video => unreachable,
         }
-        if (t.player) reselect(s.world, true) else {
-            tr.cur_audio = tr.sel_audio;
-            tr.cur_sub = tr.sel_sub;
+        if (t.player) {
+            reselect(s.world, true);
+        } else switch (kind) {
+            .audio => tr.cur_audio = tr.sel_audio,
+            .subtitle => tr.cur_sub = tr.sel_sub,
+            .video => unreachable,
         }
     }
 
@@ -645,8 +698,21 @@ pub fn reselect(w: *World, from_api: bool) void {
     if (old.cur_video != tr.cur_video) trackEvent(w, first, .video_track, "video_track", old.cur_video, tr.cur_video);
     if (old.cur_audio != tr.cur_audio) trackEvent(w, first, .audio_track, "audio_track", old.cur_audio, tr.cur_audio);
     if (old.cur_sub != tr.cur_sub) trackEvent(w, first, .subtitle_track, "subtitle_track", old.cur_sub, tr.cur_sub);
+    // The player shows a forced track for as long as it is current (Z.10.21).
+    if (old.cur_sub != tr.cur_sub and !w.model.subtitle_visible and subForced(w)) {
+        w.model.subtitle_visible = true;
+        if (w.eng) |e| e.command(.{ .subtitle_visible = true });
+    }
     if (old.cur_video != tr.cur_video or old.cur_audio != tr.cur_audio or old.cur_sub != tr.cur_sub)
         if (w.eng) |e| e.command(.{ .tracks = .{ .video = tr.cur_video, .audio = tr.cur_audio, .subtitle = tr.cur_sub } });
+}
+
+/// Whether the current subtitle track is forced (Vol. 3 6.2.3: shown whatever the subtitle visibility).
+fn subForced(w: *World) bool {
+    const title = curTitle(w) orelse return false;
+    const n = w.model.tracks.cur_sub orelse return false;
+    const nv = navOf(title, .subtitle, n) orelse return false;
+    return nv.forced;
 }
 
 fn trackEvent(w: *World, first: bool, kind: events.Kind, type_: []const u8, old: ?u8, new: ?u8) void {
@@ -686,7 +752,7 @@ const Bm = struct {
     fn getTrack(s: *Script) js.Error!Value {
         const tr = modelOf(s).bm_tracks orelse return js.null;
         const ts = try s.gpa.create(TrackSel);
-        ts.* = .{ .player = false, .own = tr };
+        ts.* = .{ .player = false, .bookmark = true, .own = tr };
         return s.cx.wrapAs(TrackSel, &track_selection_class, ts) catch |e| {
             s.gpa.destroy(ts);
             return e;
@@ -1167,7 +1233,9 @@ pub const ChapterRef = struct {
         const s = Script.of(cx);
         const t, const chap = try ch.get(cx);
         var index = ch.index;
-        if (s.world.title_index != null and s.world.title_index.? == ch.title and s.world.title_time -| chap.begin < fps(s) and index > 0) index -= 1;
+        // Within the first second of this chapter (the one playing), top() goes to the chapter before.
+        const now = s.world.title_time;
+        if (s.world.title_index != null and s.world.title_index.? == ch.title and now >= chap.begin and now - chap.begin < fps(s) and index > 0) index -= 1;
         try jumpTitle(s, ch.title, t.chapters[index].begin, false);
     }
 
@@ -1380,11 +1448,16 @@ fn L(comptime main: bool) type {
             if (@mod(px, 2) != 0 or @mod(py, 2) != 0 or cx_ % 2 != 0 or cy_ % 2 != 0 or cw % 2 != 0 or ch % 2 != 0) return error.Argument;
             const target: Layout.Target = .{ .x = px, .y = py, .scale = new_scale, .crop = .{ cx_, cy_, cw, ch } };
             const ticks: u64 = @intFromFloat(@round(@as(f64, @floatFromInt(dur)) / @as(f64, @floatFromInt(fps(s))) * s.world.tick_rate));
-            lay.changing = true;
             lay.target = target;
-            lay.done_at = s.world.tick + ticks;
             command(s, .{ .layout = .{ .main = main, .x = px, .y = py, .scale = new_scale, .crop = target.crop, .ticks = @intCast(ticks) } });
-            if (ticks == 0 and playing) finishLayout(lay);
+            if (!playing) {
+                lay.pending = true;
+                lay.done_at = null;
+                return;
+            }
+            lay.changing = true;
+            lay.done_at = s.world.tick + ticks;
+            if (ticks == 0) finishLayout(lay);
         }
     };
 }
@@ -1399,6 +1472,7 @@ fn finishLayout(lay: *Layout) void {
     lay.crop_w = t.crop[2];
     lay.crop_h = t.crop[3];
     lay.changing = false;
+    lay.pending = false;
     lay.target = null;
     lay.done_at = null;
 }
@@ -1407,6 +1481,10 @@ fn finishLayout(lay: *Layout) void {
 pub fn advanceLayouts(w: *World) void {
     const playing = w.model.play_state == PlayState.play;
     for ([_]*Layout{ &w.model.main, &w.model.sub }) |lay| {
+        if (lay.pending) {
+            if (playing) finishLayout(lay);
+            continue;
+        }
         const at = lay.done_at orelse continue;
         if (!playing) {
             lay.done_at = at + 1;
@@ -1515,7 +1593,9 @@ const ST = struct {
     fn getVisible(s: *Script) bool {
         return modelOf(s).subtitle_visible;
     }
+    /// A forced subtitle track stays shown: hiding it fails silently (Z.10.21).
     fn setVisible(s: *Script, v: bool) void {
+        if (!v and subForced(s.world)) return;
         modelOf(s).subtitle_visible = v;
         command(s, .{ .subtitle_visible = v });
     }
@@ -1705,8 +1785,9 @@ const EffectDone = struct {
         var serial: f64 = 0;
         _ = c.JS_ToFloat64(ctx, &serial, data[1]);
         const m = modelOf(s);
-        if (@as(u64, @intFromFloat(serial)) != m.effect_serial or !m.effect_playing) return js.undefined;
+        if (@as(u64, @intFromFloat(serial)) != m.effect_serial or !(m.effect_playing or m.effect_ended)) return js.undefined;
         m.effect_playing = false;
+        m.effect_ended = false;
         if (cx.isFunction(data[0])) {
             var args = [_]Value{cx.number(Result.finished)};
             cx.callReport(data[0], s.app_obj, &args, "effect audio");
@@ -1949,14 +2030,20 @@ pub fn timelineEvents(w: *World, jumped: bool) void {
         m.last_time = now;
     }
     if (w.model.play_state != PlayState.play and prev != null and now == prev.?) return;
-    // Scheduled events passed (forward, without a jump).
-    if (prev) |p| if (!jumped and now > p) for (title.scheduled) |sc| {
-        if (sc.kind == .event and sc.time > p and sc.time <= now) apps.sendSystem(.{ .kind = .scheduled, .type = "scheduled_event", .id = if (sc.id.len > 0) sc.id else null }, null);
-        if (sc.kind == .pause_at and sc.time > p and sc.time <= now) {
+    // Scheduled events reached: those passed playing forward (without a jump), and at 00:00:00:00 when the title
+    // starts from its beginning. Not at the exact target of a jump or a part-way title start: discs resume at the
+    // time an event fired (a bookmark taken in its handler) and would get it again.
+    const from: ?u64 = if (prev) |p| (if (!jumped and now > p) p else null) else null;
+    const at_start = prev == null and !jumped and now == 0;
+    for (title.scheduled) |sc| {
+        const reached = if (from) |p| sc.time > p and sc.time <= now else at_start and sc.time == now;
+        if (!reached) continue;
+        if (sc.kind == .event) apps.sendSystem(.{ .kind = .scheduled, .type = "scheduled_event", .id = if (sc.id.len > 0) sc.id else null }, null);
+        if (sc.kind == .pause_at) {
             m.play_state = PlayState.pause;
             if (w.eng) |e| e.command(.{ .pause = true });
         }
-    };
+    }
     // The chapter.
     const ch: ?u32 = if (title.chapterAt(now) > 0) @intCast(title.chapterAt(now)) else null;
     if (ch != m.last_chapter or !same_title) {
@@ -1991,9 +2078,29 @@ pub fn timelineEvents(w: *World, jumped: bool) void {
     }
     m.playing_clips.clearRetainingCapacity();
     m.playing_clips.appendSlice(w.gpa, now_clips.items) catch {};
+    // The Secondary Video Player is SYNC while the timeline plays a synchronized sub video (Z.10.31.4.1).
+    var sync_pip = false;
+    for (now_clips.items) |i| {
+        const cl = title.clips[i];
+        if ((cl.kind == .primary and cl.sub_video != null) or (cl.kind == .secondary_av and cl.sync != .none)) sync_pip = true;
+    }
+    if (m.svp_state == SVP.stop or m.svp_state == SVP.sync) m.svp_state = if (sync_pip) SVP.sync else SVP.stop;
 }
 
 /// A new title: the timeline's state starts over (the presentation parameters marked I in Table W-3).
+/// The title is left (it ended, or a jump left it): its playing clips end (§8.3.1 Case 2, before Application End).
+pub fn titleEnds(w: *World) void {
+    const m = &w.model;
+    defer m.playing_clips.clearRetainingCapacity();
+    const apps = w.apps orelse return;
+    const title = curTitle(w) orelse return;
+    for (m.playing_clips.items) |i| {
+        if (i >= title.clips.len) continue;
+        const cl = title.clips[i];
+        apps.sendSystem(.{ .kind = .clip, .type = "clip_end", .id = if (cl.id.len > 0) cl.id else null }, null);
+    }
+}
+
 pub fn titleBegins(w: *World) void {
     const m = &w.model;
     m.last_title = null;
@@ -2007,6 +2114,11 @@ pub fn titleBegins(w: *World) void {
     m.sub = .{ .scale = .{ 16, 16 }, .crop_w = w.aperture_w, .crop_h = w.aperture_h };
     m.sub_alpha = 0;
     m.subtitle_visible = true;
+    // Effect Audio Playing resets at a title change (Table W-3): the sound stops, and its callback still comes.
+    if (m.effect_playing) {
+        if (w.eng) |e| e.command(.effect_stop);
+        m.effect_ended = true;
+    }
     m.effect_playing = false;
     m.capturing = false;
 }
@@ -2058,7 +2170,8 @@ pub fn defaultKey(w: *World, key: u8) void {
                 e.command(.stop);
             }
         },
-        0xC9 => { // VK_SUBTITLE_SWITCH
+        0xC9 => { // VK_SUBTITLE_SWITCH (a forced track stays shown)
+            if (m.subtitle_visible and subForced(w)) return;
             m.subtitle_visible = !m.subtitle_visible;
             e.command(.{ .subtitle_visible = m.subtitle_visible });
         },
@@ -2242,6 +2355,25 @@ const Mem = struct {
     }
 };
 
+test "a soft reset keeps the selected tracks, the application group and the General Parameters" {
+    const gpa = std.testing.allocator;
+    var old: Model = .{};
+    defer old.deinit(gpa);
+    old.tracks = .{ .cur_audio = 2, .sel_audio = 2, .sel_sub_lang = "fr".* };
+    try old.general.put(gpa, try gpa.dupe(u8, "1"), try gpa.dupe(u8, "initialized"));
+    var k = Kept.take(&old, 3);
+    defer k.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), old.general.count());
+    var new: Model = .{};
+    defer new.deinit(gpa);
+    k.give(&new);
+    try std.testing.expectEqualStrings("initialized", new.general.get("1").?);
+    try std.testing.expectEqual(@as(?u8, 2), new.tracks.sel_audio);
+    try std.testing.expectEqual(@as(?u8, null), new.tracks.cur_audio); // current tracks restart (Reset "I")
+    try std.testing.expectEqualSlices(u8, "fr", &new.tracks.sel_sub_lang.?);
+    try std.testing.expectEqual(@as(?u32, 3), k.app_group);
+}
+
 test "the Player API on a title" {
     const gpa = std.testing.allocator;
     var pl = try xpl.parse(gpa,
@@ -2341,6 +2473,12 @@ test "the Player API on a title" {
         \\assertThrows(function () { t1.jump("00:02:00:00", false); }, "HDDVD_E_ARGUMENT");
         \\t1.jump("00:00:10:00", true); assertEq(Player.bookmark.title, t1); assertEq(Player.bookmark.elapsedTime, "00:00:01:10");
         \\assertThrows(function () { Player.bookmark.elapsedTime = "00:05:00:00"; }, "HDDVD_E_ARGUMENT");
+        \\// The bookmark's tracks change through its own TrackSelection (Z.10.3).
+        \\Player.bookmark.track.selectAudioTrackNumber(2); assertEq(Player.bookmark.track.selectedAudioTrackNumber, 2);
+        \\// Paused: a zero-duration layout change waits for playback without blocking jumps (Z.10.19.3).
+        \\Player.video.main.changeLayout(0, 0, null, 0, 0, 1920, 1080, "00:00:00:00"); assert(!Player.video.main.changing, "pending"); t1.jump("00:00:10:00", false);
+        \\// DOM2 binding: a missing useCapture is false.
+        \\var noCapture = function () {}; addEventListener("x_evt", noCapture); removeEventListener("x_evt", noCapture);
         \\// Video and audio.
         \\var sc = Player.createVideoScale(1, 2); assertEq(sc.denominator, 2);
         \\assertThrows(function () { Player.createVideoScale(0, 2); }, "HDDVD_E_ARGUMENT");
@@ -2404,7 +2542,7 @@ test "the Player API on a title" {
         .pause => pauses += 1,
         else => {},
     };
-    try std.testing.expectEqual(@as(u32, 1), jumps);
+    try std.testing.expectEqual(@as(u32, 2), jumps); // the bookmark jump, and one past a pending layout change
     try std.testing.expect(pauses >= 2);
     // A jump to another title from a pause plays it (Z.10.13.3 step 10): VLC is resumed before the jump.
     for (e.outbox.items) |cmd| switch (cmd) {

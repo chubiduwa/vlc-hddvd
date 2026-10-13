@@ -227,7 +227,8 @@ pub const CursorManager = struct {
         const c = cursorOf(s);
         const aw: u64 = s.world.aperture_w;
         const ah: u64 = s.world.aperture_h;
-        if (w == 0 or h == 0 or @as(u64, x) + w > aw or @as(u64, y) + h > ah) return error.Argument;
+        // Only inside the aperture: an empty region is allowed (the cursor then stays at its origin).
+        if (@as(u64, x) + w > aw or @as(u64, y) + h > ah) return error.Argument;
         c.setRegion(.{ .x = @intCast(x), .y = @intCast(y), .w = @intCast(w), .h = @intCast(h) });
         changed(s);
     }
@@ -273,7 +274,7 @@ test "ControllerManager and CursorManager" {
         \\C.setRegion(100, 100, 200, 100); assertEq(C.regionX, 100); assertEq(C.regionWidth, 200);
         \\assert(C.x >= 100 && C.x < 300 && C.y >= 100 && C.y < 200, "the cursor moved into the region");
         \\assertThrows(function () { C.setRegion(1800, 0, 200, 100); }, "HDDVD_E_ARGUMENT");
-        \\assertThrows(function () { C.setRegion(0, 0, 0, 100); }, "HDDVD_E_ARGUMENT");
+        \\C.setRegion(0, 0, 0, 100); assertEq(C.regionWidth, 0, "an empty region is allowed"); C.setRegion(100, 100, 200, 100);
         \\C.moveCursor(150, 120); assertEq(C.x, 150); assertEq(C.y, 120);
         \\assertThrows(function () { C.moveCursor(10, 10); }, "HDDVD_E_ARGUMENT");
         \\C.setImage("file:///filecache/arrow.png", 1, 2); assertEq(C.image, "file:///filecache/arrow.png"); assertEq(C.hotSpotY, 2);

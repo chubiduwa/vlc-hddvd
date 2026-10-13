@@ -59,7 +59,8 @@ fn param(n: *const dom.Node, name: []const u8) u32 {
         if (!p.is(page_mod.core_ns, "param")) continue;
         if (!std.mem.eql(u8, p.attr("name") orelse "", name)) continue;
         const v = std.mem.trimEnd(u8, std.mem.trim(u8, p.attr("value") orelse "", " "), "px");
-        return std.math.clamp(std.fmt.parseInt(u32, v, 10) catch 1, 1, 1920);
+        // The Capture Drawing Format bounds a drawing to the aperture: 1920 wide, 1080 high.
+        return std.math.clamp(std.fmt.parseInt(u32, v, 10) catch 1, 1, @as(u32, if (std.mem.eql(u8, name, "height")) 1080 else 1920));
     }
     return 1;
 }
@@ -746,9 +747,10 @@ pub const Area = struct {
 };
 
 /// The Capture Drawing Format: the header of §6.5.1.4.1 (FILE_ID "HDDVDCIF", VERN, ENC_TY 02h, WIDTH,
-/// HEIGHT, 49 reserved bytes; big-endian), then straight RGBA rows.
+/// HEIGHT, 49 reserved bytes; big-endian), then each pixel unpremultiplied as B, G, R, A (§6.5.1.4.2: a
+/// big-endian word with B in its top byte). `image.decode` reads it back.
 pub fn captureDrawing(gpa: std.mem.Allocator, cv: Canvas) ![]u8 {
-    const head = 8 + 2 + 1 + 2 + 2 + 49;
+    const head = image.capture_header;
     const out = try gpa.alloc(u8, head + cv.px.len * 4);
     @memset(out[0..head], 0);
     @memcpy(out[0..8], "HDDVDCIF");
@@ -758,7 +760,7 @@ pub fn captureDrawing(gpa: std.mem.Allocator, cv: Canvas) ![]u8 {
     std.mem.writeInt(u16, out[13..15], @intCast(cv.h), .big);
     for (cv.px, 0..) |p, i| {
         const q = raster.unpremultiply(p);
-        @memcpy(out[head + i * 4 ..][0..4], &q);
+        out[head + i * 4 ..][0..4].* = .{ q[2], q[1], q[0], q[3] };
     }
     return out;
 }
@@ -793,4 +795,14 @@ test "fills and strokes" {
     defer tt.allocator.free(cap);
     try tt.expectEqualStrings("HDDVDCIF", cap[0..8]);
     try tt.expectEqual(@as(usize, 64 + 400), cap.len);
+    // Pixels as B, G, R, A, and read back to the same canvas.
+    var one = try Canvas.init(tt.allocator, 1, 1);
+    defer one.deinit(tt.allocator);
+    one.px[0] = .{ 200, 100, 50, 255 };
+    const cap1 = try captureDrawing(tt.allocator, one);
+    defer tt.allocator.free(cap1);
+    try tt.expectEqualSlices(u8, &.{ 50, 100, 200, 255 }, cap1[64..68]);
+    var back = try image.decode(tt.allocator, cap1);
+    defer back.deinit(tt.allocator);
+    try tt.expectEqual(one.px[0], back.px[0]);
 }
