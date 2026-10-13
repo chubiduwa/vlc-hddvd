@@ -2,6 +2,7 @@
 //! All test data is synthetic (built in the tests).
 
 test {
+    _ = @import("aacs.zig");
     _ = @import("hli.zig");
     _ = @import("spu.zig");
     _ = @import("udf.zig");

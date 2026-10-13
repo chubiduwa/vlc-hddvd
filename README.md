@@ -12,7 +12,6 @@ An HD DVD plugin for VLC 3.0.
   menu sounds, bookmarks for the session, games), picture-in-picture and commentary audio, every title,
   chapter, audio and subtitle track.
 - **Disc images** (`.iso`) read directly, or a folder holding a disc (a mounted disc, or a copy of one).
-- **HD DVD sub-pictures and button highlights.**
 - **VLC controls:** arrow keys, Enter and the mouse for buttons; the disc-menu key; Playback > Title and Chapter.
 
 Not supported yet:
