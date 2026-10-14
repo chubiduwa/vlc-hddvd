@@ -268,10 +268,40 @@ void hddvd_meta_set_title(vlc_meta_t *meta, const char *title)
     vlc_meta_Set(meta, vlc_meta_Title, title);
 }
 
-/* An error dialog (the interface's, or only the log without one); the text is shown as is. */
+/* An HD DVD image that cannot play (no key, a damaged disc) is still taken, as a demux that ends at once: declining
+ * it would let the next demuxer play its scrambled packs as MPEG-PS. */
+static int FailedDemux(demux_t *demux)
+{
+    (void)demux;
+    return VLC_DEMUXER_EOF;
+}
+
+static int FailedControl(demux_t *demux, int query, va_list args)
+{
+    (void)demux;
+    (void)query;
+    (void)args;
+    return VLC_EGENERIC;
+}
+
+void hddvd_demux_set_failed(demux_t *demux)
+{
+    demux->pf_demux = FailedDemux;
+    demux->pf_control = FailedControl;
+    demux->p_sys = NULL;
+}
+
+bool hddvd_demux_failed(demux_t *demux)
+{
+    return demux->pf_demux == FailedDemux;
+}
+
+/* An error dialog; the text is shown as is. A critical question with only an OK button rather than
+ * vlc_dialog_display_error: the macOS interface lists errors in a panel whose rows show only their first line.
+ * It waits for OK (without an interface that has dialogs, it returns at once). */
 void hddvd_dialog_error(vlc_object_t *obj, const char *title, const char *text)
 {
-    vlc_dialog_display_error(obj, title, "%s", text);
+    vlc_dialog_wait_question(obj, VLC_DIALOG_QUESTION_CRITICAL, "OK", NULL, NULL, title, "%s", text);
 }
 
 void hddvd_set_update(demux_t *demux, unsigned flags, int title, int seekpoint)

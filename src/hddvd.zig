@@ -35,6 +35,8 @@ extern fn hddvd_es_out_control(out: *vlc.es_out_t, query: c_int, ...) callconv(.
 extern fn hddvd_stream_delete(s: *vlc.stream_t) void;
 extern fn hddvd_inherit_string(obj: *vlc.vlc_object_t, name: [*:0]const u8) ?[*:0]u8;
 extern fn hddvd_free(p: ?*anyopaque) void;
+extern fn hddvd_demux_set_failed(demux: *vlc.demux_t) void;
+extern fn hddvd_demux_failed(demux: *vlc.demux_t) bool;
 extern fn hddvd_set_update(demux: *vlc.demux_t, flags: c_uint, title: c_int, seekpoint: c_int) void;
 extern fn hddvd_mouse_new(demux: *vlc.demux_t) ?*anyopaque;
 extern fn hddvd_mouse_delete(demux: *vlc.demux_t, m: ?*anyopaque) void;
@@ -624,7 +626,10 @@ fn openImageFile(o: *vlc.vlc_object_t) callconv(.c) c_int {
         return vlc.VLC_EGENERIC;
     }
     log(o, vlc.VLC_MSG_DBG, @src(), "%s is an HD DVD image", .{demux.psz_file});
-    return openFs(o, fs);
+    // Taken even if it cannot play (the reason is in the log or a dialog): another demuxer would play its
+    // packs, scrambled or out of order, as MPEG-PS.
+    if (openFs(o, fs) != vlc.VLC_SUCCESS) hddvd_demux_set_failed(demux);
+    return vlc.VLC_SUCCESS;
 }
 
 /// Opens the disc in `fs` (taken).
@@ -720,6 +725,7 @@ fn openPs(demux: *vlc.demux_t) !void {
 
 fn close(o: *vlc.vlc_object_t) callconv(.c) void {
     const demux: *vlc.demux_t = @ptrCast(o);
+    if (hddvd_demux_failed(demux)) return; // an image that could not open (openImageFile): nothing to free
     if (adv.owns(demux)) return adv.close(demux);
     const sys = sysOf(demux);
     hddvd_mouse_delete(demux, sys.mouse);
