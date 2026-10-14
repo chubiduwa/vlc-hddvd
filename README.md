@@ -116,8 +116,10 @@ Note: mouse interaction can be enabled/disabled by discs themselves and might no
 
 ### Encrypted discs
 
-Encrypted (AACS) discs need the disc's key in a key database, `KEYDB.cfg` (the libaacs format: one line per
+Encrypted (AACS) discs need the disc's key in a key database, [`KEYDB.cfg`](https://github.com/chubiduwa/hd-dvd-key-db) (the libaacs format: one line per
 disc, `<disc ID> = <title> | V | <volume unique key>`). The plugin looks for it where libaacs does:
+
+**NOTE**: should work with real discs but only if its disc ID is present in `KEYDB.cfg`, there are ways to find the VUK for your physical disc (not referencing the methods here) and add it to `KEYDB.cfg` yourself.
 
 | System | Location |
 |---|---|
@@ -125,8 +127,7 @@ disc, `<disc ID> = <title> | V | <volume unique key>`). The plugin looks for it 
 | Windows | `%APPDATA%\aacs\KEYDB.cfg` |
 | Linux | `~/.config/aacs/KEYDB.cfg` |
 
-Or set its path with `--hddvd-keydb=/path/to/KEYDB.cfg` (Tools > Preferences > All > Input / Codecs > Access
-modules > HD DVD). When the key is missing, VLC shows an error naming the disc ID to look for.
+Or set its path with `--hddvd-keydb=/path/to/KEYDB.cfg`. When the key is missing, VLC shows an error naming the disc ID to look for.
 
 ## Build
 
