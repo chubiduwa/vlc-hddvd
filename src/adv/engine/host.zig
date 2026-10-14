@@ -229,7 +229,13 @@ pub const Host = struct {
                 if (on) h.engine_pause.store(true, .release);
                 hddvd_input_pause(@ptrCast(h.obj), on);
             },
-            .mixing => |m| h.pres.setMixing(m.main, m.sub, m.effect),
+            .mixing => |m| {
+                // Levels per output channel (L R C LS RS LB RB LFE), 255 = 0 dB.
+                var buf: [256]u8 = undefined;
+                const text = std.fmt.bufPrintSentinel(&buf, "mixing: main {any} sub L {any} R {any} effect L {any} R {any}", .{ m.main, m.sub[0], m.sub[1], m.effect[0], m.effect[1] }, 0) catch "mixing";
+                log(h.obj, vlc.VLC_MSG_DBG, @src(), "%s", .{text.ptr});
+                h.pres.setMixing(m.main, m.sub, m.effect);
+            },
             .effect_play => |p| h.playEffect(p.data, p.repeat, p.id, now),
             .effect_stop => {
                 h.fx.stop();
