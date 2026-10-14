@@ -1,8 +1,24 @@
 /*
  * VLC's C runtime for memory shared with VLC (see crt.h): msvcrt.dll's allocator on Windows, the usual one
- * elsewhere.
+ * elsewhere. And, on Linux, the C++ static destructors run when VLC unloads the plugin.
  */
 #include "crt.h"
+
+#if defined(__linux__)
+/*
+ * The C++ code linked in (libc++, RtAudio) registers its static destructors with __cxa_atexit for this
+ * library (&__dso_handle). A shared library normally runs them at dlclose through __cxa_finalize, called from
+ * crtbeginS.o, which Zig does not link: they stayed registered, and exit() called them after VLC had unloaded
+ * the plugin (a crash at VLC's exit).
+ */
+extern void *__dso_handle;
+extern void __cxa_finalize(void *dso);
+
+__attribute__((destructor)) static void RunStaticDestructors(void)
+{
+    __cxa_finalize(&__dso_handle);
+}
+#endif
 
 #ifdef _WIN32
 # include <windows.h>
