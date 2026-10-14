@@ -29,6 +29,8 @@
 void hddvd_es_fixup(demux_t *, es_format_t *);
 void hddvd_es_added(demux_t *, int i_id, es_out_id_t *);
 void hddvd_es_deleted(demux_t *, es_out_id_t *);
+es_out_id_t *hddvd_es_reuse(demux_t *, const es_format_t *);
+bool hddvd_es_keep(demux_t *, es_out_id_t *);
 block_t *hddvd_es_filter(demux_t *, es_out_id_t *, block_t *);
 
 /* ---- mouse ------------------------------------------------------------------------------------------ */
@@ -206,6 +208,10 @@ struct es_out_sys_t
 
 static es_out_id_t *ProxyAdd(es_out_t *out, const es_format_t *fmt)
 {
+    /* An ES kept from the previous ps demuxer (the main video across titles), if this is its successor. */
+    es_out_id_t *kept = hddvd_es_reuse(out->p_sys->demux, fmt);
+    if (kept != NULL)
+        return kept;
     es_format_t copy;
     es_format_Copy(&copy, fmt);
     hddvd_es_fixup(out->p_sys->demux, &copy);
@@ -226,8 +232,10 @@ static int ProxySend(es_out_t *out, es_out_id_t *id, block_t *block)
 
 static void ProxyDel(es_out_t *out, es_out_id_t *id)
 {
+    bool keep = hddvd_es_keep(out->p_sys->demux, id);
     hddvd_es_deleted(out->p_sys->demux, id);
-    es_out_Del(out->p_sys->parent, id);
+    if (!keep)
+        es_out_Del(out->p_sys->parent, id);
 }
 
 static int ProxyControl(es_out_t *out, int query, va_list args)

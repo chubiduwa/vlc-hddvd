@@ -1025,6 +1025,17 @@ fn esAdded(demux: *vlc.demux_t, id: c_int, es: *vlc.es_out_id_t) callconv(.c) vo
     if ((id & 0xffe0) == 0xbd20) sys.spus.append(gpa, .{ .es = es, .id = id }) catch {};
 }
 
+/// An ES the ps demuxer is adding that should be one kept from its predecessor (Advanced Content: the main
+/// video across titles), or null.
+fn esReuse(demux: *vlc.demux_t, fmt: *const vlc.es_format_t) callconv(.c) ?*vlc.es_out_id_t {
+    return if (adv.owns(demux)) adv.esReuse(demux, fmt) else null;
+}
+
+/// True if an ES the ps demuxer deletes is to be kept for its successor rather than deleted.
+fn esKeep(demux: *vlc.demux_t, es: *vlc.es_out_id_t) callconv(.c) bool {
+    return adv.owns(demux) and adv.esKeep(demux, es);
+}
+
 fn esDeleted(demux: *vlc.demux_t, es: *vlc.es_out_id_t) callconv(.c) void {
     if (adv.owns(demux)) return adv.esDeleted(demux, es);
     const sys = sysOf(demux);
@@ -1106,5 +1117,7 @@ comptime {
     @export(&esFixup, .{ .name = "hddvd_es_fixup", .visibility = hidden });
     @export(&esAdded, .{ .name = "hddvd_es_added", .visibility = hidden });
     @export(&esDeleted, .{ .name = "hddvd_es_deleted", .visibility = hidden });
+    @export(&esReuse, .{ .name = "hddvd_es_reuse", .visibility = hidden });
+    @export(&esKeep, .{ .name = "hddvd_es_keep", .visibility = hidden });
     @export(&esFilter, .{ .name = "hddvd_es_filter", .visibility = hidden });
 }

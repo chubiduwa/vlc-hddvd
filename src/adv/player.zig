@@ -175,6 +175,14 @@ pub const Player = struct {
     pres: ?*present.Presentation = null,
     /// The main video ES (our compositor) and the forwarded sub streams.
     main_video: ?*vlc.es_out_id_t = null,
+    /// The main video's codec as the ps demuxer declared it (before our fourcc replaced it).
+    main_codec: u32 = 0,
+    /// The main video ES is kept while the ps demuxer is replaced at a title change (`keep_video`), and handed
+    /// to the new demuxer if its main video has the same codec: our decoder, VLC's video output and its window
+    /// stay. A new video ES makes VLC reset the output's zoom, which resizes the window to the video.
+    keep_video: bool = false,
+    kept_video: ?*vlc.es_out_id_t = null,
+    kept_codec: u32 = 0,
     sub_video: SubStream = .{},
     sub_audio: SubStream = .{},
     cur_title: c_int = -1,
@@ -480,6 +488,7 @@ pub fn close(demux: *vlc.demux_t) void {
     hddvd_skip_keys_release(demux, &p.skip_keys);
     // demux_Delete also deletes the demuxer's stream.
     if (p.ps) |ps| vlc.demux_Delete(ps) else if (p.stream) |s| hddvd_stream_delete(s);
+    if (p.kept_video) |es| hddvd_es_del(demux, es);
     if (p.host) |h| h.destroy();
     hddvd_mouse_delete(demux, p.mouse);
     if (p.overlay_es) |es| hddvd_es_del(demux, es);
@@ -531,7 +540,9 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
     // A new ps demuxer: the ESes are recreated with this title's track names. It peeks at the stream when it
     // opens, so the reader is positioned first.
     if (p.ps) |ps| {
+        p.keep_video = true; // see kept_video
         vlc.demux_Delete(ps); // and its stream
+        p.keep_video = false;
         p.stream = null;
     }
     p.ps = null;
@@ -1399,6 +1410,7 @@ pub fn esFixup(demux: *vlc.demux_t, fmt: *vlc.es_format_t) void {
     } else if (fmt.i_cat == vlc.VIDEO_ES) {
         const main = id == 0xe0 or id == 0xe2 or id == 0xfd55;
         if (main) {
+            p.main_codec = fmt.i_codec;
             toOurDecoder(p, fmt, vdec.fourcc);
         } else {
             // The sub video (E1, E3, FD-56…) becomes a sub-picture ES drawn as an overlay (pipdec.zig), selected
@@ -1450,6 +1462,34 @@ pub fn esAdded(demux: *vlc.demux_t, id: c_int, es: *vlc.es_out_id_t) void {
     }
     if (id == p.sub_audio.id) p.sub_audio.es = es;
     if (id == 0xe0 or id == 0xe2 or id == 0xfd55) p.main_video = es;
+}
+
+/// See `kept_video`: the kept main video ES if `fmt` is the new ps demuxer's main video with the same codec. A
+/// different codec gets a new ES (the kept one is deleted).
+pub fn esReuse(demux: *vlc.demux_t, fmt: *const vlc.es_format_t) ?*vlc.es_out_id_t {
+    const p = playerOf(demux);
+    const kept = p.kept_video orelse return null;
+    if (fmt.i_cat != vlc.VIDEO_ES) return null;
+    const id = if (fmt.i_id >= 0) fmt.i_id else currentPacketId(p);
+    if (id != 0xe0 and id != 0xe2 and id != 0xfd55) return null;
+    p.kept_video = null;
+    if (fmt.i_codec != p.kept_codec) {
+        hddvd_es_del(demux, kept);
+        return null;
+    }
+    p.main_codec = fmt.i_codec;
+    log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "main video ES kept from the previous title", .{});
+    esAdded(demux, id, kept);
+    return kept;
+}
+
+/// See `kept_video`.
+pub fn esKeep(demux: *vlc.demux_t, es: *vlc.es_out_id_t) bool {
+    const p = playerOf(demux);
+    if (!p.keep_video or p.main_video != es) return false;
+    p.kept_video = es;
+    p.kept_codec = p.main_codec;
+    return true;
 }
 
 pub fn esDeleted(demux: *vlc.demux_t, es: *vlc.es_out_id_t) void {
