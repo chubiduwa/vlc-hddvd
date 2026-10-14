@@ -6,6 +6,24 @@ const std = @import("std");
 
 pub const block_size = 2048;
 
+/// The Volume Recognition Sequence is looked for in sectors 16–31: the image's first `vrs_end` bytes.
+pub const vrs_end = 32 * block_size;
+
+/// True if `head` (an image's first `vrs_end` bytes) holds a UDF Volume Recognition Sequence: a BEA01 and an
+/// NSR02/NSR03 descriptor (ECMA-167 2/9.1).
+pub fn hasVrs(head: []const u8) bool {
+    if (head.len < vrs_end) return false;
+    var bea = false;
+    var nsr = false;
+    var s: usize = 16;
+    while (s < 32) : (s += 1) {
+        const id = head[s * block_size + 1 ..][0..5];
+        if (std.mem.eql(u8, id, "BEA01")) bea = true;
+        if (std.mem.startsWith(u8, id, "NSR0")) nsr = true;
+    }
+    return bea and nsr;
+}
+
 pub const Error = error{ NotUdf, BadUdf, Unsupported, NotFound, ReadFailed, OutOfMemory };
 
 /// Reads `buf.len` bytes at byte offset `offset` of the image; returns the count read.
@@ -155,6 +173,7 @@ pub const Volume = struct {
         return true;
     }
 
+    /// hasVrs through the reader.
     fn checkVrs(v: *Volume) Error!void {
         var bea = false;
         var nsr = false;
@@ -659,4 +678,16 @@ test "CS0 names: 8-bit and 16-bit compression" {
     try testing.expectEqualStrings("HVDVD_TS", decodeName("\x08HVDVD_TS", &out));
     try testing.expectEqualStrings("AB?", decodeName("\x10\x00A\x00B\x01\x00", &out));
     try testing.expectEqualStrings("", decodeName("", &out));
+}
+
+test "UDF recognition in an image's first sectors" {
+    const head = try testing.allocator.alloc(u8, vrs_end);
+    defer testing.allocator.free(head);
+    @memset(head, 0);
+    try testing.expect(!hasVrs(head));
+    @memcpy(head[16 * block_size + 1 ..][0..5], "BEA01");
+    try testing.expect(!hasVrs(head));
+    @memcpy(head[17 * block_size + 1 ..][0..5], "NSR03");
+    try testing.expect(hasVrs(head));
+    try testing.expect(!hasVrs(head[0 .. vrs_end - 1])); // too short
 }

@@ -15,6 +15,7 @@ const vlc = @import("vlc");
 const nav = @import("nav.zig");
 const ifo = @import("ifo.zig");
 const vfs = @import("vfs.zig");
+const udf = @import("udf.zig");
 const vm_mod = @import("vm.zig");
 const hli = @import("hli.zig");
 const spudec = @import("spudec.zig");
@@ -591,6 +592,7 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
 
 // ---- open / close -------------------------------------------------------------------------------------
 
+/// hddvd:// (access_demux): `psz_file` is the disc image or folder.
 fn open(o: *vlc.vlc_object_t) callconv(.c) c_int {
     const demux: *vlc.demux_t = @ptrCast(o);
     const path: []const u8 = std.mem.span(demux.psz_file orelse return vlc.VLC_EGENERIC);
@@ -599,6 +601,35 @@ fn open(o: *vlc.vlc_object_t) callconv(.c) c_int {
         log(o, vlc.VLC_MSG_ERR, @src(), "cannot open %s (%s)", .{ demux.psz_file, @errorName(err).ptr });
         return vlc.VLC_EGENERIC;
     };
+    return openFs(o, fs);
+}
+
+/// A local file opened as such (a demux, like dvdnav's for DVD images): an HD DVD image plays as if opened as
+/// hddvd://. Anything else is declined quietly, before any dialog, so other demuxers get it: a DVD or Blu-ray
+/// image too. Unless forced, the stream must first show a UDF Volume Recognition Sequence.
+fn openImageFile(o: *vlc.vlc_object_t) callconv(.c) c_int {
+    const demux: *vlc.demux_t = @ptrCast(o);
+    const path: []const u8 = std.mem.span(demux.psz_file orelse return vlc.VLC_EGENERIC);
+    if (!demux.obj.force) {
+        const s: *vlc.stream_t = demux.unnamed_0.s orelse return vlc.VLC_EGENERIC; // the file's stream
+        var head: [*c]const u8 = undefined;
+        const n = vlc.vlc_stream_Peek(s, &head, udf.vrs_end);
+        if (n < udf.vrs_end or !udf.hasVrs(head[0..udf.vrs_end])) return vlc.VLC_EGENERIC;
+    }
+    const fs = vfs.Fs.open(gpa, o, path) catch return vlc.VLC_EGENERIC;
+    if (!fs.isImage() or !(fs.exists("HVDVD_TS/HV000I01.IFO") or fs.exists("HVDVD_TS/HVA00001.VTI") or
+        fs.exists("ADV_OBJ/DISCID.DAT")))
+    {
+        fs.close();
+        return vlc.VLC_EGENERIC;
+    }
+    log(o, vlc.VLC_MSG_DBG, @src(), "%s is an HD DVD image", .{demux.psz_file});
+    return openFs(o, fs);
+}
+
+/// Opens the disc in `fs` (taken).
+fn openFs(o: *vlc.vlc_object_t, fs: *vfs.Fs) c_int {
+    const demux: *vlc.demux_t = @ptrCast(o);
     // An encrypted disc: the file system decrypts from now on.
     switch (aacsdisc.load(o, fs)) {
         .none => {},
@@ -1052,6 +1083,7 @@ fn spuBlock(data: []const u8, pts: i64) ?*vlc.block_t {
 comptime {
     const hidden: std.builtin.SymbolVisibility = .hidden;
     @export(&open, .{ .name = "HddvdOpen", .visibility = hidden });
+    @export(&openImageFile, .{ .name = "HddvdOpenImageFile", .visibility = hidden });
     @export(&close, .{ .name = "HddvdClose", .visibility = hidden });
     @export(&getPosition, .{ .name = "hddvd_get_position", .visibility = hidden });
     @export(&setPosition, .{ .name = "hddvd_set_position", .visibility = hidden });

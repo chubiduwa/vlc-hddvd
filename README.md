@@ -85,16 +85,18 @@ VLC_PLUGIN_PATH="$HOME/vlc-hddvd" vlc --reset-plugins-cache "hddvd:///path/to/Di
 
 ## Play
 
-Open the disc with the `hddvd://` scheme (URL-encode the path: `'` → `%27`, space → `%20`). The disc can be an
-`.iso` file or a folder:
+An HD DVD `.iso` opens like any other file (File > Open, drag and drop, or `vlc /path/to/Disc.iso`).
+
+A folder (a mounted disc, or a copy of one) needs the `hddvd://` scheme, which also works for `.iso` files
+(URL-encode the path: `'` → `%27`, space → `%20`):
 
 ```sh
-vlc "hddvd:///path/to/Bob%27s%20Disc.iso"
 vlc "hddvd:///Volumes/DISC"
+vlc "hddvd:///path/to/Bob%27s%20Disc.iso"
 vlc "hddvd:///C:/Discs/Disc.iso"          # Windows
 ```
 
-From the GUI, you can also use Media > Open Network Stream with the same `hddvd:///…` address.
+From the GUI, use Media > Open Network Stream with the `hddvd:///…` address.
 
 Append `#title[:chapter]` to start at a title, e.g. `hddvd:///path/to/Disc.iso#21`.
 

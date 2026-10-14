@@ -1,6 +1,6 @@
 /*
  * The C side of the plugin, kept as small as possible:
- *  - the VLC module descriptor: the HD DVD demux and its sub-picture decoder (vlc_module_begin() macros
+ *  - the VLC module descriptor: the HD DVD demux (hddvd:// and HD DVD image files) and its decoders (vlc_module_begin() macros
  *    generate the exported vlc_entry__3_0_0f, vlc_entry_copyright__3_0_0f and vlc_entry_license__3_0_0f);
  *  - va_list plumbing: VLC passes control arguments as va_list, and es_out_Control()/vlc_stream_Control()
  *    are inline variadic functions. The dispatchers below decode the arguments and call typed functions
@@ -24,6 +24,7 @@
 
 /* Implemented in Zig (hddvd.zig). */
 int HddvdOpen(vlc_object_t *);
+int HddvdOpenImageFile(vlc_object_t *);
 void HddvdClose(vlc_object_t *);
 int HddvdSpuOpen(vlc_object_t *);
 void HddvdSpuClose(vlc_object_t *);
@@ -80,6 +81,17 @@ vlc_module_begin()
     add_bool("hddvd-test-page", false, "Graphics test page (debugging)",
              "Advanced Content: draw a test page in the graphics plane (clocks, a moving box, a clear rectangle "
              "and the cursor) to check the overlay over playback, pause and seek.", true)
+
+    /* An HD DVD image opened as a plain file plays as if opened as hddvd://, like dvdnav's demux for DVD
+     * images. Above its priority (5), so a disc with a DVD side next to the HD DVD one opens as HD DVD; other
+     * files and images are declined quickly (a UDF signature, then the HD DVD files). */
+    add_submodule()
+    set_description("HD DVD image")
+    set_category(CAT_INPUT)
+    set_subcategory(SUBCAT_INPUT_DEMUX)
+    set_capability("demux", 6)
+    add_shortcut("hddvd")
+    set_callbacks(HddvdOpenImageFile, HddvdClose)
 
     /* Sub-pictures with button highlights (spudec.zig); only takes the ESes the demux marks with its fourcc. */
     add_submodule()
