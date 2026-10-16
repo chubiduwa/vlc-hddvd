@@ -297,6 +297,14 @@ void hddvd_spu_menu_show(demux_t *demux, int id)
     var_Change(demux->p_input, "spu-es", VLC_VAR_SETVALUE, &val, NULL);
 }
 
+/* The ES VLC's subtitle menu shows as chosen (-1: Disable). */
+int hddvd_spu_menu_get(demux_t *demux)
+{
+    if (demux->p_input == NULL)
+        return -1;
+    return (int)var_GetInteger(demux->p_input, "spu-es");
+}
+
 bool hddvd_es_selected(demux_t *demux, es_out_id_t *es)
 {
     bool on = false;

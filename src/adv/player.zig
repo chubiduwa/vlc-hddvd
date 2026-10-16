@@ -56,6 +56,7 @@ extern fn hddvd_fmt_set_language_str(fmt: *vlc.es_format_t, lang: [*:0]const u8)
 extern fn hddvd_es_send(demux: *vlc.demux_t, es: *vlc.es_out_id_t, block: *vlc.block_t) void;
 extern fn hddvd_es_selected(demux: *vlc.demux_t, es: *vlc.es_out_id_t) bool;
 extern fn hddvd_spu_menu_show(demux: *vlc.demux_t, id: c_int) void;
+extern fn hddvd_spu_menu_get(demux: *vlc.demux_t) c_int;
 extern fn hddvd_inherit_string(obj: *vlc.vlc_object_t, name: [*:0]const u8) ?[*:0]u8;
 extern fn hddvd_inherit_bool(obj: *vlc.vlc_object_t, name: [*:0]const u8) bool;
 extern fn hddvd_free(p: ?*anyopaque) void;
@@ -227,6 +228,8 @@ pub const Player = struct {
     sub_track: ?u8 = null,
     reselect: bool = false,
     subtitle_visible: bool = true,
+    /// The ES VLC's subtitle menu was last set to show (-1: Disable).
+    spu_menu: c_int = -1,
     /// The main and sub videos' layouts as last set (changeLayout).
     main_layout: VideoLayout = .{},
     sub_layout: VideoLayout = .{},
@@ -1006,6 +1009,7 @@ fn selectTracks(demux: *vlc.demux_t, audio: ?u8) void {
         t.selected = on;
         if (on) shown = t.id;
     }
+    p.spu_menu = shown;
     hddvd_spu_menu_show(demux, shown);
 }
 
@@ -1022,7 +1026,15 @@ fn followSubtitleChoice(demux: *vlc.demux_t) void {
         t.selected = on;
         if (on) picked = @intCast(t.id & 0x1f) else dropped = true;
     }
-    if (picked == null and !dropped) return;
+    if (picked == null and !dropped) {
+        // An entry that is not a subtitle track (the overlay, the sub video) chosen in the menu: it is always
+        // selected, so nothing changed; the menu goes back to the track playing.
+        const shown = hddvd_spu_menu_get(demux);
+        if (shown != p.spu_menu) for (p.spus.items) |t| {
+            if (t.id == shown) break; // a subtitle track: its selection follows
+        } else hddvd_spu_menu_show(demux, p.spu_menu);
+        return;
+    }
     const span = p.span orelse return;
     const attr = if (p.evob) |e| p.vti.attrOf(e) else null;
     const track: ?u8 = if (picked) |s| for (span.clip.subtitle) |st| {
