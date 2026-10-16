@@ -38,6 +38,8 @@ pub const Event = union(enum) {
     key_up: keys.Key,
     /// A resource the File Cache could not load (its URI, owned: the engine frees it).
     resource_not_found: []u8,
+    /// A subtitle track chosen in the player's own menu (VLC's), by track number; null: subtitles off.
+    user_subtitle: ?u8,
 };
 
 /// From the engine to the demux.
@@ -158,6 +160,8 @@ pub const Engine = struct {
     effect_done: u64 = 0,
     /// Resources not found since the scene last looked (owned URIs; the applications send resource_not_found).
     missing: std.ArrayList([]u8) = .empty,
+    /// A subtitle choice from the player's menu not yet handled by the scene (the outer optional: none pending).
+    user_subtitle: ??u8 = null,
     title_serial: u32 = 0,
     /// How many jumps within the title (the Title Timeline moved).
     jump_serial: u32 = 0,
@@ -290,6 +294,7 @@ pub const Engine = struct {
             .play_state => |p| e.play_state = p,
             .mouse_move, .mouse_down, .mouse_up, .key_down, .key_up => {},
             .resource_not_found => |u| e.missing.append(e.gpa, u) catch e.gpa.free(u),
+            .user_subtitle => |t| e.user_subtitle = t,
         }
     }
 

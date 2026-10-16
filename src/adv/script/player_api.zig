@@ -2257,6 +2257,31 @@ pub fn defaultKey(w: *World, key: u8) void {
     }
 }
 
+/// A subtitle track chosen in the player's own menu (null: subtitles off), as the subtitle keys do (V.10,
+/// V.11): the selection goes through Algorithm A1, so applications see Player.subtitle.track change and get
+/// subtitle_track. A track that is not selectable is ignored; a forced track stays shown.
+pub fn userSubtitle(w: *World, track: ?u8) void {
+    const m = &w.model;
+    const e = w.eng orelse return;
+    const n = track orelse {
+        if (!m.subtitle_visible or subForced(w)) return;
+        m.subtitle_visible = false;
+        e.command(.{ .subtitle_visible = false });
+        return;
+    };
+    const title = curTitle(w) orelse return;
+    const nav = for (navList(title, .subtitle)) |x| {
+        if (x.track == n) break x;
+    } else return;
+    if (!isSelectable(w, title, .subtitle, nav)) return;
+    m.tracks.sel_sub = n;
+    if (!m.subtitle_visible) {
+        m.subtitle_visible = true;
+        e.command(.{ .subtitle_visible = true });
+    }
+    reselect(w, true);
+}
+
 /// The next selectable track after the current one (V.10–V.13); `cc`: closed caption tracks (extensions 5–7)
 /// only, else (subtitles) only the others.
 fn cycleTrack(w: *World, kind: Kind, cc: bool) void {

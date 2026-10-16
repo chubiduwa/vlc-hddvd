@@ -286,6 +286,17 @@ void hddvd_es_select(demux_t *demux, es_out_id_t *es, bool on)
         es_out_Control(demux->out, ES_OUT_SET_ES_STATE, es, false);
 }
 
+/* VLC's subtitle menu shows `id` as the chosen track (-1: Disable), without its callback (nothing is selected
+ * by this). Sub-picture ESes play simultaneously, so deselecting the previous track would otherwise leave the
+ * menu on Disable while the new one plays. */
+void hddvd_spu_menu_show(demux_t *demux, int id)
+{
+    if (demux->p_input == NULL)
+        return;
+    vlc_value_t val = { .i_int = id };
+    var_Change(demux->p_input, "spu-es", VLC_VAR_SETVALUE, &val, NULL);
+}
+
 bool hddvd_es_selected(demux_t *demux, es_out_id_t *es)
 {
     bool on = false;

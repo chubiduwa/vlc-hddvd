@@ -55,6 +55,7 @@ extern fn hddvd_fmt_set_description(fmt: *vlc.es_format_t, desc: ?[*:0]const u8)
 extern fn hddvd_fmt_set_language_str(fmt: *vlc.es_format_t, lang: [*:0]const u8) void;
 extern fn hddvd_es_send(demux: *vlc.demux_t, es: *vlc.es_out_id_t, block: *vlc.block_t) void;
 extern fn hddvd_es_selected(demux: *vlc.demux_t, es: *vlc.es_out_id_t) bool;
+extern fn hddvd_spu_menu_show(demux: *vlc.demux_t, id: c_int) void;
 extern fn hddvd_inherit_string(obj: *vlc.vlc_object_t, name: [*:0]const u8) ?[*:0]u8;
 extern fn hddvd_inherit_bool(obj: *vlc.vlc_object_t, name: [*:0]const u8) bool;
 extern fn hddvd_free(p: ?*anyopaque) void;
@@ -101,6 +102,8 @@ const SpuTrack = struct {
     id: c_int,
     buf: std.ArrayList(u8) = .empty,
     pts: i64 = 0,
+    /// Selected as we last set or saw it: a change otherwise is the user's, in VLC's subtitle menu.
+    selected: bool = false,
 };
 
 const EsTrack = struct { es: *vlc.es_out_id_t, id: c_int };
@@ -809,6 +812,7 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
         p.reselect = false;
         selectTracks(demux, p.audio_track);
     }
+    followSubtitleChoice(demux);
     p.access.disc_busy.store(!p.stopped and !p.paused and !p.held, .monotonic);
     if (p.stopped) {
         if (!p.stop_told) if (p.host) |h| {
@@ -995,10 +999,47 @@ fn selectTracks(demux: *vlc.demux_t, audio: ?u8) void {
     log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "subtitle track %d: stream %d", .{
         if (p.sub_track) |n| @as(c_int, n) else -1, if (want) |w| @as(c_int, w) else -1,
     });
-    for (p.spus.items) |t| {
+    var shown: c_int = -1;
+    for (p.spus.items) |*t| {
         const on = if (want) |w| (t.id & 0x1f) == w else false;
         if (on != hddvd_es_selected(demux, t.es)) hddvd_es_select(demux, t.es, on);
+        t.selected = on;
+        if (on) shown = t.id;
     }
+    hddvd_spu_menu_show(demux, shown);
+}
+
+/// A subtitle track chosen in VLC's menu. Sub-picture ESes play simultaneously (our overlay and the sub video
+/// need it), so VLC selects the new one alongside the old: it becomes the chosen track, the others are
+/// deselected, and the applications are told (Player.subtitle.track). Deselecting it hides subtitles.
+fn followSubtitleChoice(demux: *vlc.demux_t) void {
+    const p = playerOf(demux);
+    var picked: ?u5 = null;
+    var dropped = false;
+    for (p.spus.items) |*t| {
+        const on = hddvd_es_selected(demux, t.es);
+        if (on == t.selected) continue;
+        t.selected = on;
+        if (on) picked = @intCast(t.id & 0x1f) else dropped = true;
+    }
+    if (picked == null and !dropped) return;
+    const span = p.span orelse return;
+    const attr = if (p.evob) |e| p.vti.attrOf(e) else null;
+    const track: ?u8 = if (picked) |s| for (span.clip.subtitle) |st| {
+        const a = attr orelse break null;
+        if (a.hdSubpStream(st.stream -| 1) == s) break st.track;
+    } else null else null;
+    if (picked != null and track == null) {
+        selectTracks(demux, null); // not a subtitle track of this clip: back to the chosen one
+        return;
+    }
+    log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "subtitle chosen in VLC: track %d", .{if (track) |n| @as(c_int, n) else -1});
+    if (track) |n| {
+        p.sub_track = n;
+        p.subtitle_visible = true;
+    } else p.subtitle_visible = false;
+    selectTracks(demux, null);
+    if (p.host) |h| h.post(.{ .user_subtitle = track });
 }
 
 /// Main or sub video layout (changeLayout), at once or over the duration. The main video is placed by our

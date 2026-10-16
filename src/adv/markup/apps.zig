@@ -756,6 +756,10 @@ pub const Apps = struct {
             e.gpa.free(u);
         }
         e.missing.clearRetainingCapacity();
+        if (e.user_subtitle) |t| {
+            e.user_subtitle = null;
+            player_api.userSubtitle(w, t);
+        }
         if (e.effect_done != s.effect_done) {
             s.effect_done = e.effect_done;
             player_api.effectFinished(w, e.effect_done);
