@@ -351,6 +351,14 @@ pub const Runtime = struct {
     }
 
     /// All contexts must be destroyed first.
+    /// The calling thread runs scripts from now on. QuickJS bounds the stack from the top it recorded when the
+    /// runtime was created, on that thread: another thread's stack can lie anywhere below or above it, so
+    /// scripts failed at random with "Maximum call stack size exceeded" (seen on Linux) or could overflow. Call
+    /// it at the outermost frame of the thread, before any script runs.
+    pub fn enterThread(r: *Runtime) void {
+        c.JS_UpdateStackTop(r.rt);
+    }
+
     pub fn destroy(r: *Runtime) void {
         c.JS_FreeRuntime(r.rt);
         r.gpa.destroy(r);

@@ -43,7 +43,9 @@ EXPECT = {
 }
 # Log lines that fail a disc.
 REJECT = ["panic", "cannot load the Advanced Content playlist", "not an HD DVD Standard Content disc",
-          "buffer too late", "buffer deadlock prevented", "no decoder for", "no vout found"]
+          "buffer too late", "buffer deadlock prevented", "no decoder for", "no vout found",
+          # every test disc's scripts run without error ("1 scripts run" alone also matches a failed run)
+          "with an uncaught exception", "Maximum call stack size exceeded"]
 
 
 def play(vlc, plugins, mrl, timeout, log, gdb=False, extra=()):
@@ -124,7 +126,7 @@ def regressions(args, logs):
                 "titleTimeBegin": "00:00:00:00", "titleTimeEnd": "00:00:02:00",
             })
 
-        def check(name, fixture_data, expected=(), forbidden=(), extra=(), natural_end=True):
+        def check(name, fixture_data, expected=(), forbidden=(), extra=(), natural_end=True, allowed=()):
             disc, playlist, tree, _ = fixture_data
             tree.write(playlist, encoding="utf-8", xml_declaration=True)
             began = time.monotonic()
@@ -140,7 +142,7 @@ def regressions(args, logs):
             if natural_end and elapsed < 1.8:
                 problems.append(f"two-second title ended early ({elapsed:.2f} s)")
             problems += [f"missing {line!r}" for line in required if line not in text]
-            problems += [f"unexpected {line!r}" for line in (*REJECT, *forbidden) if line in text]
+            problems += [f"unexpected {line!r}" for line in (*REJECT, *forbidden) if line in text and line not in allowed]
             if problems:
                 failed.append(name)
                 print(f"FAIL {name}: " + "; ".join(problems))
@@ -252,7 +254,9 @@ later(function () {
         files = [(name, mime, "while (true) {}" if name == "CHAPTERS.JS" else data)
                  for name, mime, data in make_test_disc.app_files(3)]
         (case[0] / "ADV_OBJ" / "CHAPTERS.ACA").write_bytes(make_test_disc.archive(files))
-        check("script-shutdown", case, extra=("--run-time=1",), natural_end=False)
+        # The endless script is interrupted at shutdown: an uncaught exception by design.
+        check("script-shutdown", case, extra=("--run-time=1",), natural_end=False,
+              allowed=("with an uncaught exception",))
 
         requests = []
 

@@ -120,6 +120,7 @@ pub const Host = struct {
         c.image = null;
         h.pres.setCursor(c);
         for (h.pool) |f| if (f) |x| x.unref();
+        if (h.has_apps) if (h.eng.scene) |sc| apps.Apps.enterThread(sc.ctx); // freed on this thread
         h.eng.deinit();
         h.events.deinit(gpa);
         h.commands.deinit(gpa);
@@ -150,6 +151,8 @@ pub const Host = struct {
 
     fn run(data: ?*anyopaque) callconv(.c) ?*anyopaque {
         const h: *Host = @ptrCast(@alignCast(data));
+        // The script runtime was created on the demux thread; this one runs the scripts.
+        if (h.has_apps) if (h.eng.scene) |sc| apps.Apps.enterThread(sc.ctx);
         var batch: std.ArrayList(engine.Event) = .empty;
         defer batch.deinit(gpa);
         vlc.vlc_mutex_lock(&h.lock);

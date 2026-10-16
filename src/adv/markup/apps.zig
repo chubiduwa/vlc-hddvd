@@ -312,6 +312,12 @@ pub const Apps = struct {
 
     const vtable: engine.Scene.VTable = .{ .tick = tick, .input = input, .render = render, .deinit = deinit };
 
+    /// Scripts run on the calling thread from now on (the engine thread; the demux thread at shutdown).
+    pub fn enterThread(ctx: *anyopaque) void {
+        const scene: *Apps = @ptrCast(@alignCast(ctx));
+        scene.world.rt.enterThread();
+    }
+
     pub fn requestStop(ctx: *anyopaque) void {
         const scene: *Apps = @ptrCast(@alignCast(ctx));
         scene.world.rt.stop.store(true, .release);
