@@ -465,6 +465,12 @@ void hddvd_input_pause(demux_t *demux, bool paused)
         var_SetInteger(demux->p_input, "state", paused ? PAUSE_S : PLAYING_S);
 }
 
+void hddvd_input_seek(demux_t *demux, int64_t time)
+{
+    if (demux->p_input != NULL)
+        var_SetInteger(demux->p_input, "time", time);
+}
+
 /* VLC's audio output settings, for effect sounds played while paused (adv/fxout.zig): whether VLC plays sound at
  * all (an audio output that is not the "dummy" one), the volume as an amplitude (VLC's outputs map their volume
  * cubically, then apply the "gain" option; 0 when muted), and the name of the selected device (empty: none or

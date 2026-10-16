@@ -188,7 +188,6 @@ Advanced Content (HDi):
 - The markup audio object (`audio/x-wav` objects in a page).
 - Full Restricted Mode (Annex X), including signature authentication and read-only arbitrary XML documents.
   Resource and storage access is restricted by default; see [Content trust](#content-trust).
-- Same-title script jumps while VLC is paused.
 
 Standard Content:
 

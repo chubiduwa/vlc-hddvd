@@ -21,6 +21,7 @@ extern fn hddvd_now_us() i64;
 extern fn hddvd_mouse_poll(m: ?*anyopaque, x: *c_int, y: *c_int) c_int;
 extern fn hddvd_key_poll(m: ?*anyopaque) u32;
 extern fn hddvd_input_pause(demux: *vlc.demux_t, paused: bool) void;
+extern fn hddvd_input_seek(demux: *vlc.demux_t, time: i64) void;
 extern fn hddvd_aout_settings(demux: *vlc.demux_t, out: *fxout.Settings) void;
 
 fn log(obj: *vlc.vlc_object_t, prio: c_int, src: std.builtin.SourceLocation, comptime fmt: [*:0]const u8, args: anytype) void {
@@ -221,12 +222,14 @@ pub const Host = struct {
     }
 
     /// Hands the engine's commands on. The demux carries out most of them, but a paused VLC does not call the
-    /// demux, so pause and resume, audio levels and effect sounds are carried out here.
+    /// demux, so pause, resume, paused seeks, audio levels and effect sounds are carried out here.
     fn dispatch(h: *Host, now: i64) void {
         const e = &h.eng;
+        var paused = e.play_state == .paused;
         defer e.outbox.clearRetainingCapacity();
         for (e.outbox.items) |cmd| switch (cmd) {
             .pause => |on| {
+                paused = on;
                 if (on) h.engine_pause.store(true, .release);
                 hddvd_input_pause(@ptrCast(h.obj), on);
             },
@@ -243,6 +246,15 @@ pub const Host = struct {
                 h.pres.stopEffect();
             },
             else => {
+                const seek: ?u64 = if (paused) switch (cmd) {
+                    .jump => |time| time,
+                    .jump_title => |target| if (e.title == target.title) target.time else null,
+                    else => null,
+                } else null;
+                if (seek) |time| {
+                    hddvd_input_seek(@ptrCast(h.obj), h.pres.time_base.us(time));
+                    continue;
+                }
                 vlc.vlc_mutex_lock(&h.lock);
                 defer vlc.vlc_mutex_unlock(&h.lock);
                 h.commands.append(gpa, cmd) catch {};

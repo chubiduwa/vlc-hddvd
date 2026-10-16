@@ -166,6 +166,75 @@ def regressions(args, logs):
         titles.append(outro)
         check("application-transition", case, expected=('title 1 "after-app"', "main video: 16x16"))
 
+        paused_jump_script = """
+var playlist = Player.playlist;
+var timers = [];
+Diagnostics.listeners.add(Diagnostics.listeners.LISTENER_TYPE_DEBUGGER);
+Diagnostics.trace.autoFlush = true;
+function report(message) {
+    Diagnostics.trace.writeLine(message, "paused-jump", Diagnostics.TRACE_LEVEL_INFO);
+}
+function later(callback) {
+    var timer = createTimer("00:00:00:30", TIMER_APPLICATION, callback);
+    timer.autoReset = false;
+    timer.enabled = true;
+    timers.push(timer);
+}
+function failed(target) {
+    report("PAUSED-JUMP-FAIL target=" + target + " actual=" + playlist.currentTitle.elapsedTime + " state=" + playlist.playState);
+    playlist.play();
+    playlist.stop();
+}
+function verify(target, next) {
+    later(function () {
+        if (playlist.playState !== playlist.PLAYSTATE_PAUSE || playlist.currentTitle.elapsedTime !== target) {
+            failed(target);
+            return;
+        }
+        later(function () {
+            if (playlist.playState !== playlist.PLAYSTATE_PAUSE || playlist.currentTitle.elapsedTime !== target) {
+                failed(target);
+                return;
+            }
+            next();
+        });
+    });
+}
+later(function () {
+    playlist.pause();
+    playlist.currentTitle.jump("00:00:03:00", false);
+    verify("00:00:03:00", function () {
+        playlist.currentTitle.jump("00:00:04:00", false);
+        verify("00:00:04:00", function () {
+            playlist.play();
+            later(function () {
+                if (playlist.playState !== playlist.PLAYSTATE_PLAY || playlist.currentTitle.elapsedTime === "00:00:04:00") {
+                    failed("resumed");
+                    return;
+                }
+                report("PAUSED-JUMP-OK");
+                playlist.stop();
+            });
+        });
+    });
+});
+"""
+        for background in (False, True):
+            name = "paused-jump-background" if background else "paused-jump-video"
+            case = fixture(name)
+            case[3].set("titleDuration", "00:00:08:00")
+            case[3].find(tag("ApplicationSegment")).set("titleTimeEnd", "00:00:08:00")
+            if not background:
+                clip = copy.deepcopy(original.find(tag("TitleSet")).find(tag("Title")).find(tag("PrimaryAudioVideoClip")))
+                clip.set("titleTimeEnd", "00:00:08:00")
+                case[3].insert(0, clip)
+            files = [(name, mime, paused_jump_script if name == "CHAPTERS.JS" else data)
+                     for name, mime, data in make_test_disc.app_files(3)]
+            (case[0] / "ADV_OBJ" / "CHAPTERS.ACA").write_bytes(make_test_disc.archive(files))
+            check(name, case, expected=("PAUSED-JUMP-OK",),
+                  forbidden=("PAUSED-JUMP-FAIL", "with an uncaught exception"),
+                  extra=("--hddvd-trust-content",), natural_end=False)
+
         case = fixture("containment")
         resource(case[3], "file:///dvddisc/%2e%2e/outside.txt")
         expected = ["%2e%2e/outside.txt (BadUri)"]
