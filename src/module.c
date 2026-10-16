@@ -78,6 +78,9 @@ vlc_module_begin()
     add_bool("hddvd-script-trace", false, "Log script exceptions (debugging)",
              "Advanced Content: log every exception the disc's scripts throw, including those they catch "
              "themselves, with its stack (-vv).", true)
+    add_bool("hddvd-trust-content", false, "Trust Advanced Content",
+             "Allow network resources and session storage for content you trust. Disc signatures are not "
+             "verified; leave disabled for untrusted discs.", true)
     add_bool("hddvd-test-page", false, "Graphics test page (debugging)",
              "Advanced Content: draw a test page in the graphics plane (clocks, a moving box, a clear rectangle "
              "and the cursor) to check the overlay over playback, pause and seek.", true)

@@ -133,12 +133,20 @@ fn decode(dec_c: [*c]vlc.decoder_t, block_c: [*c]vlc.block_t) callconv(.c) c_int
     const s = sysOf(dec);
     const block: *vlc.block_t = block_c orelse {
         // Drain: everything decoded is output now.
+        if (s.sub) |sub| hddvd_nested_decode(sub, null);
         if (s.main) |m| hddvd_nested_decode(m, null);
         release(s, true);
         return vlc.VLC_SUCCESS;
     };
     if (block.i_pts > 0) s.last_pts = block.i_pts;
     const data = block.p_buffer[0..block.i_buffer];
+    if (std.mem.eql(u8, data, present.audio_drain_magic)) {
+        hddvd_block_release(block);
+        if (s.sub) |sub| hddvd_nested_decode(sub, null);
+        if (s.main) |main| hddvd_nested_decode(main, null);
+        release(s, true);
+        return vlc.VLC_SUCCESS;
+    }
     if (present.subPrefix(data, present.sub_audio_magic)) |codec| {
         block.p_buffer += present.sub_prefix_len;
         block.i_buffer -= present.sub_prefix_len;

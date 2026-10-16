@@ -173,9 +173,43 @@ pub fn xmlBase(gpa: std.mem.Allocator, doc_base: []const u8, value: []const u8) 
 /// Checks the content rules of §6.2.2: shorter than 1024 and no ".." segment.
 pub fn valid(s: []const u8) bool {
     if (s.len >= max_len) return false;
-    var it = std.mem.splitScalar(u8, Parts.parse(s).path, '/');
-    while (it.next()) |seg| if (std.mem.eql(u8, seg, "..")) return false;
-    return true;
+    return validPath(Parts.parse(s).path, true);
+}
+
+pub fn validDiscPath(path: []const u8) bool {
+    return (path.len == 0 or path[0] != '/') and
+        std.mem.indexOfScalar(u8, path, ':') == null and validPath(path, false);
+}
+
+pub fn allowed(s: []const u8, trusted: bool) bool {
+    if (!valid(s)) return false;
+    const location = locate(s) orelse return false;
+    return trusted or location.area == .disc or location.area == .filecache;
+}
+
+fn validPath(path: []const u8, encoded: bool) bool {
+    var index: usize = 0;
+    var length: usize = 0;
+    var dots = true;
+    while (index < path.len) {
+        var char = path[index];
+        index += 1;
+        if (encoded and char == '%') {
+            if (index + 2 > path.len) return false;
+            char = std.fmt.parseInt(u8, path[index..][0..2], 16) catch return false;
+            index += 2;
+        }
+        if (char == 0 or char == '\\') return false;
+        if (char == '/') {
+            if (dots and length == 2) return false;
+            length = 0;
+            dots = true;
+        } else {
+            length += 1;
+            dots = dots and char == '.';
+        }
+    }
+    return !dots or length != 2;
 }
 
 /// Decodes %XX escapes (RFC 3986 §2.1). Caller frees.
@@ -370,4 +404,32 @@ test "archive members and validity" {
     const dec = try percentDecode(testing.allocator, "a%20b%zz%4");
     defer testing.allocator.free(dec);
     try testing.expectEqualStrings("a b%zz%4", dec);
+}
+
+test "disc paths cannot escape through URI encoding or platform separators" {
+    for ([_][]const u8{
+        "file:///dvddisc/%2e%2e/outside",
+        "file:///dvddisc/.%2E/outside",
+        "file:///dvddisc/a%2f..%2foutside",
+        "file:///dvddisc/a%5c..%5coutside",
+        "file:///dvddisc/a%00outside",
+        "file:///dvddisc/a\\..\\outside",
+        "file:///dvddisc/a%2",
+    }) |path| try testing.expect(!valid(path));
+    for ([_][]const u8{ "../outside", "a/../../outside", "/outside", "a\\outside", "C:/outside", "a:stream", "a\x00outside" }) |path|
+        try testing.expect(!validDiscPath(path));
+    try testing.expect(valid("file:///dvddisc/ADV_OBJ/a%20b.xmu"));
+    try testing.expect(validDiscPath("ADV_OBJ/a b.xmu"));
+    try testing.expect(validDiscPath(""));
+}
+
+test "untrusted content can only access the disc and file cache" {
+    try testing.expect(allowed("file:///dvddisc/ADV_OBJ/page.xmu", false));
+    try testing.expect(allowed("file:///filecache/page.xmu", false));
+    for ([_][]const u8{ "http://127.0.0.1/a", "https://example.com/a", "file:///required/save", "file:///common/required/save", "file:///additional/usb/save" }) |resource| {
+        try testing.expect(!allowed(resource, false));
+        try testing.expect(allowed(resource, true));
+    }
+    try testing.expect(!allowed("file:///dvddisc/%2e%2e/outside", true));
+    try testing.expect(!allowed("file:///outside", true));
 }

@@ -11,6 +11,7 @@ const vlc = @import("vlc");
 const vlcio = @import("vlcio.zig");
 const udf = @import("udf.zig");
 const aacs = @import("aacs.zig");
+const uri = @import("adv/uri.zig");
 
 pub const Error = error{NotFound} || vlcio.Error || udf.Error;
 
@@ -59,8 +60,32 @@ pub const Fs = struct {
             trimmed[0 .. trimmed.len - "HVDVD_TS".len]
         else
             trimmed;
-        fs.backend = .{ .dir = try gpa.dupe(u8, std.mem.trimEnd(u8, root, "/\\")) };
+        fs.backend = .{ .dir = try canonicalPath(gpa, root) };
         return fs;
+    }
+
+    fn canonicalPath(gpa: std.mem.Allocator, path: []const u8) Error![]u8 {
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        return std.Io.Dir.cwd().realPathFileAlloc(threaded.io(), path, gpa) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.NotFound,
+        };
+    }
+
+    fn folderPath(fs: *Fs, root: []const u8, rel: []const u8) Error![]u8 {
+        const joined = try std.fmt.allocPrint(fs.gpa, "{s}/{s}", .{ root, rel });
+        defer fs.gpa.free(joined);
+        const resolved = try canonicalPath(fs.gpa, joined);
+        errdefer fs.gpa.free(resolved);
+        const base = std.mem.trimEnd(u8, root, "/\\");
+        if (resolved.len < base.len) return error.NotFound;
+        const prefix = resolved[0..base.len];
+        const matches = if (@import("builtin").os.tag == .windows)
+            std.ascii.eqlIgnoreCase(prefix, base)
+        else
+            std.mem.eql(u8, prefix, base);
+        if (!matches or (resolved.len > base.len and resolved[base.len] != '/' and resolved[base.len] != '\\')) return error.NotFound;
+        return resolved;
     }
 
     pub fn close(fs: *Fs) void {
@@ -119,9 +144,10 @@ pub const Fs = struct {
 
     /// Opens a file by disc-relative path; error.NotFound if it does not exist.
     pub fn openFile(fs: *Fs, rel: []const u8) Error!File {
+        if (!uri.validDiscPath(rel)) return error.NotFound;
         switch (fs.backend) {
             .dir => |root| {
-                const p = try std.fmt.allocPrint(fs.gpa, "{s}/{s}", .{ root, rel });
+                const p = try fs.folderPath(root, rel);
                 defer fs.gpa.free(p);
                 const url = try vlcio.pathToUrl(fs.gpa, p);
                 defer fs.gpa.free(url);
@@ -149,6 +175,7 @@ pub const Fs = struct {
     /// Whether a disc-relative file exists. A folder is listed rather than the file opened, so that a missing file
     /// logs no error from VLC's file access.
     pub fn exists(fs: *Fs, rel: []const u8) bool {
+        if (!uri.validDiscPath(rel)) return false;
         switch (fs.backend) {
             .image => |*img| {
                 const info = img.volume.lookup(rel) catch return false;
@@ -169,13 +196,14 @@ pub const Fs = struct {
 
     /// Names of the entries of a disc-relative folder (free with freeNames).
     pub fn listDir(fs: *Fs, gpa: std.mem.Allocator, rel: []const u8) Error![][]u8 {
+        if (!uri.validDiscPath(rel)) return error.NotFound;
         switch (fs.backend) {
             .image => |*img| return img.volume.listDir(gpa, rel) catch |err| switch (err) {
                 error.NotFound => error.NotFound,
                 else => err,
             },
             .dir => |root| {
-                const p = try std.fmt.allocPrint(fs.gpa, "{s}/{s}", .{ root, rel });
+                const p = try fs.folderPath(root, rel);
                 defer fs.gpa.free(p);
                 const url = try vlcio.pathToUrl(fs.gpa, p);
                 defer fs.gpa.free(url);

@@ -48,6 +48,7 @@ const Sys = struct {
     timer: retime.Retimer = retime.Retimer.init(0, 0),
     /// Timestamp of the last block, to reject pictures with nonsensical dates.
     last_pts: i64 = 0,
+    background: bool = false,
 };
 
 fn sysOf(dec: *vlc.decoder_t) *Sys {
@@ -59,7 +60,7 @@ fn open(o: *vlc.vlc_object_t) callconv(.c) c_int {
     if (dec.fmt_in.i_cat != vlc.VIDEO_ES or dec.fmt_in.i_codec != fourcc) return vlc.VLC_EGENERIC;
     const x = present.Presentation.fromExtra(&dec.fmt_in) orelse return vlc.VLC_EGENERIC;
     const s = gpa.create(Sys) catch return vlc.VLC_ENOMEM;
-    s.* = .{ .dec = dec, .pres = x.pres };
+    s.* = .{ .dec = dec, .pres = x.pres, .background = x.codec == vlc.VLC_CODEC_I420 };
     s.main = hddvd_nested_new(o, &dec.fmt_in, dec.fmt_in.i_cat, x.codec, s, kind_main) orelse {
         gpa.destroy(s);
         return vlc.VLC_EGENERIC;
@@ -192,7 +193,9 @@ pub fn onPicture(ctx: *anyopaque, pic: *vlc.picture_t) void {
     const out = hddvd_dec_new_picture(s.dec) orelse return;
     if (yuvOf(out)) |dst| {
         const sq = squareSize(&fmt);
-        if (compose.place(layout, sq[0], sq[1], aw, ah)) |placed| {
+        if (s.background) {
+            compose.fill(dst, outer);
+        } else if (compose.place(layout, sq[0], sq[1], aw, ah)) |placed| {
             const r = placed.dest;
             const shown = if (placed.crop) |c| src.crop(c, placed.space[0], placed.space[1]) else src;
             const covers = r.x <= 0 and r.y <= 0 and r.x + r.w >= aw and r.y + r.h >= ah;

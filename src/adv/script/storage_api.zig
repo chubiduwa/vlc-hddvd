@@ -66,6 +66,7 @@ const device_constants = [_]js.Member{
 
 fn storeOf(s: *Script) ?*pstore.Store {
     const f = s.world.files orelse return null;
+    if (!f.trusted) return null;
     return f.store;
 }
 
@@ -91,6 +92,7 @@ pub const Manager = struct {
     }
 
     fn getPersistentStorageDevices(s: *Script, kind: u32) js.Error!Value {
+        if (s.world.files) |files| if (!files.trusted) return error.InvalidCall;
         const arr = try s.cx.array();
         errdefer s.cx.free(arr);
         const st = storeOf(s) orelse return arr;
@@ -121,12 +123,14 @@ pub const Manager = struct {
     /// pause() counts at once, not at the next tick). The player has no management menu of its own (the
     /// storage is in memory): it returns at once.
     fn callManagementMenu(s: *Script) js.Error!void {
+        if (s.world.files) |files| if (!files.trusted) return error.InvalidCall;
         if (s.world.model.play_state != player_api.PlayState.pause) return error.InvalidCall;
     }
 
     /// saveBasePath(uri): the Assignment Information File next to that playlist (§10.6).
     fn saveBasePath(s: *Script, u: []const u8) js.Error!void {
         const f = s.world.files orelse return error.FileNotFound;
+        if (!f.trusted) return error.InvalidCall;
         if ((files_mod.Files.where(u) catch return error.Argument) != .store) return error.Argument;
         const name = std.fs.path.basenamePosix(u);
         if (name.len != 12 or !std.ascii.endsWithIgnoreCase(name, ".XPL")) return error.Argument;
@@ -328,6 +332,19 @@ pub fn exposeConstructors(cx: *js.Context) js.Error!void {
 // ---- tests --------------------------------------------------------------------------------------------------------
 
 const testenv = @import("testenv.zig");
+
+test "untrusted applications cannot use the storage manager" {
+    const env = try testenv.Env.create();
+    defer env.destroy();
+    env.files.trusted = false;
+    env.world.paused = true;
+    try env.run(
+        \\assertEq(PersistentStorageDevice.STORAGE_ALL, 0);
+        \\assertThrows(function () { PersistentStorageManager.getPersistentStorageDevices(PersistentStorageDevice.STORAGE_ALL); }, "HDDVD_E_INVALIDCALL");
+        \\assertThrows(function () { PersistentStorageManager.callManagementMenu(); }, "HDDVD_E_INVALIDCALL");
+        \\assertThrows(function () { PersistentStorageManager.saveBasePath("file:///required/save"); }, "HDDVD_E_INVALIDCALL");
+    , "restricted-storage.js");
+}
 
 test "DataCache and the persistent storage" {
     const e = try testenv.Env.create();

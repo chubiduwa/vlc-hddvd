@@ -105,6 +105,7 @@ pub const Host = struct {
         h.stop = true;
         vlc.vlc_cond_signal(&h.wake);
         vlc.vlc_mutex_unlock(&h.lock);
+        if (h.has_apps) if (h.eng.scene) |scene| apps.Apps.requestStop(scene.ctx);
         vlc.vlc_join(h.thread, null);
         if (kept) |k| if (h.has_apps) if (h.eng.scene) |sc| {
             k.* = apps.Apps.takeKept(sc.ctx);

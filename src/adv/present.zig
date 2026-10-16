@@ -22,6 +22,7 @@ pub const extra_len = extra_magic.len + @sizeOf(usize) + 4;
 
 /// Prefix of a sub audio block forwarded into the main audio ES: magic then the stream's codec.
 pub const sub_audio_magic = "HDSUBAUD";
+pub const audio_drain_magic = "HDDRAIN1";
 pub const sub_prefix_len = 12;
 
 pub const Effect = struct {

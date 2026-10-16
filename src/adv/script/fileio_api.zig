@@ -830,12 +830,12 @@ test "TextStream: positions after writes and deleteLine, hidden copies" {
         \\  // The stream's copy in the API Managed Area is the player's: not listed, not reachable.
         \\  FileIO.getFiles("file:///filecache", cb(function (a, i) { var l = []; for (var k = 0; k < a.size; k++) l.push(a.get(k)); r.files = l.join(","); }));
         \\  FileIO.getDirectories("file:///filecache", cb(function (a, i) { r.dirs = a.size; }));
-        \\  FileIO.getFileInfo("file:///filecache/%00player/textstream2.txt", cb(function (f, i) { r.hidden = i; }));
+        \\  assertThrows(function () { FileIO.getFileInfo("file:///filecache/%00player/textstream2.txt", function () {}); }, "HDDVD_E_ARGUMENT");
         \\  FileIO.getDirectoryInfo("file:///filecache", cb(function (d, i) { r.size = d.size; }));
         \\}));
     , "textstream1.js");
     try e.run(
-        \\assert(r.w); assertEq(r.files, "file:///filecache/w.txt"); assertEq(r.dirs, 0); assertEq(r.hidden, FileIO.FILE_NOT_FOUND);
+        \\assert(r.w); assertEq(r.files, "file:///filecache/w.txt"); assertEq(r.dirs, 0);
         \\assert(r.size > 14, "the copy takes room");
         \\FileIO.saveTextFile(r.ts, cb(function (i) { r.saved = i; }));
     , "textstream2.js");

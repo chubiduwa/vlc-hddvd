@@ -22,6 +22,7 @@ const gpa = std.heap.c_allocator;
 
 extern fn hddvd_now_us() i64;
 extern fn hddvd_inherit_string(obj: *vlc.vlc_object_t, name: [*:0]const u8) ?[*:0]u8;
+extern fn hddvd_inherit_bool(obj: *vlc.vlc_object_t, name: [*:0]const u8) bool;
 extern fn hddvd_free(p: ?*anyopaque) void;
 
 /// Largest file read from a network server.
@@ -55,6 +56,7 @@ pub const Access = struct {
     lock: vlc.vlc_mutex_t = undefined,
     /// Files as the applications' scripts see them (Annex Z.3), over the File Cache, the store and the disc.
     files: files_mod.Files = undefined,
+    trusted: bool = false,
     /// The Primary Video Set is being read from the disc: scripts cannot read disc files (Z.3).
     disc_busy: std.atomic.Value(bool) = .init(false),
 
@@ -73,6 +75,7 @@ pub const Access = struct {
             .res = resman.Manager.init(gpa),
             .collector = .{ .gpa = gpa },
             .menu_language = lang,
+            .trusted = hddvd_inherit_bool(obj, "hddvd-trust-content"),
         };
         a.res.keys = fs.keys;
         a.res.cache.now_ms = wallMs;
@@ -81,6 +84,7 @@ pub const Access = struct {
             .gpa = gpa,
             .temp = &a.res.cache.temp,
             .store = &a.store,
+            .trusted = a.trusted,
             .backend = .{
                 .ctx = a,
                 .resource = filesResource,
@@ -210,6 +214,7 @@ pub const Access = struct {
     /// Reads a file from where its URI points (not from the File Cache's Resource Area).
     pub fn fetch(a: *Access, u: []const u8) ![]u8 {
         if (!uri.valid(u)) return error.BadUri;
+        if (!uri.allowed(u, a.trusted)) return error.NotPermitted;
         const loc = uri.locate(u) orelse return error.UnsupportedUri;
         switch (loc.area) {
             .disc => {
@@ -255,6 +260,7 @@ pub const Access = struct {
     /// is there, else from the URI's own location (Annex Z.3). Archive members are only in the File Cache.
     /// Caller frees.
     pub fn read(a: *Access, u: []const u8) ![]u8 {
+        if (!uri.allowed(u, a.trusted)) return error.NotPermitted;
         vlc.vlc_mutex_lock(&a.lock);
         defer vlc.vlc_mutex_unlock(&a.lock);
         if (a.res.lookup(u)) |d| return gpa.dupe(u8, d);

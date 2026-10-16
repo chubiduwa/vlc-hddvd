@@ -13,11 +13,19 @@ error that way (some builds crash at exit), the same exit code from a disc is on
 --gdb runs VLC under gdb and prints the backtrace of a crash.
 """
 import argparse
+import copy
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+import xml.etree.ElementTree as ET
+
+import make_test_disc
 
 # Log lines each disc must produce, in any order.
 EXPECT = {
@@ -34,10 +42,11 @@ EXPECT = {
     ],
 }
 # Log lines that fail a disc.
-REJECT = ["panic", "cannot load the Advanced Content playlist", "not an HD DVD Standard Content disc"]
+REJECT = ["panic", "cannot load the Advanced Content playlist", "not an HD DVD Standard Content disc",
+          "buffer too late", "buffer deadlock prevented", "no decoder for", "no vout found"]
 
 
-def play(vlc, plugins, mrl, timeout, log, gdb=False):
+def play(vlc, plugins, mrl, timeout, log, gdb=False, extra=()):
     """Plays `mrl`; returns VLC's exit code (None: timed out), its log, and gdb's crash report if any."""
     env = dict(os.environ)
     env.pop("VLC_PLUGIN_PATH", None)
@@ -45,7 +54,7 @@ def play(vlc, plugins, mrl, timeout, log, gdb=False):
         env["VLC_PLUGIN_PATH"] = os.path.abspath(plugins)
     cmd = [vlc, "-I", "dummy", "--ignore-config", "--reset-plugins-cache", "--no-media-library",
            "--vout=dummy", "--aout=dummy", "--play-and-exit", "-vv",
-           "--file-logging", f"--logfile={log}", "--log-verbose=2", mrl]
+           "--file-logging", f"--logfile={log}", "--log-verbose=2", *extra, mrl]
     if gdb:
         cmd = ["gdb", "-q", "-batch", "-return-child-result", "-ex", "set pagination off", "-ex", "run",
                "-ex", "info sharedlibrary", "-ex", "thread apply all bt 40", "--args"] + cmd
@@ -73,6 +82,143 @@ def disc_mrl(disc):
 
 def indent(text):
     return "\n".join("  " + l for l in text.splitlines())
+
+
+def regressions(args, logs):
+    source = pathlib.Path(args.discs) / "advanced"
+    if not source.is_dir():
+        return []
+    namespace = make_test_disc.PLAYLIST_NS
+    ET.register_namespace("", namespace)
+
+    def tag(name):
+        return f"{{{namespace}}}{name}"
+
+    failed = []
+    with tempfile.TemporaryDirectory(prefix="hddvd-regressions-") as work:
+        root = pathlib.Path(work)
+        marker = root / "outside.txt"
+        marker.write_text("Synthetic containment marker.\n", encoding="ascii")
+
+        def fixture(name):
+            disc = root / name
+            shutil.copytree(source, disc)
+            playlist = disc / "ADV_OBJ" / "VPLST000.XPL"
+            tree = ET.parse(playlist)
+            titles = tree.find(tag("TitleSet"))
+            first = titles.find(tag("FirstPlayTitle"))
+            if first is not None:
+                titles.remove(first)
+            title = titles.find(tag("Title"))
+            title.set("titleDuration", "00:00:02:00")
+            for child in list(title):
+                if child.tag in (tag("PrimaryAudioVideoClip"), tag("ChapterList")):
+                    title.remove(child)
+                elif child.tag == tag("ApplicationSegment"):
+                    child.set("titleTimeEnd", "00:00:02:00")
+            return disc, playlist, tree, title
+
+        def resource(title, uri):
+            ET.SubElement(title, tag("TitleResource"), {
+                "src": uri, "size": str(marker.stat().st_size), "priority": "1", "multiplexed": "false",
+                "titleTimeBegin": "00:00:00:00", "titleTimeEnd": "00:00:02:00",
+            })
+
+        def check(name, fixture_data, expected=(), forbidden=(), extra=(), natural_end=True):
+            disc, playlist, tree, _ = fixture_data
+            tree.write(playlist, encoding="utf-8", xml_declaration=True)
+            began = time.monotonic()
+            code, text, crash = play(args.vlc, args.plugins, disc_mrl(disc), min(args.timeout, 20),
+                                     os.path.join(logs, name + ".log"), args.gdb, extra)
+            elapsed = time.monotonic() - began
+            required = ["CHAPTERS.XMF: 1 scripts run", *expected]
+            if natural_end:
+                required.append("playlist ended")
+            problems = []
+            if code != 0:
+                problems.append(f"VLC exit code {code}")
+            if natural_end and elapsed < 1.8:
+                problems.append(f"two-second title ended early ({elapsed:.2f} s)")
+            problems += [f"missing {line!r}" for line in required if line not in text]
+            problems += [f"unexpected {line!r}" for line in (*REJECT, *forbidden) if line in text]
+            if problems:
+                failed.append(name)
+                print(f"FAIL {name}: " + "; ".join(problems))
+                if crash:
+                    print(indent(crash))
+            else:
+                print(f"ok   {name}")
+
+        check("application-only", fixture("application-only"), expected=("main video: 16x16",))
+
+        case = fixture("application-transition")
+        case[3].set("onEnd", "after-app")
+        titles = case[2].find(tag("TitleSet"))
+        original = ET.parse(source / "ADV_OBJ" / "VPLST000.XPL")
+        intro = copy.deepcopy(original.find(tag("TitleSet")).find(tag("FirstPlayTitle")))
+        intro.set("titleDuration", "00:00:02:00")
+        intro.find(tag("PrimaryAudioVideoClip")).set("titleTimeEnd", "00:00:02:00")
+        titles.insert(0, intro)
+        outro = copy.deepcopy(intro)
+        outro.tag = tag("Title")
+        outro.set("titleNumber", "2")
+        outro.set("id", "after-app")
+        titles.append(outro)
+        check("application-transition", case, expected=('title 1 "after-app"', "main video: 16x16"))
+
+        case = fixture("containment")
+        resource(case[3], "file:///dvddisc/%2e%2e/outside.txt")
+        expected = ["%2e%2e/outside.txt (BadUri)"]
+        link = case[0] / "ADV_OBJ" / "outside.txt"
+        try:
+            link.symlink_to(marker)
+        except OSError:
+            print("note containment: symlink creation unavailable; encoded traversal is still checked")
+        else:
+            resource(case[3], "file:///dvddisc/ADV_OBJ/outside.txt")
+            expected.append("cannot load file:///dvddisc/ADV_OBJ/outside.txt")
+        check("containment", case, expected=expected, forbidden=("loaded file:///dvddisc/%2e%2e/",))
+
+        case = fixture("script-shutdown")
+        files = [(name, mime, "while (true) {}" if name == "CHAPTERS.JS" else data)
+                 for name, mime, data in make_test_disc.app_files(3)]
+        (case[0] / "ADV_OBJ" / "CHAPTERS.ACA").write_bytes(make_test_disc.archive(files))
+        check("script-shutdown", case, extra=("--run-time=1",), natural_end=False)
+
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                data = marker.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *unused):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+        try:
+            uri = f"http://127.0.0.1:{server.server_port}/outside.txt"
+            for trusted in (False, True):
+                name = "network-trusted" if trusted else "network-restricted"
+                case = fixture(name)
+                resource(case[3], uri)
+                requests.clear()
+                check(name, case, expected=() if trusted else (uri + " (NotPermitted)",),
+                      extra=("--hddvd-trust-content",) if trusted else ())
+                if bool(requests) != trusted:
+                    failed.append(name)
+                    print(f"FAIL {name}: HTTP requests {requests!r}")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+    return failed
 
 
 def main():
@@ -129,6 +275,7 @@ def main():
         if crash:
             print(f"  --- gdb ---")
             print(indent(crash))
+    failed += regressions(args, logs)
     print(f"logs in {logs}")
     sys.exit(1 if failed else 0)
 

@@ -92,7 +92,7 @@ static decoder_t *NewModule(hddvd_nested_t *n, const es_format_t *fmt, bool pack
         var_Create(d, "avcodec-hw", VLC_VAR_STRING);
         var_SetString(d, "avcodec-hw", "none");
         cap = "video decoder";
-        name = "avcodec";
+        name = fmt->i_codec == VLC_CODEC_I420 ? "rawvideo" : "avcodec";
         strict = true;
     }
     else

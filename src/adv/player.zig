@@ -44,6 +44,7 @@ extern fn hddvd_esout_new(demux: *vlc.demux_t) ?*vlc.es_out_t;
 extern fn hddvd_esout_delete(out: ?*vlc.es_out_t) void;
 extern fn hddvd_es_select(demux: *vlc.demux_t, es: *vlc.es_out_id_t, on: bool) void;
 extern fn hddvd_es_out_empty(demux: *vlc.demux_t) bool;
+extern fn hddvd_es_add_background(demux: *vlc.demux_t, codec: u32, extra: [*]const u8, len: usize) ?*vlc.es_out_id_t;
 extern fn hddvd_sleep_ms(ms: c_int) void;
 extern fn hddvd_now_us() i64;
 extern fn hddvd_input_title_set_flags(t: *vlc.input_title_t, flags: c_int, name: ?[*:0]const u8) void;
@@ -156,6 +157,9 @@ pub const Player = struct {
     /// The engine was told the playback stopped (title_end and stop_request for the applications).
     stop_told: bool = false,
     wait_ticks: u32 = 0,
+    audio_drained: bool = false,
+    background_es: ?*vlc.es_out_id_t = null,
+    background_next: i64 = 0,
 
     // Reader.
     file: ?vfs.File = null,
@@ -339,7 +343,7 @@ pub fn open(demux: *vlc.demux_t, fs: *vfs.Fs) c_int {
         startHost(demux, pr, null);
     }
     startPlaylist(demux);
-    if (p.ps == null and !p.stopped) {
+    if (p.ps == null and p.background_es == null and !p.stopped) {
         close(demux);
         return vlc.VLC_EGENERIC;
     }
@@ -437,7 +441,7 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
                 best = n;
             }
         }
-        if (disc_id.search_flag & 1 == 0) if (content) |cid| if (acc.store.findPlaylist(&cid, kind)) |f| if (f.number > best_n) {
+        if (acc.trusted and disc_id.search_flag & 1 == 0) if (content) |cid| if (acc.store.findPlaylist(&cid, kind)) |f| if (f.number > best_n) {
             const u = try std.fmt.allocPrint(gpa, "file:///required/{s}/{s}{d:0>3}.XPL", .{ &cid, kind, f.number });
             pl_bytes = acc.read(u) catch null;
             if (pl_bytes != null) {
@@ -458,6 +462,7 @@ fn load(p: *Player, o: *vlc.vlc_object_t, fs: *vfs.Fs) !void {
     }
     var pl = try xpl.parse(gpa, aca.unwrap(pl_bytes orelse return error.NoPlaylist));
     errdefer pl.deinit();
+    if (!acc.trusted and pl.streaming_buffer_kb != 0) return error.NotPermitted;
     if (pl_uri) |u| fs.setPlaylist(uri_mod.fileName(u)); // an encrypted disc's packs use its key file
 
     const vti_bytes = (try fs.readFile(gpa, "HVDVD_TS/HVA00001.VTI")) orelse return error.NoVti;
@@ -489,6 +494,7 @@ pub fn close(demux: *vlc.demux_t) void {
     // demux_Delete also deletes the demuxer's stream.
     if (p.ps) |ps| vlc.demux_Delete(ps) else if (p.stream) |s| hddvd_stream_delete(s);
     if (p.kept_video) |es| hddvd_es_del(demux, es);
+    if (p.background_es) |es| hddvd_es_del(demux, es);
     if (p.host) |h| h.destroy();
     hddvd_mouse_delete(demux, p.mouse);
     if (p.overlay_es) |es| hddvd_es_del(demux, es);
@@ -530,13 +536,11 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
         .tick_divisor = title.tick_divisor,
         .time = t,
     } });
-    const span = timeline.spanFrom(title, t) orelse {
-        // Nothing to present (an application-only title): move on.
-        p.next = .{ .title = timeline.nextTitle(&p.pl, p.title) };
-        return;
-    };
-    if (!positionSpan(demux, span, @max(t, span.begin))) return;
-    if (p.pres) |pr| pr.setJumpTarget(@max(t, span.begin)); // a title started part-way: as a jump
+    const span = timeline.spanFrom(title, t);
+    if (span) |current| {
+        if (!positionSpan(demux, current, @max(t, current.begin))) return;
+        if (p.pres) |pr| pr.setJumpTarget(@max(t, current.begin));
+    }
     // A new ps demuxer: the ESes are recreated with this title's track names. It peeks at the stream when it
     // opens, so the reader is positioned first.
     if (p.ps) |ps| {
@@ -546,6 +550,8 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
         p.stream = null;
     }
     p.ps = null;
+    if (p.background_es) |es| hddvd_es_del(demux, es);
+    p.background_es = null;
     p.main_video = null;
     p.sub_video = .{};
     p.sub_audio = .{};
@@ -553,11 +559,34 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
     for (p.spus.items) |*s| s.buf.deinit(gpa);
     p.spus.clearRetainingCapacity();
     _ = hddvd_es_out_control(demux.out, vlc.ES_OUT_RESET_PCR);
-    openPs(demux) catch |err| {
-        log(asObj(demux), vlc.VLC_MSG_ERR, @src(), "cannot start the ps demuxer: %s", .{@errorName(err).ptr});
-        p.stopped = true;
-        return;
-    };
+    if (span != null) {
+        openPs(demux) catch |err| {
+            log(asObj(demux), vlc.VLC_MSG_ERR, @src(), "cannot start the ps demuxer: %s", .{@errorName(err).ptr});
+            p.stopped = true;
+            return;
+        };
+    } else {
+        const pres = p.pres orelse {
+            p.stopped = true;
+            return;
+        };
+        if (p.kept_video) |es| hddvd_es_del(demux, es);
+        p.kept_video = null;
+        p.span = null;
+        p.evob = null;
+        p.tmapi = null;
+        p.ref_time = @min(t, title.duration);
+        p.ref_ts = 1 + p.tb().us(p.ref_time);
+        p.background_next = p.ref_ts;
+        pres.setTimeline(p.ref_time, p.ref_ts, title.duration);
+        pres.setJumpTarget(p.ref_time);
+        const extra = pres.extra(vlc.VLC_CODEC_I420);
+        p.background_es = hddvd_es_add_background(demux, vdec.fourcc, &extra, extra.len) orelse {
+            p.stopped = true;
+            return;
+        };
+        hddvd_es_select(demux, p.background_es.?, true);
+    }
     p.stopped = false;
     restartOverlay(demux);
     updateTitleInfo(demux);
@@ -603,6 +632,7 @@ fn positionSpan(demux: *vlc.demux_t, span: timeline.Span, t: u64) bool {
         pr.unlock();
     };
     p.span = span;
+    p.audio_drained = false;
     p.evob = evob;
     p.tmapi = mi;
     updateSubVideo(demux);
@@ -633,6 +663,23 @@ fn jump(demux: *vlc.demux_t, t: u64) bool {
 fn jumpTo(demux: *vlc.demux_t, t: u64, notify: bool) bool {
     const p = playerOf(demux);
     const title = p.curTitle() orelse return false;
+    if (p.background_es != null) {
+        const at = @min(t, title.duration);
+        p.ref_time = at;
+        p.ref_ts = 1 + p.tb().us(at);
+        p.background_next = p.ref_ts;
+        p.next = .none;
+        if (p.pres) |pres| {
+            pres.setTimeline(at, p.ref_ts, title.duration);
+            pres.setJumpTarget(at);
+        }
+        p.access.jumped(&p.pl, title, p.title == null, at);
+        _ = hddvd_es_out_control(demux.out, vlc.ES_OUT_RESET_PCR);
+        if (notify) if (p.host) |host| host.post(.{ .jump = at });
+        restartOverlay(demux);
+        updateTitleInfo(demux);
+        return true;
+    }
     const span = timeline.spanFrom(title, t) orelse return false;
     const at = @max(t, span.begin);
     if (!positionSpan(demux, span, at)) return false;
@@ -664,10 +711,28 @@ fn clipRead(demux: *vlc.demux_t) void {
     p.next = .{ .title = timeline.nextTitle(&p.pl, p.title) };
 }
 
+fn drainAudio(demux: *vlc.demux_t) void {
+    const p = playerOf(demux);
+    if (p.audio_drained) return;
+    p.audio_drained = true;
+    for (p.tracks.items) |track| {
+        if ((track.id & 0xff00) != 0xbd00 or !isMainAudio(@intCast(track.id & 0xff))) continue;
+        const block = vlc.block_Alloc(present.audio_drain_magic.len) orelse continue;
+        @memcpy(block.*.p_buffer[0..present.audio_drain_magic.len], present.audio_drain_magic);
+        hddvd_es_send(demux, track.es, block);
+    }
+}
+
 /// True once the end of the current span is on screen (or everything sent has been presented).
 fn spanPresented(demux: *vlc.demux_t) bool {
     const p = playerOf(demux);
     if (hddvd_es_out_empty(demux)) return true;
+    if (p.background_es != null) {
+        const title = p.curTitle() orelse return true;
+        const clock = p.spu_shared orelse return false;
+        const date = (clock.displayDate(1 + p.tb().us(title.duration)) catch return false) orelse return false;
+        return date <= hddvd_now_us();
+    }
     const span = p.span orelse return true;
     const evob = p.evob orelse return true;
     const sh = p.spu_shared orelse return false;
@@ -679,8 +744,8 @@ fn spanPresented(demux: *vlc.demux_t) bool {
 
 /// The title time on screen: from a decoder's clock when there is one, else from the read position.
 fn titleNow(p: *Player) u64 {
-    const span = p.span orelse return 0;
     if (p.pres) |pr| if (pr.titleNow(hddvd_now_us())) |t| return t;
+    const span = p.span orelse return p.ref_time;
     const m = p.tmapi orelse return span.begin;
     const evob = p.evob orelse return span.begin;
     const sector = (p.pos / sector_size) -| evob.adr_ofs;
@@ -761,6 +826,7 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
     switch (p.next) {
         .none => {},
         else => {
+            drainAudio(demux);
             // The clip has been read; move on once it has been presented.
             if (!spanPresented(demux)) {
                 if (p.wait_ticks % 100 == 0) log(asObj(demux), vlc.VLC_MSG_DBG, @src(), "end of clip: waiting for presentation (%u)", .{p.wait_ticks});
@@ -787,6 +853,27 @@ fn demuxOne(demux_c: [*c]vlc.demux_t) callconv(.c) c_int {
             }
             return if (p.stopped) 0 else 1;
         },
+    }
+    if (p.background_es) |es| {
+        const title = p.curTitle() orelse return 0;
+        const end = 1 + p.tb().us(title.duration);
+        if (p.background_next >= end) {
+            p.next = .{ .title = timeline.nextTitle(&p.pl, p.title) };
+            return 1;
+        }
+        const block = vlc.block_Alloc(16 * 16 * 3 / 2) orelse return -1;
+        @memset(block.*.p_buffer[0..256], 16);
+        @memset(block.*.p_buffer[256..384], 128);
+        block.*.i_pts = p.background_next;
+        block.*.i_dts = p.background_next;
+        block.*.i_length = @min(33_333, end - p.background_next);
+        p.last_pts = p.background_next;
+        p.background_next += block.*.i_length;
+        hddvd_es_send(demux, es, block);
+        _ = hddvd_es_out_control(demux.out, vlc.ES_OUT_SET_PCR, p.last_pts);
+        updateTitleInfo(demux);
+        updateResources(demux);
+        return 1;
     }
     if (p.pos < p.end or p.sector_off < sector_size) {
         const ps = p.ps orelse return -1;
@@ -1003,6 +1090,7 @@ fn loadPlaylist(demux: *vlc.demux_t, u: []const u8) !void {
     defer gpa.free(bytes);
     var pl = try xpl.parse(gpa, aca.unwrap(bytes));
     errdefer pl.deinit();
+    if (!p.access.trusted and pl.streaming_buffer_kb != 0) return error.NotPermitted;
     const new_uri = try gpa.dupe(u8, u);
     // A soft reset (§4.3.22.3): what Annex W keeps goes to the new playlist's applications.
     var kept: player_api.Kept = .{};
@@ -1245,7 +1333,7 @@ fn flushedByVlc(p: *Player) void {
 /// buffers are full again, so without this the picture (and the menu over it) would stay empty until resumed.
 fn resyncAfterFlush(demux: *vlc.demux_t) void {
     const p = playerOf(demux);
-    if (p.stopped or p.span == null) return;
+    if (p.stopped or (p.span == null and p.background_es == null)) return;
     _ = jumpTo(demux, titleNow(p), false);
 }
 

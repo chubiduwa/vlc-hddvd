@@ -282,6 +282,7 @@ pub const Apps = struct {
         s.* = .{ .gpa = gpa, .cfg = cfg, .w = w, .h = h, .world = world };
         world.apps = s;
         world.files = cfg.files;
+        world.diagnostics_unlocked = if (cfg.files) |files| files.trusted else false;
         world.log = logWorld;
         world.log_ctx = s;
         world.tick_rate = engine.TickRate.of(cfg.pl.tick_base).perSecond();
@@ -308,6 +309,11 @@ pub const Apps = struct {
     }
 
     const vtable: engine.Scene.VTable = .{ .tick = tick, .input = input, .render = render, .deinit = deinit };
+
+    pub fn requestStop(ctx: *anyopaque) void {
+        const scene: *Apps = @ptrCast(@alignCast(ctx));
+        scene.world.rt.stop.store(true, .release);
+    }
 
     fn deinit(ctx: *anyopaque, gpa: std.mem.Allocator) void {
         const s: *Apps = @ptrCast(@alignCast(ctx));

@@ -1065,6 +1065,17 @@ test "scripts are UTF-16BE with a byte order mark" {
     try testing.run(cx, "assertEq(s, \"\u{e9}\u{1f600}\"); assertEq(s.length, 3);", "check.js");
 }
 
+test "shutdown interrupts a non-terminating script" {
+    const rt, const cx = try probeContext();
+    defer rt.destroy();
+    defer cx.destroy();
+    rt.stop.store(true, .release);
+    try t.expectError(error.Thrown, cx.runScript("while (true) {}", "loop.js"));
+    const message = try cx.takeException(t.allocator);
+    defer t.allocator.free(message);
+    try t.expect(std.mem.indexOf(u8, message, "interrupted") != null);
+}
+
 test "Annex Z argument types, exceptions and API objects" {
     const rt, const cx = try probeContext();
     defer rt.destroy();

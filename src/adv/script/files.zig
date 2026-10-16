@@ -62,6 +62,7 @@ pub const Files = struct {
     temp_capacity: u64 = default_temp_capacity,
     store: *pstore.Store,
     backend: Backend,
+    trusted: bool = false,
 
     pub fn lock(f: *Files) void {
         if (f.backend.lock) |l| l(f.backend.ctx);
@@ -93,6 +94,12 @@ pub const Files = struct {
         };
     }
 
+    fn allowedWhere(f: *Files, u: []const u8) Error!Where {
+        const area = try where(u);
+        if (!uri.allowed(u, f.trusted)) return error.NotPermitted;
+        return area;
+    }
+
     /// The memfs path of an API Managed Area URI.
     fn tempPath(f: *Files, u: []const u8) Error![]u8 {
         const loc = uri.locate(u) orelse return error.BadPath;
@@ -112,7 +119,7 @@ pub const Files = struct {
     /// Reads a file as an application does: the Resource Area by original URI first, then its location
     /// (archived files only from the Resource Area). Caller frees.
     pub fn read(f: *Files, gpa: std.mem.Allocator, u: []const u8) Error![]u8 {
-        const w = try where(u);
+        const w = try f.allowedWhere(u);
         f.lock();
         defer f.unlock();
         if (w != .temp) if (f.backend.resource(f.backend.ctx, u)) |d| return gpa.dupe(u8, d);
@@ -123,7 +130,7 @@ pub const Files = struct {
     /// Whether reading `u` is served by the Resource Area (outside the API Managed Area, by original URI), so
     /// that no disc access happens.
     pub fn inResourceArea(f: *Files, u: []const u8) bool {
-        const w = where(u) catch return false;
+        const w = f.allowedWhere(u) catch return false;
         if (w == .temp) return false;
         f.lock();
         defer f.unlock();
@@ -192,7 +199,7 @@ pub const Files = struct {
     }
 
     pub fn stat(f: *Files, u: []const u8) Error!Stat {
-        const w = try where(u);
+        const w = try f.allowedWhere(u);
         f.lock();
         defer f.unlock();
         if (w != .temp) if (f.backend.resource(f.backend.ctx, u)) |d| return .{ .dir = false, .size = d.len, .modified = f.resourceModified(u) };
@@ -224,7 +231,7 @@ pub const Files = struct {
 
     /// Files or directories in a directory, by name. Caller frees each name and the list.
     pub fn list(f: *Files, gpa: std.mem.Allocator, u: []const u8, dirs: bool) Error![][]u8 {
-        const w = try where(u);
+        const w = try f.allowedWhere(u);
         f.lock();
         defer f.unlock();
         switch (w) {
@@ -297,7 +304,7 @@ pub const Files = struct {
     /// Writes a whole file (API Managed Area or persistent storage), creating its directory where allowed.
     pub fn write(f: *Files, u: []const u8, data: []const u8) Error!void {
         if (uri.archiveMember(u) != null) return error.NotPermitted;
-        const w = try where(u);
+        const w = try f.allowedWhere(u);
         f.lock();
         defer f.unlock();
         switch (w) {
@@ -338,7 +345,7 @@ pub const Files = struct {
     }
 
     pub fn makeDir(f: *Files, u: []const u8) Error!void {
-        const w = try where(u);
+        const w = try f.allowedWhere(u);
         f.lock();
         defer f.unlock();
         switch (w) {
@@ -357,7 +364,7 @@ pub const Files = struct {
 
     pub fn remove(f: *Files, u: []const u8, recursive: bool) Error!void {
         if (uri.archiveMember(u) != null) return error.NotPermitted;
-        const w = try where(u);
+        const w = try f.allowedWhere(u);
         f.lock();
         defer f.unlock();
         switch (w) {
@@ -374,7 +381,7 @@ pub const Files = struct {
 
     pub fn setModified(f: *Files, u: []const u8, ms: i64) Error!void {
         if (uri.archiveMember(u) != null) return error.NotPermitted;
-        const w = try where(u);
+        const w = try f.allowedWhere(u);
         f.lock();
         defer f.unlock();
         const n: *memfs.Node = switch (w) {
@@ -402,7 +409,7 @@ pub const Files = struct {
 
     /// Free bytes in the area of `u` (API Managed Area or the device of a persistent storage URI).
     pub fn free(f: *Files, u: []const u8) u64 {
-        const w = where(u) catch return 0;
+        const w = f.allowedWhere(u) catch return 0;
         f.lock();
         defer f.unlock();
         switch (w) {
@@ -540,7 +547,7 @@ test "areas, the Resource Area first, permissions" {
     defer temp.deinit();
     var store = try pstore.Store.init(tt.allocator, "11111111-2222-3333-4444-555555555555".*, 1);
     defer store.deinit();
-    var f: Files = .{ .gpa = tt.allocator, .temp = &temp, .store = &store, .backend = b.backend() };
+    var f: Files = .{ .gpa = tt.allocator, .temp = &temp, .store = &store, .backend = b.backend(), .trusted = true };
 
     try b.disc.write("ADV_OBJ/a.txt", "disc", 0, true);
     try b.resources.put(tt.allocator, "file:///dvddisc/ADV_OBJ/r.aca/x.xml", "member");
@@ -576,4 +583,18 @@ test "areas, the Resource Area first, permissions" {
     try tt.expectEqualStrings("<a/>", p);
     try tt.expect(f.free("file:///required/x") < pstore.required_capacity);
     try tt.expectError(error.BadPath, f.read(tt.allocator, "nonsense"));
+
+    f.trusted = false;
+    try b.resources.put(tt.allocator, "https://example.com/cached", "cached");
+    try tt.expectError(error.NotPermitted, f.read(tt.allocator, "https://example.com/cached"));
+    try tt.expect(!f.inResourceArea("https://example.com/cached"));
+    try tt.expectError(error.NotPermitted, f.read(tt.allocator, "file:///required/save.xml"));
+    try tt.expectError(error.NotPermitted, f.write("file:///required/save.xml", "blocked"));
+    try tt.expectError(error.NotPermitted, f.stat("file:///required/save.xml"));
+    try tt.expectError(error.NotPermitted, f.list(tt.allocator, "file:///required/", false));
+    try tt.expectError(error.NotPermitted, f.makeDir("file:///required/blocked"));
+    try tt.expectError(error.NotPermitted, f.remove("file:///required/save.xml", false));
+    try tt.expectError(error.NotPermitted, f.setModified("file:///required/save.xml", 1));
+    try tt.expectEqual(@as(u64, 0), f.free("file:///required/"));
+    try f.write("file:///filecache/allowed.txt", "allowed");
 }

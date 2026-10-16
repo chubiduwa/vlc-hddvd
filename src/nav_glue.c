@@ -314,6 +314,27 @@ es_out_id_t *hddvd_es_add_spu(demux_t *demux, vlc_fourcc_t codec, const void *ex
     return es;
 }
 
+es_out_id_t *hddvd_es_add_background(demux_t *demux, vlc_fourcc_t codec, const void *extra, size_t len)
+{
+    es_format_t fmt;
+    es_format_Init(&fmt, VIDEO_ES, codec);
+    fmt.b_packetized = true;
+    fmt.video.i_chroma = VLC_CODEC_I420;
+    fmt.video.i_width = fmt.video.i_visible_width = 16;
+    fmt.video.i_height = fmt.video.i_visible_height = 16;
+    fmt.video.i_sar_num = fmt.video.i_sar_den = 1;
+    fmt.video.i_frame_rate = 30;
+    fmt.video.i_frame_rate_base = 1;
+    fmt.p_extra = malloc(len);
+    if (fmt.p_extra == NULL)
+        return NULL;
+    memcpy(fmt.p_extra, extra, len);
+    fmt.i_extra = len;
+    es_out_id_t *es = es_out_Add(demux->out, &fmt);
+    free(fmt.p_extra);
+    return es;
+}
+
 void hddvd_es_del(demux_t *demux, es_out_id_t *es)
 {
     es_out_Del(demux->out, es);

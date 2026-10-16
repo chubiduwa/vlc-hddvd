@@ -27,7 +27,7 @@ pub const Env = struct {
         e.backend = .init(t.allocator);
         e.temp = .init(t.allocator);
         e.store = try pstore.Store.init(t.allocator, provider.*, 7);
-        e.files = .{ .gpa = t.allocator, .temp = &e.temp, .store = &e.store, .backend = e.backend.backend() };
+        e.files = .{ .gpa = t.allocator, .temp = &e.temp, .store = &e.store, .backend = e.backend.backend(), .trusted = true };
         e.world = try host.World.create(t.allocator);
         e.world.files = &e.files;
         e.world.log = print;

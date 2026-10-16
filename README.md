@@ -129,6 +129,15 @@ disc, `<disc ID> = <title> | V | <volume unique key>`). The plugin looks for it 
 
 Or set its path with `--hddvd-keydb=/path/to/KEYDB.cfg`. When the key is missing, VLC shows an error naming the disc ID to look for.
 
+### Content trust
+
+Advanced Content is untrusted by default. Resources are limited to the disc and File Cache; network downloads,
+session storage and script diagnostics are disabled, and playlists requesting a streaming buffer are rejected.
+Only for content you trust, add `--hddvd-trust-content` to allow those operations. Storage still lasts only
+until VLC closes, and script network APIs still report an offline player.
+
+Disc signatures are not verified. This policy is not a complete Annex X sandbox.
+
 ## Build
 
 Build it (needs [Zig](https://ziglang.org) 0.17 and the VLC 3.0 plugin SDK, the `sdk` folder of VLC's Windows
@@ -177,7 +186,9 @@ Advanced Content (HDi):
 - Trick play: fast forward, fast reverse, slow motion and frame stepping (the API reports them as unsupported).
 - Video capture (`MainVideo.capture`) and image scaling (`changeImageSize`).
 - The markup audio object (`audio/x-wav` objects in a page).
-- Restricted Mode (Annex X): every application runs with full rights.
+- Full Restricted Mode (Annex X), including signature authentication and read-only arbitrary XML documents.
+  Resource and storage access is restricted by default; see [Content trust](#content-trust).
+- Same-title script jumps while VLC is paused.
 
 Standard Content:
 
