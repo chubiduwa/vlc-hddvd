@@ -101,6 +101,17 @@ pub const Elem = struct {
     key_actioned: ?u64 = null,
     pressed: bool = false,
     focus_after: bool = false,
+    /// A timing `set`/`animate` of state:focused applies to it, this tick and the previous one (apps.zig): such
+    /// a set moves the focus once, when it starts.
+    focus_set: bool = false,
+    focus_set_before: bool = false,
+    /// The state:enabled and state:value that timing sets gave it at the last tick (apps.zig): a timing value is
+    /// applied when it starts or changes, then held (§7.6.3.4.1), so a value a script set and released with
+    /// unsetProperty() stays until timing gives a new one. `timing_now`: this tick's, while it is evaluated.
+    timing_enabled: ?bool = null,
+    timing_value: ?[]u8 = null,
+    timing_enabled_now: ?bool = null,
+    timing_value_now: ?[]const u8 = null,
     /// An `image/mng` object (apps.zig): the tick its display became auto (its animation starts then), and the
     /// frame it shows (null: none).
     mng_start: ?u64 = null,
@@ -179,6 +190,7 @@ pub const Page = struct {
         e.node.view = null;
         p.gpa.free(e.state.value);
         p.gpa.free(e.seen.value);
+        if (e.timing_value) |v| p.gpa.free(v);
         p.gpa.destroy(e);
     }
 
@@ -195,6 +207,9 @@ pub const Page = struct {
         for (p.elems.items) |e| {
             p.gpa.free(e.state.value);
             e.state = .{};
+            if (e.timing_value) |v| p.gpa.free(v);
+            e.timing_value = null;
+            e.timing_enabled = null;
         }
         try p.initialState();
         p.script.clearRetainingCapacity();

@@ -64,6 +64,8 @@ pub const Anim = struct {
     sum: bool,
     linear: bool,
     rank: Rank,
+    /// A finished cue's value kept by `fill="hold"`, not an active one.
+    held: bool = false,
 
     pub const Rank = struct {
         clock: Clock,
@@ -170,7 +172,8 @@ pub const Timing = struct {
     /// State values set by animations this tick.
     states: std.ArrayList(StateSet) = .empty,
 
-    pub const StateSet = struct { elem: *Elem, which: StateProp, value: []const u8 };
+    /// `held`: kept by `fill="hold"` after its cue finished.
+    pub const StateSet = struct { elem: *Elem, which: StateProp, value: []const u8, held: bool = false };
 
     /// Builds the timesheets of `page` (an empty set for a page without timing). Times in seconds count
     /// `title_fps` frames on the title clock and `tick_rate` ticks on the others (nominal rates).
@@ -250,7 +253,7 @@ pub const Timing = struct {
         }.less);
         for (list.items) |x| {
             const v = x.value(ev.a, "");
-            tm.states.append(tm.gpa, .{ .elem = x.elem, .which = x.target.state, .value = v }) catch {};
+            tm.states.append(tm.gpa, .{ .elem = x.elem, .which = x.target.state, .value = v, .held = x.held }) catch {};
         }
     }
 
@@ -480,6 +483,8 @@ const Eval = struct {
     a: std.mem.Allocator,
     sheet: *Sheet = undefined,
     t: i64 = 0,
+    /// Emitting a finished cue's held values.
+    holding: bool = false,
 
     /// Updates node `n` whose parent is active over [ps, pf), placing it from syncbase `sync`. `defaults`:
     /// the nodes of the closest path begin above.
@@ -518,6 +523,8 @@ const Eval = struct {
         const finished = n.rt.entered and n.rt.finish != null and t >= n.rt.finish.?;
         if (n.kind == .cue and n.hold and finished and (pf == null or t < pf.?)) {
             // fill="hold": the last values applied, until the parent finishes.
+            ev.holding = true;
+            defer ev.holding = false;
             ev.emit(n, own, if (n.rt.sd) |d| frac(n.rt.finish.? - 1 - n.rt.start, d) else null);
         } else if (n.kind != .cue) {
             for (n.children) |c| if (c.rt.placed or c.rt.entered) resetTree(ev.tm, c);
@@ -639,6 +646,7 @@ const Eval = struct {
                         .sum = o.sum,
                         .linear = linear,
                         .rank = .{ .clock = ev.sheet.clock, .start = n.rt.start, .order = n.order },
+                        .held = ev.holding,
                     }) catch {};
                 }
             }

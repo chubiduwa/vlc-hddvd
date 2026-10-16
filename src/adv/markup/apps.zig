@@ -190,6 +190,8 @@ pub const App = struct {
     reload_requested: bool = false,
     /// Script changed attributes of the page.
     attrs_dirty: bool = false,
+    /// A timing set of state:focused is active in the page: user input cannot move the focus (§7.6.3.4.1).
+    focus_held: bool = false,
 
     /// Active: valid, selected, ready and loaded (§8.4.6).
     pub fn active(a: *const App) bool {
@@ -1023,7 +1025,7 @@ pub const Apps = struct {
                 for (p.elems.items) |el| if (el.pressed) {
                     el.pressed = false;
                     if (el.key_actioned == null) p.setState(el, .actioned, false);
-                    if (focus.focusable(el) and !s.world.focus_locked) s.setFocus(p, el);
+                    if (focus.focusable(el) and !s.engineFocusBlocked()) s.setFocus(p, el);
                     any = true;
                 };
                 return any;
@@ -1098,7 +1100,7 @@ pub const Apps = struct {
         };
         const cur = p.focused();
         if (dir) |d| {
-            if (s.world.focus_locked) return cur != null;
+            if (s.engineFocusBlocked()) return cur != null;
             if (focus.stale(p)) focus.generate(s.gpa, p, a.rank) catch {};
             const to = focus.navigate(p, cur, d, a.id, a.rank);
             s.log("key {s} in {s}: from {s}, to {s}", .{
@@ -1133,7 +1135,7 @@ pub const Apps = struct {
         }
         if (k == keys.esc) {
             // Cancel: no element has the focus any more.
-            if (cur == null or s.world.focus_locked) return false;
+            if (cur == null or s.engineFocusBlocked()) return false;
             s.clearFocus();
             return true;
         }
@@ -1160,7 +1162,7 @@ pub const Apps = struct {
                 if (!el.pressed) p.setState(el, .actioned, false);
                 if (el.focus_after) {
                     el.focus_after = false;
-                    if (focus.focusable(el) and !s.world.focus_locked) s.setFocus(p, el);
+                    if (focus.focusable(el) and !s.engineFocusBlocked()) s.setFocus(p, el);
                 }
             }
         }
@@ -1170,6 +1172,14 @@ pub const Apps = struct {
     fn focusedApp(s: *Apps) ?*App {
         for (s.records.items) |a| if (a.active()) if (a.page) |p| if (p.focused() != null) return a;
         return s.topActive();
+    }
+
+    /// User input cannot move the focus: script set it (until unsetProperty), or a timing set of state:focused
+    /// is active (§7.6.3.4.1).
+    fn engineFocusBlocked(s: *Apps) bool {
+        if (s.world.focus_locked) return true;
+        for (s.records.items) |a| if (a.active() and a.focus_held) return true;
+        return false;
     }
 
     /// Gives `el` the focus: one element in all applications has it.
@@ -1234,15 +1244,48 @@ pub const Apps = struct {
             .valid = a.valid_range,
         });
         const ov = if (a.script) |sc| &sc.overrides else null;
+        // A set of state:focused moves the focus when it starts, and the focus is then held (§7.6.3.4.2.3): it is
+        // not applied again while the set stays active, so a later set (another cue starting) takes the focus.
+        // While one is active (not merely held by fill="hold") the engine cannot move the focus (§7.6.3.4.1).
+        for (p.elems.items) |el| {
+            el.focus_set_before = el.focus_set;
+            el.focus_set = false;
+        }
+        for (tm.states.items) |st| if (st.which == .focused) {
+            st.elem.focus_set = true;
+        };
+        a.focus_held = false;
         for (tm.states.items) |st| switch (st.which) {
-            .focused => if (!s.world.focus_locked) {
+            .focused => {
+                if (!st.held) a.focus_held = true;
+                if (s.world.focus_locked or st.elem.focus_set_before) continue;
                 if (std.mem.eql(u8, st.value, "true")) {
                     if (focus.focusable(st.elem) or st.elem.kind.activatable()) s.setFocus(p, st.elem);
                 } else p.setState(st.elem, .focused, false);
             },
-            .enabled => if (ov == null or !ov.?.enabled_locked) p.setState(st.elem, .enabled, !std.mem.eql(u8, st.value, "false")),
-            .value => if (ov == null or !ov.?.value_locked) p.setValue(st.elem, st.value) catch {},
+            // The last value by priority; applied below if it started or changed.
+            .enabled => st.elem.timing_enabled_now = !std.mem.eql(u8, st.value, "false"),
+            .value => st.elem.timing_value_now = st.value,
         };
+        for (p.elems.items) |el| {
+            if (el.timing_enabled_now) |on| {
+                if (el.timing_enabled != on and (ov == null or !ov.?.enabled_locked)) p.setState(el, .enabled, on);
+                el.timing_enabled = on;
+            } else el.timing_enabled = null;
+            el.timing_enabled_now = null;
+            if (el.timing_value_now) |v| {
+                const changed = if (el.timing_value) |old| !std.mem.eql(u8, old, v) else true;
+                if (changed) {
+                    if (ov == null or !ov.?.value_locked) p.setValue(el, v) catch {};
+                    if (el.timing_value) |old| p.gpa.free(old);
+                    el.timing_value = p.gpa.dupe(u8, v) catch null;
+                }
+            } else if (el.timing_value) |old| {
+                p.gpa.free(old);
+                el.timing_value = null;
+            }
+            el.timing_value_now = null;
+        }
         // <event> elements: application events, to every application (§8.3.7).
         for (tm.events.items) |ev| s.raiseEvent(a, ev);
         tm.events.clearRetainingCapacity();
@@ -1523,6 +1566,158 @@ test "focus, activation and the pointer from user input" {
     try e.post(.{ .mouse_move = .{ .x = 400, .y = 400 } });
     next(&e, &now);
     try testing.expect(!a.state.pointer);
+}
+
+test "a timing set of state:focused moves the focus when it starts; user input waits while it is active" {
+    const gpa = testing.allocator;
+    var pl = try xpl.parse(gpa,
+        \\<Playlist xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Playlist" majorVersion="1" minorVersion="0">
+        \\ <Configuration><StreamingBuffer size="0"/><Aperture size="1920x1080"/><MainVideoDefaultColor color="108080"/></Configuration>
+        \\ <MediaAttributeList/>
+        \\ <TitleSet timeBase="60fps">
+        \\  <Title id="t1" titleNumber="1" titleDuration="00:01:00:00"/>
+        \\  <PlaylistApplication id="pa" src="file:///dvddisc/ADV_OBJ/m.xmf"/>
+        \\ </TitleSet>
+        \\</Playlist>
+    );
+    defer pl.deinit();
+    // A focus sink held for the page's first second, and a cue that focuses b from 0.5 s until b has the focus
+    // (so it ends at once): b must keep the focus although the sink's set is still active.
+    var files: Files = .{ .files = &.{
+        .{
+            "file:///dvddisc/ADV_OBJ/m.xmf",
+            \\<Application xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Manifest" id="m">
+            \\ <Region x="0" y="0" width="400" height="400"/>
+            \\ <Markup src="m.xmu"/>
+            \\</Application>
+        },
+        .{
+            "file:///dvddisc/ADV_OBJ/m.xmu",
+            \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style"
+            \\      xmlns:state="http://www.dvdforum.org/2005/ihd#state" xml:lang="en"><head>
+            \\<timing clock="page"><par dur="60s">
+            \\ <cue select="id('sink')" begin="0s" dur="1s"><set state:focused="true"/></cue>
+            \\ <cue select="id('b')" begin="0.5s" end="id('b')[state:focused()=1]"><set state:focused="true"/></cue>
+            \\</par></timing>
+            \\</head><body>
+            \\<button id="sink" style:position="absolute" style:x="-200px" style:y="0px" style:width="0px" style:height="0px"/>
+            \\<button id="a" style:position="absolute" style:x="0px" style:y="0px" style:width="50px" style:height="50px"/>
+            \\<button id="b" style:position="absolute" style:x="100px" style:y="0px" style:width="50px" style:height="50px"/>
+            \\</body></root>
+        },
+    } };
+    var e = engine.Engine.init(gpa, 1920, 1080, 50);
+    defer e.deinit();
+    e.setScene(try Apps.create(gpa, .{ .pl = &pl, .loader = .{ .ctx = &files, .read = Files.read }, .menu_language = "en" }, 1920, 1080), 0);
+    try e.post(.{ .title_begin = .{ .title = 0, .duration = 3000 } });
+    var now: i64 = 0;
+    _ = e.step(now, 0);
+    const s: *Apps = @ptrCast(@alignCast(e.scene.?.ctx));
+    const p = s.records.items[0].page.?;
+    const sink = Page.elemOf(p.doc.getElementById("sink").?).?;
+    const a = Page.elemOf(p.doc.getElementById("a").?).?;
+    const b = Page.elemOf(p.doc.getElementById("b").?).?;
+    const until = struct {
+        fn f(eng: *engine.Engine, t: *i64, end: i64) void {
+            while (t.* < end) {
+                t.* += 20_000;
+                _ = eng.step(t.*, 0);
+            }
+        }
+    }.f;
+
+    until(&e, &now, 200_000);
+    try testing.expect(sink.state.focused);
+    // The sink's set is active: user navigation cannot move the focus.
+    try e.post(.{ .key_down = keys.left });
+    until(&e, &now, 240_000);
+    try testing.expect(sink.state.focused and !a.state.focused);
+    // b's cue starts: b takes the focus and keeps it while the sink's set stays active.
+    until(&e, &now, 900_000);
+    try testing.expect(b.state.focused and !sink.state.focused);
+    until(&e, &now, 1_200_000);
+    try testing.expect(b.state.focused and !sink.state.focused);
+    // Both sets have ended: navigation works again.
+    try e.post(.{ .key_down = keys.left });
+    until(&e, &now, 1_240_000);
+    try testing.expect(a.state.focused and !b.state.focused);
+}
+
+test "a timing state:value applies when it starts or changes; a value set by script and released is held" {
+    const gpa = testing.allocator;
+    var pl = try xpl.parse(gpa,
+        \\<Playlist xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Playlist" majorVersion="1" minorVersion="0">
+        \\ <Configuration><StreamingBuffer size="0"/><Aperture size="1920x1080"/><MainVideoDefaultColor color="108080"/></Configuration>
+        \\ <MediaAttributeList/>
+        \\ <TitleSet timeBase="60fps">
+        \\  <Title id="t1" titleNumber="1" titleDuration="00:01:00:00"/>
+        \\  <PlaylistApplication id="pa" src="file:///dvddisc/ADV_OBJ/m.xmf"/>
+        \\ </TitleSet>
+        \\</Playlist>
+    );
+    defer pl.deinit();
+    // A state input set to OPEN by a cue active for 2 s; at 0.5 s a script sets it to SEL and releases it with
+    // unsetProperty() (a menu's state machine): SEL must stay while the cue goes on, and a later cue's value
+    // applies when it starts.
+    var files: Files = .{ .files = &.{
+        .{
+            "file:///dvddisc/ADV_OBJ/m.xmf",
+            \\<Application xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Manifest" id="m">
+            \\ <Region x="0" y="0" width="400" height="400"/>
+            \\ <Script src="m.js"/>
+            \\ <Markup src="m.xmu"/>
+            \\</Application>
+        },
+        .{
+            "file:///dvddisc/ADV_OBJ/m.js",
+            \\addEventListener("go", function (e) {
+            \\  var st = document.getElementById("st");
+            \\  st.state.value = "SEL";
+            \\  st.state.unsetProperty("value");
+            \\}, true);
+        },
+        .{
+            "file:///dvddisc/ADV_OBJ/m.xmu",
+            \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style"
+            \\      xmlns:state="http://www.dvdforum.org/2005/ihd#state" xml:lang="en"><head>
+            \\<timing clock="page"><par dur="60s">
+            \\ <cue select="id('st')" begin="0s" dur="2s"><set state:value="OPEN"/></cue>
+            \\ <cue select="id('st')" begin="0.5s" dur="0.1s"><event name="go"/></cue>
+            \\ <cue select="id('st')" begin="3s" dur="1s"><set state:value="LATER"/></cue>
+            \\</par></timing>
+            \\</head><body>
+            \\<input id="st" mode="display" style:visibility="hidden" state:value="INITIAL"/>
+            \\</body></root>
+        },
+    } };
+    var e = engine.Engine.init(gpa, 1920, 1080, 50);
+    defer e.deinit();
+    e.setScene(try Apps.create(gpa, .{ .pl = &pl, .loader = .{ .ctx = &files, .read = Files.read }, .menu_language = "en" }, 1920, 1080), 0);
+    try e.post(.{ .title_begin = .{ .title = 0, .duration = 3000 } });
+    var now: i64 = 0;
+    _ = e.step(now, 0);
+    const s: *Apps = @ptrCast(@alignCast(e.scene.?.ctx));
+    const p = s.records.items[0].page.?;
+    const st = Page.elemOf(p.doc.getElementById("st").?).?;
+    const until = struct {
+        fn f(eng: *engine.Engine, t: *i64, end: i64) void {
+            while (t.* < end) {
+                t.* += 20_000;
+                _ = eng.step(t.*, 0);
+            }
+        }
+    }.f;
+
+    until(&e, &now, 300_000);
+    try testing.expectEqualStrings("OPEN", st.state.value);
+    until(&e, &now, 1_500_000);
+    try testing.expectEqualStrings("SEL", st.state.value);
+    // The first cue ended (the page clock starts once the page is loaded, about 0.5 s in): the value is held,
+    // not reverted.
+    until(&e, &now, 3_200_000);
+    try testing.expectEqualStrings("SEL", st.state.value);
+    until(&e, &now, 4_000_000);
+    try testing.expectEqualStrings("LATER", st.state.value);
 }
 
 test "an MNG object plays from its first frame whenever it is displayed" {
