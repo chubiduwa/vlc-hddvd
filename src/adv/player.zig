@@ -732,19 +732,17 @@ fn drainAudio(demux: *vlc.demux_t) void {
 /// True once the end of the current span is on screen (or everything sent has been presented).
 fn spanPresented(demux: *vlc.demux_t) bool {
     const p = playerOf(demux);
-    if (hddvd_es_out_empty(demux)) return true;
     if (p.background_es != null) {
         const title = p.curTitle() orelse return true;
-        const clock = p.spu_shared orelse return false;
-        const date = (clock.displayDate(1 + p.tb().us(title.duration)) catch return false) orelse return false;
+        const clock = p.spu_shared orelse return hddvd_es_out_empty(demux);
+        const date = (clock.displayDate(1 + p.tb().us(title.duration)) catch null) orelse return hddvd_es_out_empty(demux);
         return date <= hddvd_now_us();
     }
     const span = p.span orelse return true;
     const evob = p.evob orelse return true;
-    const sh = p.spu_shared orelse return false;
+    const sh = p.spu_shared orelse return hddvd_es_out_empty(demux);
     const ts = tsOf(timeline.pts(span, p.tb(), evob.start_ptm, span.end));
-    const maybe = sh.displayDate(ts) catch return false; // no clock: wait for the decoders to drain
-    const date = maybe orelse return false;
+    const date = (sh.displayDate(ts) catch null) orelse return hddvd_es_out_empty(demux);
     return date <= hddvd_now_us();
 }
 
