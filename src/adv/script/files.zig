@@ -588,13 +588,22 @@ test "areas, the Resource Area first, permissions" {
     try b.resources.put(tt.allocator, "https://example.com/cached", "cached");
     try tt.expectError(error.NotPermitted, f.read(tt.allocator, "https://example.com/cached"));
     try tt.expect(!f.inResourceArea("https://example.com/cached"));
-    try tt.expectError(error.NotPermitted, f.read(tt.allocator, "file:///required/save.xml"));
-    try tt.expectError(error.NotPermitted, f.write("file:///required/save.xml", "blocked"));
-    try tt.expectError(error.NotPermitted, f.stat("file:///required/save.xml"));
-    try tt.expectError(error.NotPermitted, f.list(tt.allocator, "file:///required/", false));
-    try tt.expectError(error.NotPermitted, f.makeDir("file:///required/blocked"));
-    try tt.expectError(error.NotPermitted, f.remove("file:///required/save.xml", false));
-    try tt.expectError(error.NotPermitted, f.setModified("file:///required/save.xml", 1));
-    try tt.expectEqual(@as(u64, 0), f.free("file:///required/"));
+    const saved = try f.read(tt.allocator, "file:///required/save.xml");
+    defer tt.allocator.free(saved);
+    try tt.expectEqualStrings("<a/>", saved);
+    try f.write("file:///required/save.xml", "<b/>");
+    try tt.expectEqual(@as(u64, 4), (try f.stat("file:///required/save.xml")).size);
+    const stored_names = try f.list(tt.allocator, "file:///required/", false);
+    defer {
+        for (stored_names) |name| tt.allocator.free(name);
+        tt.allocator.free(stored_names);
+    }
+    try tt.expectEqualStrings("save.xml", stored_names[0]);
+    try f.makeDir("file:///common/required/allowed");
+    try f.setModified("file:///required/save.xml", 1);
+    try tt.expectEqual(@as(i64, 1), (try f.stat("file:///required/save.xml")).modified);
+    try tt.expect(f.free("file:///required/") > 0);
+    try f.remove("file:///required/save.xml", false);
+    try tt.expect(!f.exists("file:///required/save.xml"));
     try f.write("file:///filecache/allowed.txt", "allowed");
 }

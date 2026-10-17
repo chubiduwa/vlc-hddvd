@@ -184,7 +184,7 @@ pub fn validDiscPath(path: []const u8) bool {
 pub fn allowed(s: []const u8, trusted: bool) bool {
     if (!valid(s)) return false;
     const location = locate(s) orelse return false;
-    return trusted or location.area == .disc or location.area == .filecache;
+    return trusted or location.area != .network;
 }
 
 fn validPath(path: []const u8, encoded: bool) bool {
@@ -423,10 +423,16 @@ test "disc paths cannot escape through URI encoding or platform separators" {
     try testing.expect(validDiscPath(""));
 }
 
-test "untrusted content can only access the disc and file cache" {
-    try testing.expect(allowed("file:///dvddisc/ADV_OBJ/page.xmu", false));
-    try testing.expect(allowed("file:///filecache/page.xmu", false));
-    for ([_][]const u8{ "http://127.0.0.1/a", "https://example.com/a", "file:///required/save", "file:///common/required/save", "file:///additional/usb/save" }) |resource| {
+test "untrusted content can access session storage but not the network" {
+    for ([_][]const u8{
+        "file:///dvddisc/ADV_OBJ/page.xmu", "file:///filecache/page.xmu",
+        "file:///required/save",            "file:///common/required/save",
+        "file:///additional/usb/save",      "file:///common/additional/usb/save",
+    }) |resource| {
+        try testing.expect(allowed(resource, false));
+        try testing.expect(allowed(resource, true));
+    }
+    for ([_][]const u8{ "http://127.0.0.1/a", "https://example.com/a" }) |resource| {
         try testing.expect(!allowed(resource, false));
         try testing.expect(allowed(resource, true));
     }
