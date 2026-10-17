@@ -536,12 +536,6 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
     p.access.startTitle(&p.pl, title, index == null, t);
     resetLayouts(demux);
     p.res_tick = hddvd_now_us();
-    if (p.host) |h| h.post(.{ .title_begin = .{
-        .title = if (index) |i| @intCast(i) else null,
-        .duration = title.duration,
-        .tick_divisor = title.tick_divisor,
-        .time = t,
-    } });
     const span = timeline.spanFrom(title, t);
     if (span) |current| {
         if (!positionSpan(demux, current, @max(t, current.begin))) return;
@@ -596,6 +590,12 @@ fn startTitle(demux: *vlc.demux_t, index: ?usize, t: u64) void {
     p.stopped = false;
     restartOverlay(demux);
     updateTitleInfo(demux);
+    if (p.host) |h| h.post(.{ .title_begin = .{
+        .title = if (index) |i| @intCast(i) else null,
+        .duration = title.duration,
+        .tick_divisor = title.tick_divisor,
+        .time = t,
+    } });
 }
 
 /// Positions the reader on `span` at title time `t`. False (and stopped) if its files are missing.

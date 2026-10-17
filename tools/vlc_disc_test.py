@@ -165,8 +165,37 @@ def regressions(args, logs):
         outro.tag = tag("Title")
         outro.set("titleNumber", "2")
         outro.set("id", "after-app")
+        clock_script = """
+var checks = 0;
+Diagnostics.listeners.add(Diagnostics.listeners.LISTENER_TYPE_DEBUGGER);
+Diagnostics.trace.autoFlush = true;
+var timer = createTimer("00:00:00:01", TIMER_APPLICATION, function () {
+    if (Player.playlist.currentTitle.elapsedTime >= "00:00:00:25") throw new Error("New title retained the old clock");
+    checks++;
+    if (checks === 3) {
+        Diagnostics.trace.writeLine("new title clock checked", "clock", Diagnostics.TRACE_LEVEL_INFO);
+        timer.enabled = false;
+    }
+});
+timer.autoReset = true;
+timer.enabled = true;
+"""
+        clock_dir = case[0] / "ADV_OBJ"
+        (clock_dir / "CLOCK.JS").write_text(clock_script, encoding="ascii")
+        (clock_dir / "CLOCK.XMF").write_text(
+            '<Application xmlns="http://www.dvdforum.org/2005/HDDVDVideo/Manifest" id="clock">'
+            '<Script src="CLOCK.JS"/></Application>', encoding="ascii")
+        clock_app = ET.SubElement(outro, tag("ApplicationSegment"), {
+            "id": "clock", "src": "file:///dvddisc/ADV_OBJ/CLOCK.XMF", "titleTimeBegin": "00:00:00:00",
+            "titleTimeEnd": "00:00:02:00", "sync": "hard", "autorun": "true", "zOrder": "1",
+        })
+        ET.SubElement(clock_app, tag("ApplicationResource"), {
+            "src": "file:///dvddisc/ADV_OBJ/CLOCK.JS", "size": str((clock_dir / "CLOCK.JS").stat().st_size),
+            "priority": "1", "multiplexed": "false",
+        })
         titles.append(outro)
-        check("application-transition", case, expected=('title 1 "after-app"', "main video: 16x16"))
+        check("application-transition", case, expected=('title 1 "after-app"', "main video: 16x16", "new title clock checked"),
+              extra=("--hddvd-trust-content",))
 
         paused_jump_script = """
 var playlist = Player.playlist;
