@@ -300,7 +300,13 @@ fn subPictures(pres: *present.Presentation, ts: i64, clears: []const planes.Clea
 fn graphics(f: *planes.Frame, tail: **?*vlc.subpicture_region_t) void {
     const r = f.usedBounds() orelse return;
     const region = hddvd_region_new_rgba(@intCast(r.w), @intCast(r.h)) orelse return;
-    copyRgba(region, f.canvas, r);
+    const plane = &region.p_picture.*.p[0];
+    const pitch: usize = @intCast(plane.i_pitch);
+    const w: usize = @intCast(r.w);
+    for (0..@intCast(r.h)) |y| {
+        const src = f.straightRow(@as(usize, @intCast(r.y)) + y)[@intCast(r.x)..][0..w];
+        @memcpy(plane.p_pixels[y * pitch .. y * pitch + w * 4], std.mem.sliceAsBytes(src));
+    }
     append(tail, region, r.x, r.y);
 }
 

@@ -32,6 +32,11 @@ pub const Frame = struct {
     clears: std.ArrayList(ClearRect) = .empty,
     /// One bit per tile, row-major: the tile has a pixel that is not transparent.
     occupied: std.DynamicBitSetUnmanaged,
+    /// The canvas in straight alpha (what VLC's subpictures are blended with), kept for the occupied tiles by
+    /// `finish`, so that the video output thread only copies; other tiles hold zeros.
+    straight: []raster.Px,
+    /// The tiles of `straight` that hold something (to zero them when they empty).
+    converted: std.DynamicBitSetUnmanaged,
     tiles_x: u32,
     tiles_y: u32,
 
@@ -42,10 +47,17 @@ pub const Frame = struct {
         errdefer canvas.deinit(gpa);
         const tx = (w + tile - 1) / tile;
         const ty = (h + tile - 1) / tile;
+        const straight = try gpa.alloc(raster.Px, canvas.px.len);
+        errdefer gpa.free(straight);
+        @memset(straight, .{ 0, 0, 0, 0 });
+        var occupied: std.DynamicBitSetUnmanaged = try .initEmpty(gpa, tx * ty);
+        errdefer occupied.deinit(gpa);
         f.* = .{
             .gpa = gpa,
             .canvas = canvas,
-            .occupied = try .initEmpty(gpa, tx * ty),
+            .occupied = occupied,
+            .straight = straight,
+            .converted = try .initEmpty(gpa, tx * ty),
             .tiles_x = tx,
             .tiles_y = ty,
         };
@@ -62,6 +74,8 @@ pub const Frame = struct {
         f.canvas.deinit(gpa);
         f.clears.deinit(gpa);
         f.occupied.deinit(gpa);
+        f.converted.deinit(gpa);
+        gpa.free(f.straight);
         gpa.destroy(f);
     }
 
@@ -83,7 +97,7 @@ pub const Frame = struct {
         f.clears.clearRetainingCapacity();
     }
 
-    /// Records which tiles hold anything, once the frame is rendered.
+    /// Records which tiles hold anything, once the frame is rendered, and converts those to straight alpha.
     pub fn finish(f: *Frame) void {
         f.occupied.unsetAll();
         for (0..f.tiles_y) |ty| for (0..f.tiles_x) |tx| {
@@ -94,8 +108,24 @@ pub const Frame = struct {
                     if (p[3] != 0) break true;
                 } else false) break true;
             } else false;
-            if (used) f.occupied.set(ty * f.tiles_x + tx);
+            const i = ty * f.tiles_x + tx;
+            if (used) {
+                f.occupied.set(i);
+                f.converted.set(i);
+                for (@intCast(r.y)..@intCast(r.bottom())) |y| {
+                    const src = f.canvas.row(y)[@intCast(r.x)..@intCast(r.right())];
+                    for (src, f.straightRow(y)[@intCast(r.x)..@intCast(r.right())]) |p, *d| d.* = raster.unpremultiply(p);
+                }
+            } else if (f.converted.isSet(i)) {
+                f.converted.unset(i);
+                for (@intCast(r.y)..@intCast(r.bottom())) |y| @memset(f.straightRow(y)[@intCast(r.x)..@intCast(r.right())], .{ 0, 0, 0, 0 });
+            }
         };
+    }
+
+    /// Row `y` of the straight-alpha copy.
+    pub fn straightRow(f: *const Frame, y: usize) []raster.Px {
+        return f.straight[y * f.canvas.w ..][0..f.canvas.w];
     }
 
     /// Adds a clear rectangle: the graphics drawn so far are cleared there (§7.8.4.1).
@@ -285,12 +315,23 @@ test "frame occupancy and spans" {
     try testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 128, .h = 64 }, s[0]);
     try testing.expectEqual(Rect{ .x = 192, .y = 128, .w = 8, .h = 2 }, s[1]);
     try testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 200, .h = 130 }, f.usedBounds().?);
+    try testing.expectEqual(raster.Px{ 1, 1, 1, 255 }, f.straightRow(12)[50]);
     // reset clears what was drawn.
     f.reset();
     try testing.expectEqual(raster.Px{ 0, 0, 0, 0 }, f.canvas.at(50, 12));
     f.finish();
     try testing.expectEqual(0, f.occupied.count());
     try testing.expectEqual(null, f.usedBounds());
+    try testing.expectEqual(raster.Px{ 0, 0, 0, 0 }, f.straightRow(12)[50]);
+}
+
+test "straight alpha copy of partly transparent pixels" {
+    const f = try Frame.create(testing.allocator, 64, 64);
+    defer f.unref();
+    f.canvas.px[70] = .{ 50, 25, 0, 100 }; // premultiplied, in tile (0,0)
+    f.finish();
+    try testing.expectEqual(raster.unpremultiply(.{ 50, 25, 0, 100 }), f.straightRow(1)[6]);
+    try testing.expectEqual(raster.Px{ 128, 64, 0, 100 }, f.straightRow(1)[6]);
 }
 
 test "clear rectangles punch the lower planes" {
