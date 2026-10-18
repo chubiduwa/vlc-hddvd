@@ -105,6 +105,21 @@ pub const Frame = struct {
         try f.clears.append(f.gpa, .{ .rect = c, .target = target });
     }
 
+    /// The smallest rectangle covering every occupied tile, or null if the frame is empty.
+    pub fn usedBounds(f: *const Frame) ?Rect {
+        var out: ?Rect = null;
+        var it = f.occupied.iterator(.{});
+        while (it.next()) |i| {
+            const r = f.tileRect(@intCast(i % f.tiles_x), @intCast(i / f.tiles_x));
+            const x = if (out) |o| @min(o.x, r.x) else r.x;
+            const y = if (out) |o| @min(o.y, r.y) else r.y;
+            const right = if (out) |o| @max(o.right(), r.right()) else r.right();
+            const bottom = if (out) |o| @max(o.bottom(), r.bottom()) else r.bottom();
+            out = .{ .x = x, .y = y, .w = right - x, .h = bottom - y };
+        }
+        return out;
+    }
+
     /// The occupied part of the frame as rectangles: runs of occupied tiles in each row of tiles.
     pub fn spans(f: *const Frame, gpa: std.mem.Allocator) ![]Rect {
         var out: std.ArrayList(Rect) = .empty;
@@ -269,11 +284,13 @@ test "frame occupancy and spans" {
     try testing.expectEqual(2, s.len);
     try testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 128, .h = 64 }, s[0]);
     try testing.expectEqual(Rect{ .x = 192, .y = 128, .w = 8, .h = 2 }, s[1]);
+    try testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 200, .h = 130 }, f.usedBounds().?);
     // reset clears what was drawn.
     f.reset();
     try testing.expectEqual(raster.Px{ 0, 0, 0, 0 }, f.canvas.at(50, 12));
     f.finish();
     try testing.expectEqual(0, f.occupied.count());
+    try testing.expectEqual(null, f.usedBounds());
 }
 
 test "clear rectangles punch the lower planes" {

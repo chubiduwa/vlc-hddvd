@@ -16,6 +16,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // ReleaseSafe by default: a Debug plugin is too slow to composite and mix Advanced Content in real time.
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode: debug, safe, fast or small (default: safe)") orelse .safe;
+    // Release builds carry no debug info (it holds the build machine's paths); -Dstrip=false keeps it, for profiling.
+    const strip = b.option(bool, "strip", "Strip debug info (default: unless -Doptimize=debug)") orelse (optimize != .debug);
 
     const vlc_sdk = b.option([]const u8, "vlc-sdk", "VLC SDK dir (with include/vlc/plugins)") orelse
         "../vlc-sdk/vlc-3.0.24/sdk";
@@ -63,8 +65,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/hddvd.zig"),
         .target = target,
         .optimize = optimize,
-        // Release builds carry no debug info (it holds the build machine's paths); Debug keeps it.
-        .strip = optimize != .debug,
+        .strip = strip,
         .link_libc = true,
         .link_libcpp = true, // RtAudio
         .imports = &.{

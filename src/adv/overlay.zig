@@ -294,11 +294,11 @@ fn subPictures(pres: *present.Presentation, ts: i64, clears: []const planes.Clea
     }
 }
 
-/// The graphics plane as one region over the whole canvas, with straight alpha. (Each element as its own
-/// region, tile-based, had VLC scale the regions independently when the window is not video-sized, which
-/// showed as seams along their shared edges.)
+/// The graphics plane as one region over what is drawn (the occupied tiles' bounds), with straight alpha.
+/// (Each element as its own region, tile-based, had VLC scale the regions independently when the window is
+/// not video-sized, which showed as seams along their shared edges.)
 fn graphics(f: *planes.Frame, tail: **?*vlc.subpicture_region_t) void {
-    const r = f.canvas.bounds();
+    const r = f.usedBounds() orelse return;
     const region = hddvd_region_new_rgba(@intCast(r.w), @intCast(r.h)) orelse return;
     copyRgba(region, f.canvas, r);
     append(tail, region, r.x, r.y);
