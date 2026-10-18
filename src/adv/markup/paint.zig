@@ -9,7 +9,8 @@
 //! - a still image object is drawn as if its `src` were its background image (any other is ignored); an MNG
 //!   object draws its background image, then the animation frame apps.zig chose, sized by contentWidth,
 //!   contentHeight and scaling only (§7.8.3.1);
-//! - opacity applies to each element's own marks (the discs fade groups with `opacity="inherit"`);
+//! - an element's opacity is its own times its ancestors' (an `opacity="1.0"` child of an invisible parent is
+//!   invisible, and `inherit` is multiplied again), as discs expect;
 //!   `visibility: hidden` hides an element's own marks only; everything is clipped to the region.
 //!
 //! No VLC dependency.
@@ -38,6 +39,14 @@ fn alpha(o: f32) u8 {
 
 fn withOpacity(c: style.Color, o: f32) raster.Color {
     return .{ .r = c[0], .g = c[1], .b = c[2], .a = raster.mul(c[3], alpha(o)) };
+}
+
+/// The element's opacity times those of its ancestors.
+fn opacity(e: *const Elem) f32 {
+    var o = e.style.opacity;
+    var a = e.parent;
+    while (a) |x| : (a = x.parent) o *= x.style.opacity;
+    return o;
 }
 
 /// Paints `page` laid out in `lay` into `f`, its region placed at `region` (canvas coordinates).
@@ -100,9 +109,10 @@ const Painter = struct {
         const pad_w = b.w - bw[1] - bw[3];
         const pad_h = b.h - bw[0] - bw[2];
         const padding = rect(pad_x, pad_y, pad_w, pad_h);
+        const op = opacity(e);
         if (s.visible and e.kind != .span and e.kind != .br) {
-            if (s.backgroundColor[3] > 0) cv.fill(p.clip, padding, withOpacity(s.backgroundColor, s.opacity));
-            if (s.backgroundImage.len > 0 and hasBackgroundImage(e) and s.opacity > 0) {
+            if (s.backgroundColor[3] > 0) cv.fill(p.clip, padding, withOpacity(s.backgroundColor, op));
+            if (s.backgroundImage.len > 0 and hasBackgroundImage(e) and op > 0) {
                 // Several URIs are one frame each; a single one may hold the frames (an MNG).
                 const n: i32 = @intCast(s.backgroundImage.len);
                 const fr = @max(0, s.backgroundFrame);
@@ -116,7 +126,7 @@ const Painter = struct {
                 .{ .x = outer.x, .y = outer.bottom() - @as(i32, @intFromFloat(@round(bw[2]))), .w = outer.w, .h = @intFromFloat(@round(bw[2])) },
                 .{ .x = outer.x, .y = outer.y, .w = @intFromFloat(@round(bw[3])), .h = outer.h },
             };
-            for (bd, sides) |x, r| if (x.style == .solid and x.width > 0) cv.fill(p.clip, r, withOpacity(x.color orelse s.color, s.opacity));
+            for (bd, sides) |x, r| if (x.style == .solid and x.width > 0) cv.fill(p.clip, r, withOpacity(x.color orelse s.color, op));
         }
         // The text of this block's lines (each run in its own element's style).
         for (p.lay.runs.items) |*r| if (r.block == e) p.run(r);
@@ -143,10 +153,11 @@ const Painter = struct {
     fn run(p: *Painter, r: *const layout.Run) void {
         const s = &r.elem.style;
         if (!s.visible) return;
+        const op = opacity(r.elem);
         // A span's background behind its part of the line.
-        if (r.elem != r.block and s.backgroundColor[3] > 0) p.f.canvas.fill(p.clip, rect(p.ox + r.x, p.oy + r.top, r.w, r.h), withOpacity(s.backgroundColor, s.opacity));
-        if (s.color[3] == 0 or s.opacity == 0) return;
-        const color = withOpacity(s.color, s.opacity);
+        if (r.elem != r.block and s.backgroundColor[3] > 0) p.f.canvas.fill(p.clip, rect(p.ox + r.x, p.oy + r.top, r.w, r.h), withOpacity(s.backgroundColor, op));
+        if (s.color[3] == 0 or op == 0) return;
+        const color = withOpacity(s.color, op);
         if (!r.vertical) {
             const baseline: i32 = @intFromFloat(@round(p.oy + r.baseline));
             for (r.glyphs) |g| r.font.draw(p.f.canvas, p.clip, p.ox + r.x + g.x, baseline, g.id, r.sx, r.sy, r.slant, color);
@@ -171,9 +182,10 @@ const Painter = struct {
         const content = rect(p.ox + b.x + pe[3], p.oy + b.y + pe[0], b.w - pe[1] - pe[3], b.h - pe[0] - pe[2]);
         // A graphic object: its Drawing Area (scripts draw in it), scaled to the content box.
         if (e.graphic) |g| {
-            if (!s.visible or s.opacity == 0) return;
+            const op = opacity(e);
+            if (!s.visible or op == 0) return;
             const clip = content.intersect(p.clip) orelse return;
-            p.f.canvas.blitScaled(clip, content, g.*, alpha(s.opacity));
+            p.f.canvas.blitScaled(clip, content, g.*, alpha(op));
             return;
         }
         if (std.mem.eql(u8, ty, "application/x-clearrect")) {
@@ -196,7 +208,8 @@ const Painter = struct {
     /// scaling, position, repeat), or as an MNG object (content size and scaling only).
     fn image(p: *Painter, e: *Elem, ref: []const u8, fr: u32, area: Rect, how: enum { background, mng }) void {
         const s = &e.style;
-        if (area.empty() or s.opacity == 0 or !s.visible) return;
+        const op = opacity(e);
+        if (area.empty() or op == 0 or !s.visible) return;
         const u = p.page.resolve(e.node, ref) catch return;
         defer p.page.gpa.free(u);
         const img = p.res.image(p.res.ctx, u) orelse return;
@@ -229,7 +242,7 @@ const Painter = struct {
         const flip_x = bg and (s.flip == along_x or s.flip == .both);
         const flip_y = bg and s.flip != .none and s.flip != along_x;
         const clip = area.intersect(p.clip) orelse return;
-        const a = alpha(s.opacity);
+        const a = alpha(op);
         const w: i32 = @intFromFloat(@max(1, @round(tw)));
         const h: i32 = @intFromFloat(@max(1, @round(th)));
         const x0 = area.x + @as(i32, @intFromFloat(@round(px)));
@@ -329,6 +342,29 @@ test "backgrounds, images, z order, opacity, clear rectangles" {
     try testing.expectEqual(raster.Px{ 0, 255, 0, 255 }, c.at(20, 0)); // lime border
     try testing.expectEqual(raster.Px{ 0, 0, 255, 255 }, c.at(21, 1)); // mirrored: blue on the left
     try testing.expectEqual(raster.Px{ 0, 255, 0, 255 }, c.at(22, 1)); // green on the right
+}
+
+test "opacity multiplies down the ancestors" {
+    const gpa = testing.allocator;
+    var tr: TestRes = .{ .img = .{ .w = 1, .h = 1, .data = .{ .still = try raster.Canvas.init(gpa, 1, 1) } } };
+    defer tr.img.deinit(gpa);
+    const p = try Page.fromBytes(gpa, null,
+        \\<root xmlns="http://www.dvdforum.org/2005/ihd" xmlns:style="http://www.dvdforum.org/2005/ihd#style" xml:lang="en"><body>
+        \\<div style:position="absolute" style:x="0px" style:y="0px" style:width="20px" style:height="10px" style:opacity="0">
+        \\<div style:position="absolute" style:x="0px" style:y="0px" style:width="10px" style:height="10px" style:backgroundColor="red" style:opacity="1.0"/></div>
+        \\<div style:position="absolute" style:x="0px" style:y="20px" style:width="20px" style:height="10px" style:opacity="0.5">
+        \\<div style:position="absolute" style:x="0px" style:y="0px" style:width="10px" style:height="10px" style:backgroundColor="white" style:opacity="0.5"/></div>
+        \\</body></root>
+    , "file:///dvddisc/p.xmu", 1080);
+    defer p.destroy();
+    var lay = layout.Layout.init(gpa);
+    defer lay.deinit();
+    lay.run(p, tr.res(), 100, 50);
+    const f = try planes.Frame.create(gpa, 64, 64);
+    defer f.unref();
+    paint(gpa, p, &lay, tr.res(), f, .{ .x = 0, .y = 0, .w = 100, .h = 50 });
+    try testing.expectEqual(@as(u8, 0), f.canvas.at(5, 5)[3]); // invisible parent
+    try testing.expectEqual(@as(u8, 64), f.canvas.at(5, 25)[3]); // 0.5 × 0.5
 }
 
 test "image objects: a still's background is its src, an MNG draws its frame over its background" {
